@@ -40,15 +40,16 @@ func (s *EventStream[T, R]) Push(event T) bool {
 		s.mu.Unlock()
 		return false
 	}
+	stop := s.stop
+	ch := s.ch
+	s.mu.Unlock()
+
 	select {
-	case <-s.stop:
-		s.mu.Unlock()
+	case <-stop:
 		return false
-	case s.ch <- streamEvt[T]{value: event}:
-		s.mu.Unlock()
+	case ch <- streamEvt[T]{value: event}:
 		return true
 	default:
-		s.mu.Unlock()
 		return false
 	}
 }
@@ -143,11 +144,11 @@ type AssistantMessageEvent interface {
 
 // EventStart signals the start of a streaming response.
 type EventStart struct {
-	Type      string       `json:"type"`
-	API       KnownAPI     `json:"api"`
+	Type      string        `json:"type"`
+	API       KnownAPI      `json:"api"`
 	Provider  KnownProvider `json:"provider"`
-	Model     string       `json:"model"`
-	Timestamp time.Time    `json:"timestamp"`
+	Model     string        `json:"model"`
+	Timestamp time.Time     `json:"timestamp"`
 }
 
 func (EventStart) eventTag() {}
@@ -218,10 +219,10 @@ func (EventToolCallDelta) eventTag() {}
 
 // EventToolCallEnd signals the end of a tool call.
 type EventToolCallEnd struct {
-	Type            string          `json:"type"`
-	ID              string          `json:"id"`
-	Arguments       json.RawMessage `json:"arguments"`
-	ThoughtSignature string         `json:"thoughtSignature,omitempty"`
+	Type             string          `json:"type"`
+	ID               string          `json:"id"`
+	Arguments        json.RawMessage `json:"arguments"`
+	ThoughtSignature string          `json:"thoughtSignature,omitempty"`
 }
 
 func (EventToolCallEnd) eventTag() {}
@@ -236,8 +237,8 @@ func (EventDone) eventTag() {}
 
 // EventError signals an error.
 type EventError struct {
-	Type        string `json:"type"`
-	ErrorMessage string `json:"error"`
+	Type         string `json:"type"`
+	ErrorMessage string `json:"errorMessage"`
 }
 
 func (EventError) eventTag() {}

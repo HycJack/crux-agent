@@ -3,6 +3,7 @@ package images
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -64,7 +65,19 @@ func (p *OpenRouterProvider) GenerateImages(model core.ImagesModel, c core.Conte
 	}
 	url := baseURL + "/chat/completions"
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(bodyBytes))
+	ctx, cancel := context.WithCancel(context.Background())
+	if opts.Signal != nil {
+		go func() {
+			select {
+			case <-opts.Signal:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, err
 	}

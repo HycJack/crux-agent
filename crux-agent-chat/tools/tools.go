@@ -4,8 +4,8 @@ package tools
 import (
 	"encoding/json"
 
-	"crux-ai/core"
 	"crux-agent-runtime/agent"
+	"crux-ai/core"
 )
 
 // ToolDef is a tool definition with its execution function.
@@ -37,6 +37,7 @@ func AllTools() []agent.AgentTool {
 		WriteFileTool,
 		ListFilesTool,
 		EditFileTool,
+		ReadImageTool,
 	}
 
 	tools := make([]agent.AgentTool, len(defs))

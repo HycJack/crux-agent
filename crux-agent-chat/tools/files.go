@@ -37,6 +37,9 @@ func executeReadFile(ctx context.Context, id string, params json.RawMessage, onU
 	lines := strings.Split(string(data), "\n")
 
 	// Apply offset (1-based)
+	if args.Offset < 0 {
+		return toolError(fmt.Sprintf("offset must be >= 1, got %d", args.Offset)), nil
+	}
 	start := 0
 	if args.Offset > 1 {
 		start = args.Offset - 1
@@ -130,6 +133,12 @@ func listFlat(dir string) (agent.AgentToolResult, error) {
 	var lines []string
 	for _, e := range entries {
 		name := e.Name()
+		// Skip hidden files (those starting with ".") to match the
+		// behaviour of the recursive listing. Users who need them can
+		// add a `show_hidden: true` option in the future.
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
 		if e.IsDir() {
 			name += "/"
 		}
@@ -224,9 +233,25 @@ func executeEditFile(ctx context.Context, id string, params json.RawMessage, onU
 		return toolError(fmt.Sprintf("failed to write %s: %v", args.Path, err)), nil
 	}
 
-	// Show diff summary
-	added := strings.Count(args.NewText, "\n") - strings.Count(args.OldText, "\n")
+	// Show diff summary. strings.Count("\n") counts newlines; a piece of text
+	// with N newlines spans N lines (assuming no trailing newline) or N+1
+	// (if it has a trailing newline). Use the trailing-newline aware count
+	// so the diff is accurate in both cases.
+	added := countLines(args.NewText) - countLines(args.OldText)
 	idx := strings.Index(content, args.OldText)
 	lineNum := strings.Count(content[:idx], "\n") + 1
 	return toolResult(fmt.Sprintf("Successfully edited %s at line %d (%+d lines)", args.Path, lineNum, added)), nil
+}
+
+// countLines returns the number of lines in s. A trailing newline is
+// counted as ending the last line but does not introduce a new empty one.
+func countLines(s string) int {
+	if s == "" {
+		return 0
+	}
+	n := strings.Count(s, "\n")
+	if !strings.HasSuffix(s, "\n") {
+		n++
+	}
+	return n
 }

@@ -301,6 +301,7 @@ func processSSEStream(body io.Reader, stream *core.AssistantMessageEventStream, 
 		textSignature     string
 		thinkingSignature string
 		toolCalls         map[int]*core.ToolCall
+		blockTypes        map[int]string
 	)
 	msg.API = model.API
 	msg.Provider = model.Provider
@@ -308,6 +309,7 @@ func processSSEStream(body io.Reader, stream *core.AssistantMessageEventStream, 
 	msg.Role = "assistant"
 	msg.Timestamp = time.Now()
 	toolCalls = make(map[int]*core.ToolCall)
+	blockTypes = make(map[int]string)
 
 	stream.Push(core.EventStart{Type: "start", API: model.API, Provider: model.Provider, Model: model.ID, Timestamp: time.Now()})
 
@@ -334,6 +336,7 @@ func processSSEStream(body io.Reader, stream *core.AssistantMessageEventStream, 
 			block, _ := event["content_block"].(map[string]any)
 			blockType, _ := block["type"].(string)
 			index, _ := event["index"].(float64)
+			blockTypes[int(index)] = blockType
 			switch blockType {
 			case "text":
 				if sig, ok := block["signature"].(string); ok {
@@ -380,10 +383,15 @@ func processSSEStream(body io.Reader, stream *core.AssistantMessageEventStream, 
 				msg.Content = append(msg.Content, *tc)
 			}
 			if sig, ok := event["signature"].(string); ok {
-				if thinkingBuf.Len() > 0 && thinkingSignature == "" {
-					thinkingSignature = sig
-				} else if textBuf.Len() > 0 && textSignature == "" {
-					textSignature = sig
+				switch blockTypes[int(index)] {
+				case "thinking":
+					if thinkingSignature == "" {
+						thinkingSignature = sig
+					}
+				case "text":
+					if textSignature == "" {
+						textSignature = sig
+					}
 				}
 			}
 

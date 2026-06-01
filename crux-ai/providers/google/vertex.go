@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"time"
 
 	core "crux-ai/core"
 )
@@ -104,15 +103,15 @@ func doVertexStream(ctx context.Context, baseURL, apiKey, project, location stri
 	}
 	url := fmt.Sprintf("%s/v1/projects/%s/locations/%s/publishers/google/models/%s:streamGenerateContent?alt=sse",
 		baseURL, project, location, model.ID)
-	if apiKey != "" {
-		url += "&key=" + apiKey
-	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return core.AssistantMessage{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		req.Header.Set("x-goog-api-key", apiKey)
+	}
 	for k, v := range model.Headers {
 		req.Header.Set(k, v)
 	}
@@ -120,7 +119,7 @@ func doVertexStream(ctx context.Context, baseURL, apiKey, project, location stri
 		req.Header.Set(k, v)
 	}
 
-	client := &http.Client{Timeout: 5 * time.Minute}
+	client := core.NewTimeoutClient(opts.TimeoutMs)
 	resp, err := client.Do(req)
 	if err != nil {
 		return core.AssistantMessage{}, err

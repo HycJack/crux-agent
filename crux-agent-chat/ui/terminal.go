@@ -3,10 +3,13 @@ package ui
 
 import (
 	"fmt"
+	"os"
+	goruntime "runtime"
 	"strings"
+	"sync"
 
-	"crux-ai/core"
 	runtime "crux-agent-runtime/agent"
+	"crux-ai/core"
 )
 
 // ANSI color codes
@@ -20,6 +23,22 @@ const (
 	colorCyan   = "\033[36m"
 	colorRed    = "\033[31m"
 )
+
+var vtOnce sync.Once
+
+// enableVTSupport enables Windows virtual terminal (ANSI) processing on
+// stdout and stderr so the color escapes below render correctly. No-op on
+// other platforms.
+func enableVTSupport() {
+	if goruntime.GOOS != "windows" {
+		return
+	}
+	vtOnce.Do(func() {
+		for _, f := range []*os.File{os.Stdout, os.Stderr} {
+			enableVTOnHandle(f)
+		}
+	})
+}
 
 // Subscriber returns a function that prints agent events to the terminal.
 func Subscriber() func(runtime.AgentEvent) {
@@ -59,6 +78,7 @@ func handleMessageUpdate(e runtime.EventMessageUpdate) {
 
 // PrintBanner prints the agent startup banner.
 func PrintBanner(provider, model string) {
+	enableVTSupport()
 	fmt.Printf(`
 %s╔══════════════════════════════════════╗
 ║     %s🚀 Crux Agent Chat%s                ║
@@ -76,14 +96,24 @@ Commands: /quit  /clear  /help
 func PrintHelp() {
 	fmt.Printf(`
 %sCommands:%s
-  /quit, /exit    Exit the agent
-  /clear          Clear conversation history
-  /help           Show this help message
-  /tools          List available tools
+  /quit, /exit       Exit the agent
+  /clear             Clear conversation history (and staged images)
+  /help              Show this help message
+  /tools             List available tools
+  /paste <path>...   Stage one or more images for the next turn
+  /clearimg          Clear staged images without clearing history
+
+%sMultimodal:%s
+  Just type a message that contains an image path (jpg/jpeg/png/gif/webp)
+  and the agent will attach it. Example:
+    "What is in C:\Users\me\Desktop\screenshot.png?"
+  Or stage multiple images first and ask your question:
+    /paste a.png b.png
+    Describe the differences.
 
 Type any message to chat with the agent.
 The agent can read/write files, run shell commands, and edit code.
-`, colorBold, colorReset)
+`, colorBold, colorReset, colorBold, colorReset)
 }
 
 // PrintTools prints available tools.
@@ -95,6 +125,7 @@ func PrintTools() {
 		{"write_file", "Write content to a file"},
 		{"list_files", "List directory contents"},
 		{"edit_file", "Search and replace in a file"},
+		{"read_image", "Read a local image as a multimodal attachment"},
 	}
 	for _, t := range toolNames {
 		fmt.Printf("  %s%-12s%s %s\n", colorCyan, t.name, colorReset, t.desc)
@@ -104,11 +135,13 @@ func PrintTools() {
 
 // PrintError prints an error message.
 func PrintError(msg string, args ...any) {
+	enableVTSupport()
 	fmt.Printf("%s❌ %s%s\n", colorRed, fmt.Sprintf(msg, args...), colorReset)
 }
 
 // PrintInfo prints an info message.
 func PrintInfo(msg string, args ...any) {
+	enableVTSupport()
 	fmt.Printf("%sℹ %s%s\n", colorBlue, fmt.Sprintf(msg, args...), colorReset)
 }
 
@@ -123,12 +156,25 @@ func truncate(s string, maxLen int) string {
 	return string(runes[:maxLen]) + "..."
 }
 
-// FormatUserPrompt formats the user input prompt.
-func FormatUserPrompt() string {
-	return fmt.Sprintf("\n%s👤 You:%s ", colorGreen, colorReset)
+// FormatUserPrompt formats the user input prompt. If imageCount > 0 the
+// count of pending images is shown in the prompt suffix.
+func FormatUserPrompt(imageCount int) string {
+	if imageCount == 0 {
+		return fmt.Sprintf("\n%s👤 You:%s ", colorGreen, colorReset)
+	}
+	return fmt.Sprintf("\n%s👤 You:%s %s📎 %d image(s) attached%s ",
+		colorGreen, colorReset, colorCyan, imageCount, colorReset)
+}
+
+// PrintMultimodalHint prints a short hint about image attachments when the
+// session starts, so the user knows about the new capability.
+func PrintMultimodalHint() {
+	fmt.Printf("%s💡 Tip: drop an image path into the prompt, or use /paste <path> to attach images for the next turn.%s\n\n",
+		colorDim, colorReset)
 }
 
 // PrintSeparator prints a visual separator.
 func PrintSeparator() {
+	enableVTSupport()
 	fmt.Printf("%s%s%s\n", colorDim, strings.Repeat("─", 60), colorReset)
 }

@@ -17,7 +17,7 @@ type AgentState struct {
 
 	// Options forwarded to AgentLoopConfig
 	ConvertToLlm        func([]core.Message) []core.Message
-	TransformContext     func([]core.Message) []core.Message
+	TransformContext    func([]core.Message) []core.Message
 	GetApiKey           func() string
 	ShouldStopAfterTurn func(core.AssistantMessage, []core.ToolResultMessage) bool
 	PrepareNextTurn     func(*AgentLoopConfig, core.AssistantMessage, []core.ToolResultMessage, []core.Message)
@@ -124,7 +124,9 @@ func (a *Agent) Abort() {
 // Run starts a new agent run with the given prompts.
 func (a *Agent) Run(ctx context.Context, prompts ...core.Message) ([]core.Message, error) {
 	a.mu.Lock()
-	a.state.Messages = append(a.state.Messages, prompts...)
+	// 把 prompts 拼接到当前历史前，先复制以避免后续 processStream 再次 append 导致重复
+	baseMessages := append([]core.Message{}, a.state.Messages...)
+	baseMessages = append(baseMessages, prompts...)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	a.cancel = cancel
@@ -152,16 +154,14 @@ func (a *Agent) Run(ctx context.Context, prompts ...core.Message) ([]core.Messag
 		return msgs
 	}
 
-	stream := AgentLoop(runCtx, prompts, config)
+	stream := AgentLoop(runCtx, baseMessages, config)
 	a.processStream(runCtx, stream)
 
 	result, err := stream.Result()
+	a.streamWg.Wait()
 	if err != nil {
-		a.streamWg.Wait()
 		return nil, err
 	}
-
-	a.streamWg.Wait()
 
 	a.mu.Lock()
 	a.state.Messages = result
@@ -208,12 +208,10 @@ func (a *Agent) RunContinue(ctx context.Context) ([]core.Message, error) {
 	a.processStream(runCtx, stream)
 
 	result, err := stream.Result()
+	a.streamWg.Wait()
 	if err != nil {
-		a.streamWg.Wait()
 		return nil, err
 	}
-
-	a.streamWg.Wait()
 
 	a.mu.Lock()
 	a.state.Messages = result
@@ -232,7 +230,7 @@ func (a *Agent) buildConfig() AgentLoopConfig {
 		Tools:               a.state.Tools,
 		ToolExecution:       a.state.ToolExecution,
 		ConvertToLlm:        a.state.ConvertToLlm,
-		TransformContext:     a.state.TransformContext,
+		TransformContext:    a.state.TransformContext,
 		GetApiKey:           a.state.GetApiKey,
 		ShouldStopAfterTurn: a.state.ShouldStopAfterTurn,
 		PrepareNextTurn:     a.state.PrepareNextTurn,
@@ -254,13 +252,6 @@ func (a *Agent) processStream(ctx context.Context, stream *AgentEventStream) {
 	go func() {
 		defer a.streamWg.Done()
 		stream.ForEach(ctx, func(evt AgentEvent) error {
-			a.mu.Lock()
-			switch e := evt.(type) {
-			case EventMessageEnd:
-				a.state.Messages = append(a.state.Messages, e.Message)
-			}
-			a.mu.Unlock()
-
 			for _, fn := range subs {
 				fn(evt)
 			}

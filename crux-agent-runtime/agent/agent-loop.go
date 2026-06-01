@@ -27,14 +27,6 @@ func AgentLoop(ctx context.Context, msgs []core.Message, config AgentLoopConfig)
 
 		stream.Push(EventAgentStart{})
 
-		// Emit message_start/message_end for prompt messages
-		for _, m := range msgs {
-			if am, ok := m.(core.AssistantMessage); ok {
-				stream.Push(EventMessageStart{Message: am})
-				stream.Push(EventMessageEnd{Message: am})
-			}
-		}
-
 		messages := make([]core.Message, len(msgs))
 		copy(messages, msgs)
 
@@ -124,7 +116,7 @@ func runLoop(ctx context.Context, config AgentLoopConfig, messages []core.Messag
 				ToolResults: toolResults,
 			})
 
-			// If all tools requested termination, stop the loop
+			// If any tool requested termination, stop the loop
 			if shouldTerminate {
 				stream.End(messages)
 				return
@@ -248,7 +240,7 @@ func streamAssistantResponse(ctx context.Context, config AgentLoopConfig, messag
 		case core.EventDone:
 			partialMsg = e.Message
 		case core.EventError:
-			return e.Error
+			return fmt.Errorf("%s", e.ErrorMessage)
 		}
 
 		stream.Push(EventMessageUpdate{

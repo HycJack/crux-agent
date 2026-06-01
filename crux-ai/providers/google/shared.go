@@ -82,7 +82,6 @@ func convertAssistantParts(content []core.ContentBlock) []any {
 }
 
 func convertToolResultParts(content []core.ContentBlock) map[string]any {
-	result := make(map[string]any)
 	for _, block := range content {
 		if text, ok := block.(core.TextContent); ok {
 			var v any
@@ -91,10 +90,10 @@ func convertToolResultParts(content []core.ContentBlock) map[string]any {
 					return m
 				}
 			}
-			result["text"] = text.Text
+			return map[string]any{"text": text.Text}
 		}
 	}
-	return result
+	return nil
 }
 
 // ConvertTools converts tools to Google Gemini format.

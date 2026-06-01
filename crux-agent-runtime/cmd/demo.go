@@ -36,7 +36,12 @@ func main() {
 			var args struct {
 				Text string `json:"text"`
 			}
-			json.Unmarshal(params, &args)
+			if err := json.Unmarshal(params, &args); err != nil {
+				return agent.AgentToolResult{
+					Content: []core.ContentBlock{core.TextContent{Type: "text", Text: "invalid args: " + err.Error()}},
+					IsError: true,
+				}, nil
+			}
 			return agent.AgentToolResult{
 				Content: []core.ContentBlock{core.TextContent{Type: "text", Text: "Echo: " + args.Text}},
 			}, nil

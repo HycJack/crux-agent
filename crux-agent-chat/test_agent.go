@@ -11,10 +11,10 @@ import (
 	"syscall"
 	"time"
 
+	"crux-agent-chat/config"
+	runtime "crux-agent-runtime/agent"
 	"crux-ai/core"
 	_ "crux-ai/providers"
-	runtime "crux-agent-runtime/agent"
-	"crux-agent-chat/config"
 )
 
 func main() {
@@ -28,12 +28,19 @@ func main() {
 	}
 
 	echoTool := runtime.AgentTool{
-		Name:       "echo",
+		Name:        "echo",
 		Description: "Echoes back the input text",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}`),
 		Execute: func(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (runtime.AgentToolResult, error) {
-			var args struct{ Text string `json:"text"` }
-			json.Unmarshal(params, &args)
+			var args struct {
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(params, &args); err != nil {
+				return runtime.AgentToolResult{
+					Content: []core.ContentBlock{core.TextContent{Type: "text", Text: "invalid args: " + err.Error()}},
+					IsError: true,
+				}, nil
+			}
 			return runtime.AgentToolResult{
 				Content: []core.ContentBlock{core.TextContent{Type: "text", Text: "Echo: " + args.Text}},
 			}, nil
@@ -69,13 +76,15 @@ func main() {
 			case core.EventDone:
 				fmt.Fprintf(os.Stderr, "\n[llm:done] stop=%s blocks=%d\n", evt.Message.StopReason, len(evt.Message.Content))
 			case core.EventError:
-				fmt.Fprintf(os.Stderr, "\n[llm:ERROR] %v\n", evt.Error)
+				fmt.Fprintf(os.Stderr, "\n[llm:ERROR] %s\n", evt.ErrorMessage)
 			}
 		case runtime.EventToolExecStart:
 			fmt.Fprintf(os.Stderr, "[tool:start] %s\n", e.ToolName)
 		case runtime.EventToolExecEnd:
 			s := "✓"
-			if e.IsError { s = "✗" }
+			if e.IsError {
+				s = "✗"
+			}
 			fmt.Fprintf(os.Stderr, "[tool:end] %s %s\n", s, e.ToolName)
 		case runtime.EventTurnEnd:
 			fmt.Fprintf(os.Stderr, "=== END TURN %d (toolResults=%d) ===\n", turnCount, len(e.ToolResults))
@@ -101,11 +110,17 @@ func main() {
 		case core.AssistantMessage:
 			text := ""
 			for _, b := range msg.Content {
-				if tc, ok := b.(core.TextContent); ok { text += tc.Text }
-				if tc, ok := b.(core.ToolCall); ok { text += fmt.Sprintf(" [tool:%s]", tc.Name) }
+				if tc, ok := b.(core.TextContent); ok {
+					text += tc.Text
+				}
+				if tc, ok := b.(core.ToolCall); ok {
+					text += fmt.Sprintf(" [tool:%s]", tc.Name)
+				}
 			}
 			errMsg := ""
-			if msg.ErrorMessage != "" { errMsg = fmt.Sprintf(" err=%q", msg.ErrorMessage) }
+			if msg.ErrorMessage != "" {
+				errMsg = fmt.Sprintf(" err=%q", msg.ErrorMessage)
+			}
 			fmt.Fprintf(os.Stderr, "[%d] Assistant(stop=%s): %q%s\n", i, msg.StopReason, text, errMsg)
 		case core.ToolResultMessage:
 			fmt.Fprintf(os.Stderr, "[%d] ToolResult[%s]\n", i, msg.ToolName)

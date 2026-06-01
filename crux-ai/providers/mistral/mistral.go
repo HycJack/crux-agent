@@ -145,7 +145,7 @@ func convertUserContent(content any) (any, error) {
 				blocks = append(blocks, map[string]any{"type": "text", "text": b.Text})
 			case core.ImageContent:
 				blocks = append(blocks, map[string]any{
-					"type": "image_url",
+					"type":      "image_url",
 					"image_url": map[string]any{"url": "data:" + b.MimeType + ";base64," + b.Data},
 				})
 			}
@@ -212,18 +212,34 @@ func convertTools(tools []core.Tool) []map[string]any {
 
 func normalizeToolCallID(id string) string {
 	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
-	if len(id) == 9 {
-		return id
+	const targetLen = 9
+	if len(id) == targetLen {
+		valid := true
+		for i := 0; i < targetLen; i++ {
+			c := id[i]
+			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			return id
+		}
 	}
-	var buf [9]byte
-	for i := range buf {
+	buf := make([]byte, targetLen)
+	for i := 0; i < targetLen; i++ {
 		if i < len(id) {
-			buf[i] = chars[int(id[i])%len(chars)]
+			c := id[i]
+			if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+				buf[i] = c
+			} else {
+				buf[i] = chars[int(c)%len(chars)]
+			}
 		} else {
 			buf[i] = chars[0]
 		}
 	}
-	return string(buf[:])
+	return string(buf)
 }
 
 func doMistralStream(ctx context.Context, baseURL, apiKey string, model core.Model, body map[string]any, stream *core.AssistantMessageEventStream, opts core.StreamOptions) (core.AssistantMessage, error) {

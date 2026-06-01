@@ -2,11 +2,14 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"crux-ai/core"
+
 	"github.com/joho/godotenv"
 )
 
@@ -23,8 +26,12 @@ type Config struct {
 
 // Load loads configuration from .env file and environment variables.
 func Load() (*Config, error) {
-	godotenv.Load()
-	godotenv.Load("../.env")
+	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("loading .env: %w", err)
+	}
+	if err := godotenv.Load("../.env"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("loading ../.env: %w", err)
+	}
 
 	cfg := &Config{
 		MaxTokens:   4096,
@@ -36,13 +43,25 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("no AI API key found. Set one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, DEEPSEEK_API_KEY")
 	}
 
-	if model := os.Getenv("AI_MODEL"); model != "" {
-		cfg.ModelID = model
-	}
+	cfg.ModelID = os.Getenv("AI_MODEL")
 	cfg.BaseURL = os.Getenv("AI_BASE_URL")
 	cfg.SystemPrompt = os.Getenv("AI_SYSTEM_PROMPT")
 	if v := os.Getenv("AI_MAX_TOKENS"); v != "" {
-		fmt.Sscanf(v, "%d", &cfg.MaxTokens)
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid AI_MAX_TOKENS=%q: %w", v, err)
+		}
+		if n <= 0 {
+			return nil, fmt.Errorf("AI_MAX_TOKENS must be > 0, got %d", n)
+		}
+		cfg.MaxTokens = n
+	}
+	if v := os.Getenv("AI_TEMPERATURE"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid AI_TEMPERATURE=%q: %w", v, err)
+		}
+		cfg.Temperature = f
 	}
 
 	setDefaults(cfg)
