@@ -53,3 +53,4 @@ bin/
 # Temporary files
 *.tmp
 *.temp
+crux-agent-chat
