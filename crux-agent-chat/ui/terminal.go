@@ -2,6 +2,7 @@
 package ui
 
 import (
+	"crux-agent-chat/harness"
 	"fmt"
 	"os"
 	goruntime "runtime"
@@ -145,6 +146,12 @@ func PrintInfo(msg string, args ...any) {
 	fmt.Printf("%sℹ %s%s\n", colorBlue, fmt.Sprintf(msg, args...), colorReset)
 }
 
+// PrintWarn prints a warning message.
+func PrintWarn(msg string, args ...any) {
+	enableVTSupport()
+	fmt.Printf("%s⚠ %s%s\n", colorYellow, fmt.Sprintf(msg, args...), colorReset)
+}
+
 func truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
@@ -177,4 +184,64 @@ func PrintMultimodalHint() {
 func PrintSeparator() {
 	enableVTSupport()
 	fmt.Printf("%s%s%s\n", colorDim, strings.Repeat("─", 60), colorReset)
+}
+
+// PrintHarnessSummary prints a one-line summary of the harness status
+// (session id, skills loaded, etc.) when the REPL starts.
+func PrintHarnessSummary(h *harness.Harness) {
+	enableVTSupport()
+	skills := h.LoadedSkillsCount()
+	if skills > 0 {
+		fmt.Printf("%s🧩 Harness: session=%s · %d skill(s) loaded · %s%s\n\n",
+			colorDim, h.SessionID(), skills, h.SessionPath(), colorReset)
+	} else {
+		fmt.Printf("%s🧩 Harness: session=%s · 0 skills · %s%s\n\n",
+			colorDim, h.SessionID(), h.SessionPath(), colorReset)
+	}
+}
+
+// PrintTokenUsage prints the cumulative token usage for this session.
+func PrintTokenUsage(h *harness.Harness) {
+	t := h.Snapshot()
+	fmt.Printf("\n%sToken usage (this session):%s\n", colorBold, colorReset)
+	fmt.Printf("  Input:         %d\n", t.Input)
+	fmt.Printf("  Output:        %d\n", t.Output)
+	if t.CacheRead > 0 {
+		fmt.Printf("  Cache read:    %d\n", t.CacheRead)
+	}
+	if t.CacheWrite > 0 {
+		fmt.Printf("  Cache write:   %d\n", t.CacheWrite)
+	}
+	fmt.Printf("  Total:         %d\n", t.Total)
+	if t.Compactions > 0 {
+		fmt.Printf("  Compactions:   %d\n", t.Compactions)
+	}
+	if cost := h.EstimatedCost(); cost > 0 {
+		fmt.Printf("  Estimated cost: $%.4f\n", cost)
+	}
+	fmt.Println()
+}
+
+// PrintSessionInfo prints the session id and JSONL file path.
+func PrintSessionInfo(h interface {
+	SessionID() string
+	SessionPath() string
+}) {
+	fmt.Printf("\n%sSession:%s\n", colorBold, colorReset)
+	fmt.Printf("  ID:   %s\n", h.SessionID())
+	fmt.Printf("  File: %s\n\n", h.SessionPath())
+}
+
+// PrintSkills prints the list of loaded skills.
+func PrintSkills(skills []harness.SkillSummary) {
+	fmt.Printf("\n%sLoaded skills:%s\n", colorBold, colorReset)
+	if len(skills) == 0 {
+		fmt.Printf("  %s(none — drop SKILL.md files in .crux/skills/ or ~/.crux/skills/)%s\n\n", colorDim, colorReset)
+		return
+	}
+	for _, s := range skills {
+		fmt.Printf("  %s● %s%s — %s\n", colorCyan, s.Name, colorReset, s.Description)
+		fmt.Printf("      %s%s%s\n", colorDim, s.FilePath, colorReset)
+	}
+	fmt.Println()
 }

@@ -1,9 +1,10 @@
+// Module crux-agent-harness — version v0.0.1
 module crux-agent-harness
 
 go 1.23.0
 
 require (
-	crux-ai v0.0.0
+	crux-ai v0.0.1
 	github.com/pkoukk/tiktoken-go v0.1.6
 )
 

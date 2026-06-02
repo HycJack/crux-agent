@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"crux-ai/core"
 
@@ -22,6 +23,7 @@ type Config struct {
 	SystemPrompt string
 	MaxTokens    int
 	Temperature  float64
+	QueryTimeout time.Duration
 }
 
 // Load loads configuration from .env file and environment variables.
@@ -62,6 +64,18 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("invalid AI_TEMPERATURE=%q: %w", v, err)
 		}
 		cfg.Temperature = f
+	}
+	if v := os.Getenv("AI_QUERY_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid AI_QUERY_TIMEOUT=%q: %w", v, err)
+		}
+		if d <= 0 {
+			return nil, fmt.Errorf("AI_QUERY_TIMEOUT must be > 0, got %s", d)
+		}
+		cfg.QueryTimeout = d
+	} else {
+		cfg.QueryTimeout = 10 * time.Minute
 	}
 
 	setDefaults(cfg)

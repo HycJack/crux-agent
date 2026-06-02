@@ -1,5 +1,4 @@
-//go:build ignore
-
+// Command testagent tests the coding agent with a simple echo tool.
 package main
 
 import (

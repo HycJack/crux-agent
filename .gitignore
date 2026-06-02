@@ -53,4 +53,5 @@ bin/
 # Temporary files
 *.tmp
 *.temp
-crux-agent-chat
+crux-agent-chat/react-go-tutorial
+crux-agent-chat/.crux
