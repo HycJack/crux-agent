@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +15,7 @@ import (
 	_ "crux-ai/providers"
 
 	"crux-agent-chat/agent"
+	"crux-agent-chat/command"
 	"crux-agent-chat/config"
 	"crux-agent-chat/harness"
 	"crux-agent-chat/tools"
@@ -33,40 +33,59 @@ type chatAgent struct {
 	mu          sync.Mutex
 	override    []core.Message
 	subscribers []func(agentruntime.AgentEvent)
-	// msgCount tracks how many messages have been persisted to session,
-	// so we only persist newly-added messages on each REPL iteration.
-	msgCount int
+}
+
+// sessionWriter persists messages to the harness session.
+// It tracks which messages have already been persisted so we only
+// write new ones on each REPL iteration.
+type sessionWriter struct {
+	hr        *harness.Harness
+	persisted int // number of messages already persisted from the agent's list
 }
 
 func (c *chatAgent) Run(ctx context.Context, prompt core.UserMessage) ([]core.Message, error) {
 	c.mu.Lock()
 	override := c.override
 	c.override = nil
-	c.mu.Unlock()
+	inner := c.inner
 	if len(override) > 0 {
 		// Apply compaction: rebuild the agent's state with compacted history.
-		state := c.inner.State()
+		state := inner.State()
 		state.Messages = override
 		newInner := agentruntime.New(agentruntime.AgentOptions{InitialState: &state})
-		c.mu.Lock()
 		c.inner = newInner
+		inner = newInner
 		for _, fn := range c.subscribers {
 			c.inner.Subscribe(fn)
 		}
-		c.mu.Unlock()
 	}
-	return c.inner.Run(ctx, prompt)
+	c.mu.Unlock()
+	return inner.Run(ctx, prompt)
 }
 
 func (c *chatAgent) Subscribe(fn func(agentruntime.AgentEvent)) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.subscribers = append(c.subscribers, fn)
-	c.mu.Unlock()
-	c.inner.Subscribe(fn)
+	if c.inner != nil {
+		c.inner.Subscribe(fn)
+	}
 }
-func (c *chatAgent) Abort()                         { c.inner.Abort() }
-func (c *chatAgent) State() agentruntime.AgentState { return c.inner.State() }
-func (c *chatAgent) Messages() []core.Message       { return c.inner.Messages() }
+func (c *chatAgent) Abort() {
+	c.mu.Lock()
+	c.inner.Abort()
+	c.mu.Unlock()
+}
+func (c *chatAgent) State() agentruntime.AgentState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.inner.State()
+}
+func (c *chatAgent) Messages() []core.Message {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.inner.Messages()
+}
 func (c *chatAgent) SetOverride(msgs []core.Message) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -83,7 +102,35 @@ func (c *chatAgent) ResetSubscribers() {
 	c.mu.Unlock()
 }
 
+// newSessionWriter creates a session writer that knows how many messages
+// have already been persisted from the given agent's message list.
+func newSessionWriter(hr *harness.Harness, msgs []core.Message) *sessionWriter {
+	return &sessionWriter{hr: hr, persisted: len(msgs)}
+}
+
+// flush persists all messages in msgs that haven't been persisted yet.
+func (sw *sessionWriter) flush(msgs []core.Message) {
+	// After compaction, the message list may be shorter than persisted count.
+	// In that case, reset persisted to the current length (all messages are "new"
+	// from the session's perspective after compaction replaces the history).
+	if sw.persisted > len(msgs) {
+		sw.persisted = 0
+	}
+	for _, m := range msgs[sw.persisted:] {
+		_ = sw.hr.RecordMessage(m)
+	}
+	sw.persisted = len(msgs)
+}
+
+// reset updates the tracked count after compaction or clear.
+func (sw *sessionWriter) reset(count int) {
+	sw.persisted = count
+}
+
 func main() {
+	// Initialize command registry
+	cmdRegistry := command.NewRegistry()
+
 	cfg, err := config.Load()
 	if err != nil {
 		ui.PrintError("Configuration error: %v", err)
@@ -98,7 +145,7 @@ func main() {
 	wd, _ := os.Getwd()
 	hr, err := harness.New(harness.Config{
 		Model:   cfg.GetModel(),
-		APIKey:  cfg.APIKey,
+		APIKey:  cfg.GetAPIKey(),
 		WorkDir: wd,
 		// Default policy: prompt for write/edit/bash, auto-allow read-only.
 		AutoApprove: []string{"read_file", "list_files", "read_image"},
@@ -133,6 +180,11 @@ func main() {
 			if count == 1 {
 				ui.PrintInfo("\n⏸  Aborting current query... (press Ctrl+C again to quit)")
 				ca.Abort()
+				// Reset counter after a short delay to allow user to continue
+				go func() {
+					time.Sleep(2 * time.Second)
+					atomic.StoreInt32(&ctrlCCount, 0)
+				}()
 			} else {
 				ui.PrintInfo("\n👋 Exiting...")
 				os.Exit(0)
@@ -144,6 +196,13 @@ func main() {
 	// REPL loop
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
+
+	// sessionWriter tracks which messages have already been persisted to the
+	// session file. On first iteration, all existing messages in the agent
+	// are already in the session (loaded from file during harness init),
+	// so persisted starts at len(currentMessages). Only new messages from
+	// each Run() call will be flushed.
+	sw := newSessionWriter(hr, ca.Messages())
 
 	var pendingImages []core.ContentBlock
 
@@ -165,11 +224,115 @@ func main() {
 
 		// Handle slash commands
 		if strings.HasPrefix(input, "/") {
-			handled, done := handleCommand(input, ca, cfg, hr)
-			if done {
+			var result command.HandlerResult
+
+			// Handle special commands that need custom processing
+			if strings.HasPrefix(input, "/paste") {
+				result = command.HandlePaste(input)
+			} else if input == "/clearimg" {
+				result = command.HandleClearImg()
+			} else {
+				// Use the command registry for other commands
+				cmdCtx := &command.Context{
+					Agent:     ca,
+					Harness:   hr,
+					Config:    cfg,
+					SessionID: hr.SessionID(),
+				}
+				result = cmdRegistry.Handle(cmdCtx, input)
+
+				// Handle /clear command that needs agent recreation
+				if input == "/clear" && result.ResetSession {
+					ca.ResetSubscribers()
+					ca.SetOverride(nil)
+					ca.inner = agent.NewCodingAgentWithHarness(agent.Options{Config: cfg, Harness: hr})
+					ca.Subscribe(func(evt agentruntime.AgentEvent) {
+						ui.Subscriber()(evt)
+						chatSubscriber(evt, hr)
+					})
+				}
+
+				// Handle /compact command
+				if input == "/compact" && result.ResetSession {
+					forceCompact(hr, ca)
+				}
+
+				// Handle /new command
+				if input == "/new" && result.ResetSession {
+					wd, _ := os.Getwd()
+					newHr, err := harness.New(harness.Config{
+						Model:       cfg.GetModel(),
+						APIKey:      cfg.GetAPIKey(),
+						WorkDir:     wd,
+						AutoApprove: []string{"read_file", "list_files", "read_image"},
+						Threshold:   0.9,
+						MinKeep:     10,
+					})
+					if err != nil {
+						ui.PrintError("Failed to create new session: %v", err)
+					} else {
+						newCa := &chatAgent{inner: agent.NewCodingAgentWithHarness(agent.Options{Config: cfg, Harness: newHr})}
+						newCa.Subscribe(func(evt agentruntime.AgentEvent) {
+							ui.Subscriber()(evt)
+							chatSubscriber(evt, newHr)
+						})
+						ui.PrintInfo("✅ New session created: %s", newHr.SessionID())
+						hr.Close()
+						hr = newHr
+						ca = newCa
+						result.NewHarness = newHr
+						result.NewAgent = newCa
+					}
+				}
+
+				// Handle /restore command
+				if strings.HasPrefix(input, "/restore") && result.ResetSession && result.RestoreSessionID != "" {
+					wd, _ := os.Getwd()
+					newHr, err := harness.RestoreSession(harness.Config{
+						Model:       cfg.GetModel(),
+						APIKey:      cfg.GetAPIKey(),
+						WorkDir:     wd,
+						AutoApprove: []string{"read_file", "list_files", "read_image"},
+						Threshold:   0.9,
+						MinKeep:     10,
+					}, result.RestoreSessionID)
+					if err != nil {
+						ui.PrintError("Failed to restore session: %v", err)
+					} else {
+						newCa := &chatAgent{inner: agent.NewCodingAgentWithHarness(agent.Options{Config: cfg, Harness: newHr})}
+						newCa.Subscribe(func(evt agentruntime.AgentEvent) {
+							ui.Subscriber()(evt)
+							chatSubscriber(evt, newHr)
+						})
+						// Load messages from restored session
+						ctx := newHr.BuildContext()
+						newCa.SetOverride(ctx.Messages)
+						ui.PrintInfo("✅ Session restored: %s", newHr.SessionID())
+						hr.Close()
+						hr = newHr
+						ca = newCa
+						result.NewHarness = newHr
+						result.NewAgent = newCa
+					}
+				}
+			}
+
+			if result.ClearPending {
+				pendingImages = nil
+			}
+			if result.ResetSession {
+				sw = newSessionWriter(hr, ca.Messages())
+			}
+			if len(result.StagedBlocks) > 0 {
+				pendingImages = append(pendingImages, result.StagedBlocks...)
+			}
+			if result.NewHarness != nil && result.NewAgent != nil {
+				sw = newSessionWriter(result.NewHarness, result.NewAgent.Messages())
+			}
+			if result.Done {
 				return
 			}
-			if handled {
+			if result.Handled {
 				continue
 			}
 		}
@@ -179,8 +342,8 @@ func main() {
 		// Auto-detect image paths in the input.
 		autoImages, rest := extractImagePaths(input)
 		if len(autoImages) > 0 {
-			added, skipped := stageImages(autoImages, &pendingImages)
-			ui.PrintInfo("🖼  Detected %d image path(s)%s", added, skippedMsg(skipped))
+			added, skipped := command.StageImages(autoImages, &pendingImages)
+			ui.PrintInfo("🖼  Detected %d image path(s)%s", added, command.SkippedMsg(skipped))
 			input = rest
 			if strings.TrimSpace(input) == "" {
 				ui.PrintInfo("Add a question and press Enter (or send blank to skip):")
@@ -198,37 +361,25 @@ func main() {
 			pendingImages = nil
 		}
 
-		// Persist the user message to the session before sending it.
-		_ = hr.RecordMessage(core.UserMessage{
-			Role: "user", Content: content, Timestamp: time.Now(),
-		})
+		// Persist the session before each query so that the full conversation
+		// history is durably recorded, even if the process crashes during Run.
+		// We flush all messages from the agent's internal list that haven't
+		// been persisted yet (e.g. after compaction in a prior iteration).
+		sw.flush(ca.Messages())
 
-		// Persist any existing messages that haven't been persisted yet
-		// (this happens after compaction in a prior iteration — the compressed
-		// messages must be written before we compact again).
-		for _, m := range ca.Messages()[ca.msgCount:] {
-			_ = hr.RecordMessage(m)
-		}
-		ca.msgCount = len(ca.Messages())
-
-		// Snapshot messages before compaction so the session log preserves
-		// the full history. Compaction may replace the in-memory message
-		// list with a compressed version, but the session file already has
-		// the full details.
-		preCompactMsgCount := len(ca.Messages())
-
-		// Maybe compact before the next LLM call.
+		// Maybe compact before the next LLM call to stay within context limits.
 		maybeCompactBeforeQuery(hr, ca)
 
-		// If compaction happened, the agent's in-memory messages changed.
-		// The compressed messages replace the full ones in memory, but the
-		// session already has the full history persisted. Update msgCount
-		// so we don't re-persist the compressed version.
-		if len(ca.Messages()) != preCompactMsgCount {
-			ca.msgCount = len(ca.Messages())
-		}
+		// After compaction, the agent's message list may have been replaced
+		// with a compressed shorter list. Reset the session writer's count
+		// to reflect the new list, so we don't re-persist the compressed
+		// messages that are already in the session file.
+		sw.reset(len(ca.Messages()))
 
-		// Use a fresh context per query so Abort() can cancel just this one.
+		// Use a context with the configured timeout.  Signal-based cancellation
+		// (Ctrl+C) is handled separately by ca.Abort(), which sets an atomic flag
+		// checked within the agent's Run loop, so the Go context here is only
+		// for enforcing the query timeout.
 		queryTimeout := cfg.QueryTimeout
 		if queryTimeout <= 0 {
 			queryTimeout = 10 * time.Minute
@@ -244,113 +395,11 @@ func main() {
 			ui.PrintError("Agent error: %v", err)
 		}
 
-		// Persist only the new messages that the agent appended.
-		for _, m := range ca.Messages()[ca.msgCount:] {
-			_ = hr.RecordMessage(m)
-		}
-		ca.msgCount = len(ca.Messages())
+		// Persist all new messages the agent appended during Run.
+		sw.flush(ca.Messages())
 
 		fmt.Println()
 	}
-}
-
-// handleCommand dispatches a slash command.
-//   - handled: the input was a command; the REPL should NOT also run it as a prompt
-//   - done:    the command was /quit, exit the process
-func handleCommand(input string, ca *chatAgent, cfg *config.Config, hr *harness.Harness) (handled, done bool) {
-	cmd := strings.ToLower(input)
-
-	// Image-related commands
-	if strings.HasPrefix(cmd, "/paste") {
-		args := strings.Fields(input)
-		if len(args) < 2 {
-			ui.PrintError("Usage: /paste <image-path> [more-image-paths...]")
-			return true, false
-		}
-		var pending []core.ContentBlock
-		added, skipped := stageImages(args[1:], &pending)
-		ui.PrintInfo("📎 Staged %d image(s)%s (will attach to the next turn)", added, skippedMsg(skipped))
-		return true, false
-	}
-	if strings.HasPrefix(cmd, "/clearimg") {
-		ui.PrintInfo("Cleared staged images.")
-		return true, false
-	}
-
-	switch cmd {
-	case "/quit", "/exit":
-		fmt.Println("Goodbye! 👋")
-		return true, true
-	case "/clear":
-		ca.ResetSubscribers()
-		ca.SetOverride(nil)
-		ca.msgCount = 0
-		ca.inner = agent.NewCodingAgentWithHarness(agent.Options{Config: cfg, Harness: hr})
-		ca.Subscribe(func(evt agentruntime.AgentEvent) {
-			ui.Subscriber()(evt)
-			chatSubscriber(evt, hr)
-		})
-		ui.PrintInfo("Conversation cleared.")
-		return true, false
-	case "/help":
-		ui.PrintHelp()
-		return true, false
-	case "/tools":
-		ui.PrintTools()
-		return true, false
-	case "/tokens":
-		ui.PrintTokenUsage(hr)
-		return true, false
-	case "/session":
-		ui.PrintSessionInfo(hr)
-		return true, false
-	case "/skills":
-		ui.PrintSkills(hr.LoadedSkills())
-		return true, false
-	case "/compact":
-		ui.PrintInfo("Compacting context...")
-		forceCompact(hr, ca)
-		return true, false
-	default:
-		ui.PrintError("Unknown command: %s (type /help for help)", input)
-		return true, false
-	}
-}
-
-// --- Helpers ---
-
-func stageImages(paths []string, pending *[]core.ContentBlock) (added int, skipped []string) {
-	for _, p := range paths {
-		p = strings.Trim(p, "\"'")
-		if strings.HasPrefix(p, "~") {
-			if home, err := os.UserHomeDir(); err == nil {
-				// On Windows, ~ expands to C:\Users\name.
-				// TrimPrefix removes the leading "~" but leaves any following
-				// path separator; filepath.Join handles it correctly.
-				suffix := strings.TrimPrefix(p, "~")
-				// Ensure we don't end up with a bare "/" prefix on Windows.
-				suffix = strings.TrimLeft(suffix, "/\\")
-				p = filepath.Join(home, suffix)
-			}
-		}
-		abs, err := filepath.Abs(p)
-		if err != nil {
-			skipped = append(skipped, fmt.Sprintf("%s: %v", p, err))
-			continue
-		}
-		mime, b64, err := tools.ReadImageFile(abs)
-		if err != nil {
-			skipped = append(skipped, fmt.Sprintf("%s: %v", p, err))
-			continue
-		}
-		*pending = append(*pending, core.ImageContent{
-			Type:     "image",
-			Data:     b64,
-			MimeType: mime,
-		})
-		added++
-	}
-	return added, skipped
 }
 
 func extractImagePaths(input string) (paths []string, rest string) {
@@ -417,13 +466,6 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
-func skippedMsg(skipped []string) string {
-	if len(skipped) == 0 {
-		return ""
-	}
-	return " (skipped: " + strings.Join(skipped, "; ") + ")"
-}
-
 // chatToolsCore returns the tool list as core.Tool for the harness.
 func chatToolsCore() []core.Tool {
 	all := tools.AllTools()
@@ -446,10 +488,23 @@ func maybeCompactBeforeQuery(hr *harness.Harness, ca *chatAgent) {
 	if res == nil {
 		return
 	}
-	// Apply compaction: set the override so the next Run uses the
-	// compacted message list as its base history.
-	ca.SetOverride(newMsgs)
-	_ = hr.RecordCompaction(res.Summary, res.TokensBefore)
+	// Apply compaction immediately: rebuild the agent's state with the
+	// compacted message list, so ca.Messages() reflects the new list
+	// right away (not just on the next ca.Run()).
+	ca.mu.Lock()
+	ca.override = nil
+	state.Messages = newMsgs
+	newInner := agentruntime.New(agentruntime.AgentOptions{InitialState: &state})
+	subs := ca.subscribers
+	ca.inner = newInner
+	for _, fn := range subs {
+		ca.inner.Subscribe(fn)
+	}
+	ca.mu.Unlock()
+	// Record compaction and persist the compacted messages
+	if err := hr.CompactAndPersist(res.Summary, res.TokensBefore, newMsgs); err != nil {
+		ui.PrintWarn("Failed to persist compaction: %v", err)
+	}
 	ui.PrintInfo("   saved %d tokens (kept %d recent messages)", res.TokensSaved, res.KeptCount)
 }
 
@@ -464,25 +519,35 @@ func forceCompact(hr *harness.Harness, ca *chatAgent) {
 		ui.PrintInfo("No compaction needed.")
 		return
 	}
-	ca.SetOverride(newMsgs)
-	_ = hr.RecordCompaction(res.Summary, res.TokensBefore)
+	// Apply compaction immediately: rebuild the agent's state with the
+	// compacted message list, so ca.Messages() reflects the new list
+	// right away (not just on the next ca.Run()).
+	ca.mu.Lock()
+	ca.override = nil // discard any pending override
+	state.Messages = newMsgs
+	newInner := agentruntime.New(agentruntime.AgentOptions{InitialState: &state})
+	subs := ca.subscribers
+	ca.inner = newInner
+	for _, fn := range subs {
+		ca.inner.Subscribe(fn)
+	}
+	ca.mu.Unlock()
+	// Record compaction and persist the compacted messages
+	if err := hr.CompactAndPersist(res.Summary, res.TokensBefore, newMsgs); err != nil {
+		ui.PrintWarn("Failed to persist compaction: %v", err)
+	}
 	ui.PrintInfo("✅ Compacted: %d → %d tokens (saved %d)", res.TokensBefore, res.TokensAfter, res.TokensSaved)
 }
 
 // chatSubscriber is the agent event listener that accumulates token
 // usage from every assistant message.
 //
-// Only EventMessageEnd and EventMessageUpdate+EventDone are used to
-// record usage. EventAgentEnd is skipped because its Messages list
-// may overlap with earlier events, causing double-counting.
+// Only EventMessageEnd is used to record usage. EventMessageUpdate+EventDone
+// is NOT used because it would cause double-counting (EventMessageEnd already
+// contains the final message with complete Usage data).
 func chatSubscriber(evt agentruntime.AgentEvent, hr *harness.Harness) {
 	switch e := evt.(type) {
 	case agentruntime.EventMessageEnd:
 		hr.AccumulateUsage(e.Message.Usage)
-	case agentruntime.EventMessageUpdate:
-		// The Done sub-event carries the final message with Usage.
-		if done, ok := e.AssistantEvent.(core.EventDone); ok {
-			hr.AccumulateUsage(done.Message.Usage)
-		}
 	}
 }

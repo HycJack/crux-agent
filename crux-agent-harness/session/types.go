@@ -107,6 +107,19 @@ type SessionModel struct {
 	ModelID  string
 }
 
+// SessionMetadata contains session-level metadata including token usage.
+type SessionMetadata struct {
+	SessionID       string    `json:"sessionId"`
+	Description     string    `json:"description,omitempty"`
+	CreatedAt       time.Time `json:"createdAt"`
+	LastActiveAt    time.Time `json:"lastActiveAt"`
+	TotalInputTokens int64    `json:"totalInputTokens"`
+	TotalOutputTokens int64   `json:"totalOutputTokens"`
+	TotalTokens     int64    `json:"totalTokens"`
+	MessageCount    int      `json:"messageCount"`
+	CompactionCount int      `json:"compactionCount"`
+}
+
 // --- Session Storage interface ---
 
 // SessionStorage defines the persistence interface for sessions.

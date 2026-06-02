@@ -158,8 +158,27 @@ func (c *Config) GetModel() core.Model {
 		API:           api,
 		Provider:      c.Provider,
 		BaseURL:       c.BaseURL,
-		ContextWindow: 200000,
+		ContextWindow: c.contextWindow(),
 		MaxTokens:     c.MaxTokens,
+	}
+}
+
+func (c *Config) contextWindow() int {
+	switch c.Provider {
+	case core.ProviderAnthropic:
+		return 200000
+	case core.ProviderGoogle:
+		return 1000000
+	case core.ProviderDeepSeek:
+		return 1000000
+	case core.ProviderXAI:
+		return 128000
+	case core.ProviderGroq:
+		return 128000
+	case core.ProviderMistral:
+		return 128000
+	default:
+		return 128000
 	}
 }
 
@@ -182,6 +201,21 @@ func (c *Config) detectAPI() core.KnownAPI {
 	default:
 		return core.APIOpenAICompletions
 	}
+}
+
+// APIKey returns the API key.
+func (c *Config) GetAPIKey() string {
+	return c.APIKey
+}
+
+// ProviderName returns the provider name as a string.
+func (c *Config) GetProvider() core.KnownProvider {
+	return c.Provider
+}
+
+// GetModelID returns the model ID.
+func (c *Config) GetModelID() string {
+	return c.ModelID
 }
 
 // String returns a human-readable summary of the config.

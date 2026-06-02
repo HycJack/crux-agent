@@ -4,8 +4,8 @@ package context
 import (
 	"fmt"
 
-	core "crux-ai/core"
 	"crux-agent-harness/token"
+	core "crux-ai/core"
 )
 
 // Budget describes the token budget for a context window.
@@ -88,6 +88,14 @@ func PlanCompaction(counter *token.MessageCounter, systemPrompt string, messages
 		return nil, fmt.Errorf("no compaction needed: %d tokens used, %d available", est.Total, avail)
 	}
 
+	// Ensure minKeep is within valid bounds
+	if minKeep < 1 {
+		minKeep = 1
+	}
+	if minKeep > len(messages)-1 {
+		minKeep = len(messages) - 1
+	}
+
 	// Binary search: find the split point where keeping [split:] fits in budget
 	low := 0
 	high := len(messages) - minKeep
@@ -105,11 +113,18 @@ func PlanCompaction(counter *token.MessageCounter, systemPrompt string, messages
 	}
 
 	splitIdx := low
-	if splitIdx >= len(messages)-minKeep {
-		splitIdx = len(messages) - minKeep
+	// Ensure splitIdx is within valid bounds
+	maxSplitIdx := len(messages) - minKeep
+	if splitIdx > maxSplitIdx {
+		splitIdx = maxSplitIdx
 	}
-	if splitIdx < 1 {
-		splitIdx = 1
+	if splitIdx < 0 {
+		splitIdx = 0
+	}
+
+	// Ensure we have at least minKeep messages to keep
+	if len(messages)-splitIdx < minKeep {
+		splitIdx = len(messages) - minKeep
 	}
 
 	toSummarize := messages[:splitIdx]

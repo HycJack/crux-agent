@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -78,8 +79,9 @@ func runLoop(ctx context.Context, config AgentLoopConfig, messages []core.Messag
 			stream.Push(EventTurnStart{})
 
 			// Stream assistant response
-			assistantMsg, err := streamAssistantResponse(ctx, config, messages, stream)
+			assistantMsg, trimmedMsgs, err := streamAssistantResponse(ctx, config, messages, stream)
 			if err != nil {
+				log.Printf("agent: streamAssistantResponse error: %v", err)
 				errMsg := core.AssistantMessage{
 					Role:         "assistant",
 					StopReason:   core.StopError,
@@ -91,6 +93,9 @@ func runLoop(ctx context.Context, config AgentLoopConfig, messages []core.Messag
 				return
 			}
 
+			// Persist the trimmed/compacted messages so Agent.state.Messages reflects the
+			// compacted state — this prevents large tool results from accumulating forever.
+			messages = trimmedMsgs
 			messages = append(messages, assistantMsg)
 
 			// Check for error/aborted stop reasons
@@ -158,11 +163,16 @@ func runLoop(ctx context.Context, config AgentLoopConfig, messages []core.Messag
 	}
 }
 
-// streamAssistantResponse streams an LLM response and returns the final message.
-func streamAssistantResponse(ctx context.Context, config AgentLoopConfig, messages []core.Message, stream *AgentEventStream) (core.AssistantMessage, error) {
-	// Transform context
+// streamAssistantResponse streams an LLM response and returns the final message
+// together with the (possibly compacted/trimmed) messages that were actually sent to the LLM.
+// The caller should use trimmedMessages to update its own message list so that
+// trimming/compaction results are persisted back to Agent.state.Messages.
+func streamAssistantResponse(ctx context.Context, config AgentLoopConfig, messages []core.Message, stream *AgentEventStream) (assistantMsg core.AssistantMessage, trimmedMessages []core.Message, err error) {
+	// Transform context — the returned slice may be a trimmed/compacted copy.
 	if config.TransformContext != nil {
-		messages = config.TransformContext(messages)
+		trimmedMessages = config.TransformContext(messages)
+	} else {
+		trimmedMessages = messages
 	}
 
 	// Convert to LLM messages
@@ -170,7 +180,7 @@ func streamAssistantResponse(ctx context.Context, config AgentLoopConfig, messag
 	if convertFn == nil {
 		convertFn = defaultConvertToLlm
 	}
-	llmMessages := convertFn(messages)
+	llmMessages := convertFn(trimmedMessages)
 
 	// Resolve API key
 	apiKey := ""
@@ -197,10 +207,12 @@ func streamAssistantResponse(ctx context.Context, config AgentLoopConfig, messag
 
 	llmStream, err := streamFn(ctx, config.Model, llmCtx, opts)
 	if err != nil {
-		return core.AssistantMessage{}, err
+		log.Printf("agent: streamFn error: %v", err)
+		return core.AssistantMessage{}, trimmedMessages, err
 	}
 	if llmStream == nil {
-		return core.AssistantMessage{}, fmt.Errorf("agent: stream function returned nil stream")
+		log.Printf("agent: streamFn returned nil stream")
+		return core.AssistantMessage{}, trimmedMessages, fmt.Errorf("agent: stream function returned nil stream")
 	}
 
 	// Partial message for streaming updates
@@ -211,7 +223,7 @@ func streamAssistantResponse(ctx context.Context, config AgentLoopConfig, messag
 	stream.Push(EventMessageStart{Message: partialMsg})
 
 	// Iterate over LLM events
-	finalMsg, err := llmStream.ForEach(ctx, func(evt core.AssistantMessageEvent) error {
+	_, err = llmStream.ForEach(ctx, func(evt core.AssistantMessageEvent) error {
 		switch e := evt.(type) {
 		case core.EventStart:
 			partialMsg.API = e.API
@@ -250,11 +262,12 @@ func streamAssistantResponse(ctx context.Context, config AgentLoopConfig, messag
 		return nil
 	})
 	if err != nil {
-		return core.AssistantMessage{}, err
+		return core.AssistantMessage{}, trimmedMessages, err
 	}
 
-	stream.Push(EventMessageEnd{Message: finalMsg})
-	return finalMsg, nil
+	// Use partialMsg which has been updated with EventDone.Message containing Usage data
+	stream.Push(EventMessageEnd{Message: partialMsg})
+	return partialMsg, trimmedMessages, nil
 }
 
 // executeToolCalls executes tool calls and returns the results.

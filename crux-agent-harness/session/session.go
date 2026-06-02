@@ -134,6 +134,10 @@ func BuildSessionContext(entries []SessionTreeEntry) SessionContext {
 func entryToMessage(entry SessionTreeEntry) core.Message {
 	switch entry.Type {
 	case EntryMessage:
+		// Filter out tool result messages to avoid orphaned tool call references
+		if _, ok := entry.Message.(core.ToolResultMessage); ok {
+			return nil
+		}
 		return entry.Message
 	case EntryCustomMessage:
 		return core.UserMessage{

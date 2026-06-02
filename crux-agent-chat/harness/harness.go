@@ -43,7 +43,9 @@ type Harness struct {
 	skillDiags []skills.Diagnostic
 
 	session  *session.Session
+	sessDir  string
 	sessFile string
+	metadata session.SessionMetadata
 
 	tokens TokenTotals
 
@@ -88,20 +90,35 @@ func New(cfg Config) (*Harness, error) {
 		wd, _ := os.Getwd()
 		cfg.WorkDir = wd
 	}
-	if cfg.SessionPath == "" {
-		cfg.SessionPath = filepath.Join(cfg.WorkDir, ".crux", "session.jsonl")
-	}
-	if err := os.MkdirAll(filepath.Dir(cfg.SessionPath), 0755); err != nil {
+
+	// Create session directory
+	sessDir := filepath.Join(cfg.WorkDir, ".crux", "sessions")
+	if err := os.MkdirAll(sessDir, 0755); err != nil {
 		return nil, fmt.Errorf("harness: cannot create session dir: %w", err)
 	}
 
-	store, err := session.NewJSONLStorage(cfg.SessionPath)
+	// Generate session ID and create session file
+	sessID := generateSessionID()
+	sessFile := filepath.Join(sessDir, sessID+".jsonl")
+
+	store, err := session.NewJSONLStorage(sessFile)
 	if err != nil {
 		return nil, fmt.Errorf("harness: open session: %w", err)
 	}
 	sess, err := session.NewSession(store)
 	if err != nil {
 		return nil, fmt.Errorf("harness: load session: %w", err)
+	}
+
+	// Write session info entry
+	err = sess.Append(session.SessionTreeEntry{
+		ID:        session.GenerateID(),
+		Type:      session.EntrySessionInfo,
+		Timestamp: time.Now(),
+		SessionID: sessID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("harness: write session info: %w", err)
 	}
 
 	gate := approval.New()
@@ -171,10 +188,21 @@ func New(cfg Config) (*Harness, error) {
 		contextDir: cfg.WorkDir,
 		skillDiags: diags,
 		session:    sess,
-		sessFile:   cfg.SessionPath,
-		logger:     logger,
-		model:      cfg.Model,
+		sessDir:    sessDir,
+		sessFile:   sessFile,
+		metadata: session.SessionMetadata{
+			SessionID:    sessID,
+			CreatedAt:    time.Now(),
+			LastActiveAt: time.Now(),
+		},
+		logger: logger,
+		model:  cfg.Model,
 	}, nil
+}
+
+// generateSessionID generates a unique session ID based on timestamp.
+func generateSessionID() string {
+	return time.Now().Format("20060102_150405")
 }
 
 func defaultSkillDirs(workDir string) []string {
@@ -350,12 +378,29 @@ func (h *Harness) RecordMessage(msg core.Message) error {
 		Type:      session.EntryMessage,
 		Timestamp: time.Now(),
 		Message:   msg,
+		SessionID: h.metadata.SessionID, // Add session ID to each message
 	}
+
+	// Update session metadata
+	h.mu.Lock()
+	h.metadata.MessageCount++
+	h.metadata.LastActiveAt = time.Now()
+	h.mu.Unlock()
+
+	// Persist metadata after each message to prevent data loss
+	go h.persistMetadata()
+
 	return h.session.Append(entry)
 }
 
 // RecordCompaction appends a compaction entry.
 func (h *Harness) RecordCompaction(summary string, tokensBefore int) error {
+	// Update session metadata
+	h.mu.Lock()
+	h.metadata.CompactionCount++
+	h.metadata.LastActiveAt = time.Now()
+	h.mu.Unlock()
+
 	return h.session.Append(session.SessionTreeEntry{
 		ID:                session.GenerateID(),
 		Type:              session.EntryCompaction,
@@ -365,13 +410,85 @@ func (h *Harness) RecordCompaction(summary string, tokensBefore int) error {
 	})
 }
 
+// CompactAndPersist records compaction and persists the compacted messages.
+// This ensures that after compaction, the session file reflects the new compacted state.
+func (h *Harness) CompactAndPersist(summary string, tokensBefore int, compactedMessages []core.Message) error {
+	// Update session metadata
+	h.mu.Lock()
+	h.metadata.CompactionCount++
+	h.metadata.LastActiveAt = time.Now()
+	h.mu.Unlock()
+
+	// Append compaction entry
+	if err := h.session.Append(session.SessionTreeEntry{
+		ID:                session.GenerateID(),
+		Type:              session.EntryCompaction,
+		Timestamp:         time.Now(),
+		CompactionSummary: summary,
+		TokensBefore:      tokensBefore,
+		SessionID:         h.metadata.SessionID,
+	}); err != nil {
+		return fmt.Errorf("harness: append compaction entry: %w", err)
+	}
+
+	// Append compacted messages (only user and assistant messages, no tool results)
+	for _, msg := range compactedMessages {
+		// Skip tool result messages as they cause issues when restored
+		if _, isToolResult := msg.(core.ToolResultMessage); isToolResult {
+			continue
+		}
+		if err := h.session.Append(session.SessionTreeEntry{
+			ID:        session.GenerateID(),
+			Type:      session.EntryMessage,
+			Timestamp: time.Now(),
+			Message:   msg,
+			SessionID: h.metadata.SessionID,
+		}); err != nil {
+			return fmt.Errorf("harness: append compacted message: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // BuildContext rebuilds the LLM context from the session tree.
 func (h *Harness) BuildContext() session.SessionContext {
 	return h.session.BuildContext()
 }
 
 // Close flushes and closes the session.
-func (h *Harness) Close() error { return h.session.Close() }
+func (h *Harness) Close() error {
+	// Persist session metadata before closing
+	if err := h.persistMetadata(); err != nil {
+		return err
+	}
+	return h.session.Close()
+}
+
+// Metadata returns the current session metadata.
+func (h *Harness) Metadata() session.SessionMetadata {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.metadata
+}
+
+// persistMetadata saves session metadata to a JSON file.
+func (h *Harness) persistMetadata() error {
+	h.mu.RLock()
+	metadata := h.metadata
+	h.mu.RUnlock()
+
+	metaFile := filepath.Join(h.sessDir, metadata.SessionID+".meta.json")
+	f, err := os.Create(metaFile)
+	if err != nil {
+		return fmt.Errorf("harness: cannot create metadata file: %w", err)
+	}
+	defer f.Close()
+
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(metadata)
+}
 
 // --- Token accounting ---
 
@@ -383,6 +500,14 @@ func (h *Harness) AccumulateUsage(u core.Usage) {
 	atomic.AddInt64(&h.tokens.CacheRead, int64(u.CacheRead))
 	atomic.AddInt64(&h.tokens.CacheWrite, int64(u.CacheWrite))
 	atomic.AddInt64(&h.tokens.Total, int64(u.TotalTokens))
+
+	// Update session metadata
+	h.mu.Lock()
+	h.metadata.TotalInputTokens += int64(u.Input)
+	h.metadata.TotalOutputTokens += int64(u.Output)
+	h.metadata.TotalTokens += int64(u.TotalTokens)
+	h.metadata.LastActiveAt = time.Now()
+	h.mu.Unlock()
 }
 
 // EstimatedCost returns the running cost (in USD) of this session.
@@ -399,3 +524,144 @@ func (h *Harness) SkillsDiagnostics() []skills.Diagnostic { return h.skillDiags 
 
 // Model returns the model used by this harness.
 func (h *Harness) Model() core.Model { return h.model }
+
+// RestoreSession creates a new Harness from an existing session file.
+func RestoreSession(cfg Config, sessionID string) (*Harness, error) {
+	if cfg.WorkDir == "" {
+		wd, _ := os.Getwd()
+		cfg.WorkDir = wd
+	}
+
+	// Session directory
+	sessDir := filepath.Join(cfg.WorkDir, ".crux", "sessions")
+	if err := os.MkdirAll(sessDir, 0755); err != nil {
+		return nil, fmt.Errorf("harness: cannot create session dir: %w", err)
+	}
+
+	// Open existing session file
+	sessFile := filepath.Join(sessDir, sessionID+".jsonl")
+	store, err := session.NewJSONLStorage(sessFile)
+	if err != nil {
+		return nil, fmt.Errorf("harness: open session: %w", err)
+	}
+	sess, err := session.NewSession(store)
+	if err != nil {
+		return nil, fmt.Errorf("harness: load session: %w", err)
+	}
+
+	// Load metadata
+	var metadata session.SessionMetadata
+	metaFile := filepath.Join(sessDir, sessionID+".meta.json")
+	if data, err := os.ReadFile(metaFile); err == nil {
+		if err := json.Unmarshal(data, &metadata); err != nil {
+			fmt.Fprintf(os.Stderr, "harness: warn: failed to load metadata: %v\n", err)
+		}
+	} else {
+		// If metadata file doesn't exist, create default
+		metadata = session.SessionMetadata{
+			SessionID:    sessionID,
+			CreatedAt:    time.Now(),
+			LastActiveAt: time.Now(),
+		}
+	}
+
+	gate := approval.New()
+	for _, name := range cfg.AutoApprove {
+		gate.AddRule(approval.Rule{
+			Name:    "auto_" + name,
+			Match:   approval.MatchByName(name),
+			Approve: approval.DecisionAllow,
+		})
+	}
+	for _, name := range cfg.AlwaysDeny {
+		gate.AddRule(approval.Rule{
+			Name:    "deny_" + name,
+			Match:   approval.MatchByName(name),
+			Approve: approval.DecisionBlock,
+			Reason:  "blocked by harness policy",
+		})
+	}
+	gate.SetAskHandler(func(req approval.Request) approval.Result {
+		if !askOnStdin(req) {
+			return approval.Result{Decision: approval.DecisionBlock, Reason: "user denied"}
+		}
+		return approval.Result{Decision: approval.DecisionAllow}
+	})
+
+	ctxWin := cfg.MaxContextWin
+	if ctxWin <= 0 {
+		ctxWin = cfg.Model.ContextWindow
+	}
+	if ctxWin <= 0 {
+		ctxWin = 128000
+	}
+	threshold := cfg.Threshold
+	if threshold <= 0 {
+		threshold = 0.9
+	}
+	minKeep := cfg.MinKeep
+	if minKeep <= 0 {
+		minKeep = 10
+	}
+
+	pipe, err := hcontext.NewPipeline(hcontext.PipelineConfig{
+		Model:               cfg.Model,
+		Budget:              hcontext.DefaultBudget(ctxWin),
+		CompactionThreshold: threshold,
+		MinMessagesToKeep:   minKeep,
+		Compactor:           hcontext.NewHybridCompactor(cfg.Model),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("harness: context pipeline: %w", err)
+	}
+
+	var diags []skills.Diagnostic
+	if len(cfg.SkillDirs) == 0 {
+		cfg.SkillDirs = defaultSkillDirs(cfg.WorkDir)
+	}
+	_, diags = skills.LoadSkills(cfg.SkillDirs...)
+
+	logger := observe.New("chat")
+	logger.SetWriter(os.Stderr)
+
+	return &Harness{
+		gate:       gate,
+		pipeline:   pipe,
+		contextDir: cfg.WorkDir,
+		skillDiags: diags,
+		session:    sess,
+		sessDir:    sessDir,
+		sessFile:   sessFile,
+		metadata:   metadata,
+		logger:     logger,
+		model:      cfg.Model,
+	}, nil
+}
+
+// ListSessions returns a list of all available session IDs.
+func ListSessions(workDir string) ([]string, error) {
+	if workDir == "" {
+		wd, _ := os.Getwd()
+		workDir = wd
+	}
+	sessDir := filepath.Join(workDir, ".crux", "sessions")
+	files, err := os.ReadDir(sessDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var sessions []string
+	for _, f := range files {
+		if f.IsDir() {
+			continue
+		}
+		name := f.Name()
+		if strings.HasSuffix(name, ".jsonl") {
+			sessions = append(sessions, name[:len(name)-6])
+		}
+	}
+	return sessions, nil
+}

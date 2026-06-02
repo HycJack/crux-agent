@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	core "crux-ai/core"
@@ -251,11 +252,21 @@ func (a *Agent) processStream(ctx context.Context, stream *AgentEventStream) {
 
 	go func() {
 		defer a.streamWg.Done()
-		stream.ForEach(ctx, func(evt AgentEvent) error {
+		_, err := stream.ForEach(ctx, func(evt AgentEvent) error {
 			for _, fn := range subs {
-				fn(evt)
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							fmt.Printf("agent: subscriber panic: %v\n", r)
+						}
+					}()
+					fn(evt)
+				}()
 			}
 			return nil
 		})
+		if err != nil {
+			fmt.Printf("agent: stream error: %v\n", err)
+		}
 	}()
 }

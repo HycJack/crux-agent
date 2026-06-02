@@ -80,6 +80,10 @@ func entryToRaw(entry SessionTreeEntry) map[string]any {
 		"type":      entry.Type,
 		"timestamp": entry.Timestamp,
 	}
+	// Always include sessionId if present
+	if entry.SessionID != "" {
+		m["sessionId"] = entry.SessionID
+	}
 	switch entry.Type {
 	case EntryMessage:
 		if entry.Message != nil {
@@ -150,7 +154,19 @@ func rawToEntry(raw map[string]json.RawMessage) (SessionTreeEntry, error) {
 				entry.Message = m
 			case "assistant":
 				var m core.AssistantMessage
-				json.Unmarshal(msgRaw, &m)
+				if err := json.Unmarshal(msgRaw, &m); err != nil {
+					return entry, err
+				}
+				// Manually parse Content since json.Unmarshal can't handle interface slices
+				var rawMsg map[string]json.RawMessage
+				if err := json.Unmarshal(msgRaw, &rawMsg); err == nil {
+					if contentRaw, ok := rawMsg["content"]; ok {
+						var contentBlocks []core.ContentBlock
+						if err := unmarshalContentBlocks(contentRaw, &contentBlocks); err == nil {
+							m.Content = contentBlocks
+						}
+					}
+				}
 				entry.Message = m
 			case "toolResult":
 				var m core.ToolResultMessage
@@ -205,4 +221,54 @@ func rawToEntry(raw map[string]json.RawMessage) (SessionTreeEntry, error) {
 		}
 	}
 	return entry, nil
+}
+
+// unmarshalContentBlocks handles unmarshaling of []core.ContentBlock since
+// standard json.Unmarshal cannot handle interface slices properly.
+func unmarshalContentBlocks(data json.RawMessage, blocks *[]core.ContentBlock) error {
+	var rawBlocks []map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawBlocks); err != nil {
+		return err
+	}
+
+	for _, rawBlock := range rawBlocks {
+		var blockType string
+		if v, ok := rawBlock["type"]; ok {
+			json.Unmarshal(v, &blockType)
+		}
+
+		switch blockType {
+		case "text":
+			var tb core.TextContent
+			if err := json.Unmarshal(dataForBlock(rawBlock), &tb); err == nil {
+				*blocks = append(*blocks, tb)
+			}
+		case "thinking":
+			var tb core.ThinkingContent
+			if err := json.Unmarshal(dataForBlock(rawBlock), &tb); err == nil {
+				*blocks = append(*blocks, tb)
+			}
+		case "toolCall":
+			var tc core.ToolCall
+			if err := json.Unmarshal(dataForBlock(rawBlock), &tc); err == nil {
+				*blocks = append(*blocks, tc)
+			}
+		default:
+			// Handle unknown content types
+			var text string
+			if v, ok := rawBlock["text"]; ok {
+				json.Unmarshal(v, &text)
+			}
+			if text != "" {
+				*blocks = append(*blocks, core.TextContent{Type: "text", Text: text})
+			}
+		}
+	}
+	return nil
+}
+
+// dataForBlock converts a map of raw messages back to JSON for unmarshaling.
+func dataForBlock(raw map[string]json.RawMessage) json.RawMessage {
+	data, _ := json.Marshal(raw)
+	return data
 }

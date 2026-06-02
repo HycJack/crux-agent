@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"crux-agent-runtime/agent"
@@ -63,13 +64,19 @@ func executeBash(ctx context.Context, id string, params json.RawMessage, onUpdat
 	}
 
 	var outputBuf strings.Builder
+	var mu sync.Mutex
+	doneCh := make(chan struct{})
 	go func() {
+		defer close(doneCh)
 		buf := make([]byte, 4096)
 		for {
 			n, err := stdout.Read(buf)
 			if n > 0 {
-				chunk := buf[:n]
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				mu.Lock()
 				outputBuf.Write(chunk)
+				mu.Unlock()
 				if onUpdate != nil {
 					// Best-effort partial update; ignore failures.
 					onUpdate(json.RawMessage(chunk))
@@ -82,7 +89,10 @@ func executeBash(ctx context.Context, id string, params json.RawMessage, onUpdat
 	}()
 
 	err = cmd.Wait()
+	<-doneCh // wait for the reader goroutine to finish
+	mu.Lock()
 	outputStr := outputBuf.String()
+	mu.Unlock()
 
 	const maxOutput = 50000
 	truncated := false
@@ -96,7 +106,7 @@ func executeBash(ctx context.Context, id string, params json.RawMessage, onUpdat
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 		}
-		return toolResult(fmt.Sprintf("Exit code: %d\n%s", exitCode, outputStr)), nil
+		return toolError(fmt.Sprintf("Exit code: %d\n%s", exitCode, outputStr)), nil
 	}
 
 	if truncated {

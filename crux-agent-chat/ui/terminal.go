@@ -62,6 +62,11 @@ func Subscriber() func(runtime.AgentEvent) {
 			if resultPreview != "" && resultPreview != "null" {
 				fmt.Printf("%s  → %s%s\n", colorDim, resultPreview, colorReset)
 			}
+		case runtime.EventTurnEnd:
+			// Show error message if the turn ended with an error
+			if e.Message.ErrorMessage != "" {
+				fmt.Printf("\n%s❌ Error: %s%s\n", colorRed, e.Message.ErrorMessage, colorReset)
+			}
 		}
 	}
 }
@@ -99,8 +104,13 @@ func PrintHelp() {
 %sCommands:%s
   /quit, /exit       Exit the agent
   /clear             Clear conversation history (and staged images)
+  /new               Create a new session (preserves current session)
   /help              Show this help message
   /tools             List available tools
+  /compact           Manually compact conversation context
+  /tokens            Show token usage for this session
+  /session           Show session info
+  /skills            List loaded skills
   /paste <path>...   Stage one or more images for the next turn
   /clearimg          Clear staged images without clearing history
 
@@ -153,9 +163,6 @@ func PrintWarn(msg string, args ...any) {
 }
 
 func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
 	runes := []rune(s)
 	if len(runes) <= maxLen {
 		return s

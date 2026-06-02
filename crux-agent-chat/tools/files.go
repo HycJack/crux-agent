@@ -44,8 +44,11 @@ func executeReadFile(ctx context.Context, id string, params json.RawMessage, onU
 	if args.Offset > 1 {
 		start = args.Offset - 1
 	}
-	if start >= len(lines) {
+	if start > len(lines) {
 		return toolResult(fmt.Sprintf("(file has %d lines, offset %d is beyond end)", len(lines), args.Offset)), nil
+	}
+	if start == len(lines) {
+		return toolResult(""), nil
 	}
 
 	end := len(lines)
@@ -101,14 +104,15 @@ func executeWriteFile(ctx context.Context, id string, params json.RawMessage, on
 var ListFilesTool = ToolDef{
 	Name:        "list_files",
 	Description: "List files and directories in a path. Returns names with / suffix for directories.",
-	Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Directory path to list (default: current directory)"},"recursive":{"type":"boolean","description":"List recursively (default: false)"}}}`),
+	Parameters:  json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","description":"Directory path to list (default: current directory)"},"recursive":{"type":"boolean","description":"List recursively (default: false)"},"show_hidden":{"type":"boolean","description":"Show hidden files (those starting with .). Default: false"}}}`),
 	Execute:     executeListFiles,
 }
 
 func executeListFiles(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (agent.AgentToolResult, error) {
 	var args struct {
-		Path      string `json:"path"`
-		Recursive bool   `json:"recursive"`
+		Path       string `json:"path"`
+		Recursive  bool   `json:"recursive"`
+		ShowHidden bool   `json:"show_hidden"`
 	}
 	if err := json.Unmarshal(params, &args); err != nil {
 		return toolError("invalid parameters: " + err.Error()), nil
@@ -119,12 +123,12 @@ func executeListFiles(ctx context.Context, id string, params json.RawMessage, on
 	}
 
 	if args.Recursive {
-		return listRecursive(args.Path)
+		return listRecursive(args.Path, args.ShowHidden)
 	}
-	return listFlat(args.Path)
+	return listFlat(args.Path, args.ShowHidden)
 }
 
-func listFlat(dir string) (agent.AgentToolResult, error) {
+func listFlat(dir string, showHidden bool) (agent.AgentToolResult, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return toolError(fmt.Sprintf("failed to list %s: %v", dir, err)), nil
@@ -133,10 +137,7 @@ func listFlat(dir string) (agent.AgentToolResult, error) {
 	var lines []string
 	for _, e := range entries {
 		name := e.Name()
-		// Skip hidden files (those starting with ".") to match the
-		// behaviour of the recursive listing. Users who need them can
-		// add a `show_hidden: true` option in the future.
-		if strings.HasPrefix(name, ".") {
+		if !showHidden && strings.HasPrefix(name, ".") {
 			continue
 		}
 		if e.IsDir() {
@@ -150,14 +151,14 @@ func listFlat(dir string) (agent.AgentToolResult, error) {
 	return toolResult(strings.Join(lines, "\n")), nil
 }
 
-func listRecursive(dir string) (agent.AgentToolResult, error) {
+func listRecursive(dir string, showHidden bool) (agent.AgentToolResult, error) {
 	var lines []string
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
 		name := info.Name()
-		if strings.HasPrefix(name, ".") && name != "." {
+		if !showHidden && strings.HasPrefix(name, ".") && name != "." {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
