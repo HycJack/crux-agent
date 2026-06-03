@@ -166,6 +166,7 @@ type AgentLoopConfig struct {
 	ConvertToLlm func([]core.Message) []core.Message
 
 	// TransformContext transforms messages for context window management.
+	// If nil, default context management with automatic compaction is used.
 	TransformContext func([]core.Message) []core.Message
 
 	// GetApiKey resolves the API key dynamically (e.g., for expiring OAuth tokens).
@@ -191,6 +192,11 @@ type AgentLoopConfig struct {
 
 	// StreamFn is a custom streaming function. If nil, crux-ai StreamSimple is used.
 	StreamFn StreamFn
+
+	// Compaction configures automatic context compaction.
+	Compaction *core.CompactionConfig
+	// Compactor is the compaction strategy.
+	Compactor core.Compactor
 }
 
 // findTool looks up a tool by name.

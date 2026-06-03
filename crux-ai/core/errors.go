@@ -246,16 +246,26 @@ func WrapRetry[T any](ctx context.Context, policy RetryPolicy, fn func(context.C
 			policy.OnRetry(attempt+1, err)
 		}
 
-		// 指数退避，注意 context 取消
+		// 对于速率限制错误，等待5分钟
+		waitTime := backoff
+		if ExtractErrorKind(err) == ErrorKindRateLimit {
+			waitTime = 5 * time.Minute
+		}
+
+		// 等待，注意 context 取消
 		select {
 		case <-ctx.Done():
 			var zero T
 			return zero, ctx.Err()
-		case <-time.After(backoff):
+		case <-time.After(waitTime):
 		}
-		backoff = time.Duration(float64(backoff) * policy.BackoffFactor)
-		if backoff > policy.MaxBackoff {
-			backoff = policy.MaxBackoff
+
+		// 非速率限制错误使用指数退避
+		if ExtractErrorKind(err) != ErrorKindRateLimit {
+			backoff = time.Duration(float64(backoff) * policy.BackoffFactor)
+			if backoff > policy.MaxBackoff {
+				backoff = policy.MaxBackoff
+			}
 		}
 	}
 

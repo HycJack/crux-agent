@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -23,6 +24,8 @@ import (
 
 	agentruntime "crux-agent-runtime/agent"
 	"crux-ai/core"
+
+	"golang.org/x/term"
 )
 
 // chatAgent is a thin wrapper around the runtime Agent that lets us
@@ -193,10 +196,6 @@ func main() {
 	}()
 	defer signal.Stop(sigCh)
 
-	// REPL loop
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 1024), 1024*1024)
-
 	// sessionWriter tracks which messages have already been persisted to the
 	// session file. On first iteration, all existing messages in the agent
 	// are already in the session (loaded from file during harness init),
@@ -208,16 +207,8 @@ func main() {
 
 	for {
 		atomic.StoreInt32(&ctrlCCount, 0)
-		fmt.Print(ui.FormatUserPrompt(len(pendingImages)))
 
-		if !scanner.Scan() {
-			if err := scanner.Err(); err != nil {
-				ui.PrintError("Read error: %v", err)
-			}
-			break
-		}
-
-		input := strings.TrimSpace(scanner.Text())
+		input := readInputWithESC(ui.FormatUserPrompt(len(pendingImages)))
 		if input == "" {
 			continue
 		}
@@ -305,8 +296,8 @@ func main() {
 							chatSubscriber(evt, newHr)
 						})
 						// Load messages from restored session
-						ctx := newHr.BuildContext()
-						newCa.SetOverride(ctx.Messages)
+						msgs := newHr.BuildContext()
+						newCa.SetOverride(msgs)
 						ui.PrintInfo("✅ Session restored: %s", newHr.SessionID())
 						hr.Close()
 						hr = newHr
@@ -466,6 +457,111 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
+// readInputWithESC reads a line from stdin and returns the input string.
+// Returns an empty string if ESC is pressed.
+func readInputWithESC(prompt string) string {
+	fmt.Print(prompt)
+
+	// Save the original terminal state
+	fd := int(os.Stdin.Fd())
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		// Fallback to regular input if terminal mode can't be changed
+		scanner := bufio.NewScanner(os.Stdin)
+		if scanner.Scan() {
+			return strings.TrimSpace(scanner.Text())
+		}
+		return ""
+	}
+	defer term.Restore(fd, oldState)
+
+	var input bytes.Buffer
+	buf := make([]byte, 4) // UTF-8 max is 4 bytes
+
+	for {
+		n, err := os.Stdin.Read(buf[:1])
+		if err != nil || n == 0 {
+			return strings.TrimSpace(input.String())
+		}
+
+		firstByte := buf[0]
+
+		// Handle ESC key or escape sequences (arrow keys, etc.)
+		if firstByte == 27 {
+			// Read next byte to check if it's an escape sequence
+			n, _ = os.Stdin.Read(buf[1:2])
+			if n >= 1 && buf[1] == '[' {
+				// This is an escape sequence (arrow keys, etc.), ignore it
+				continue
+			}
+			// Single ESC key pressed - cancel input
+			fmt.Println()
+			ui.PrintInfo("⏸  Query cancelled with ESC.")
+			return ""
+		}
+
+		// Handle Ctrl+C
+		if firstByte == 3 {
+			fmt.Println()
+			ui.PrintInfo("⏸  Input cancelled with Ctrl+C.")
+			return ""
+		}
+
+		// Handle Enter
+		if firstByte == 13 {
+			fmt.Println()
+			return strings.TrimSpace(input.String())
+		}
+
+		// Handle Backspace
+		if firstByte == 127 || firstByte == 8 {
+			if input.Len() > 0 {
+				// Get the last rune to calculate its byte length
+				lastRune := []rune(input.String())
+				if len(lastRune) > 0 {
+					lastCharBytes := len(string(lastRune[len(lastRune)-1]))
+					input.Truncate(input.Len() - lastCharBytes)
+					// Erase the character on screen
+					fmt.Print("\b \b")
+				}
+			}
+			continue
+		}
+
+		// Handle regular characters - UTF-8 multi-byte support
+		// Determine how many bytes this UTF-8 character has
+		var charLen int
+		if firstByte&0x80 == 0 {
+			// ASCII character (1 byte)
+			charLen = 1
+		} else if firstByte&0xE0 == 0xC0 {
+			// 2-byte UTF-8 character
+			charLen = 2
+		} else if firstByte&0xF0 == 0xE0 {
+			// 3-byte UTF-8 character (most Chinese characters)
+			charLen = 3
+		} else if firstByte&0xF8 == 0xF0 {
+			// 4-byte UTF-8 character
+			charLen = 4
+		} else {
+			// Invalid UTF-8, treat as single byte
+			charLen = 1
+		}
+
+		// Read remaining bytes for multi-byte characters
+		if charLen > 1 {
+			n, _ = os.Stdin.Read(buf[1:charLen])
+			if n != charLen-1 {
+				// Failed to read full character, just use what we have
+			}
+		}
+
+		// Write the character to input
+		input.Write(buf[:charLen])
+		fmt.Print(string(buf[:charLen]))
+	}
+}
+
 // chatToolsCore returns the tool list as core.Tool for the harness.
 func chatToolsCore() []core.Tool {
 	all := tools.AllTools()
@@ -476,6 +572,10 @@ func chatToolsCore() []core.Tool {
 // compaction if the context has crossed the configured threshold.
 func maybeCompactBeforeQuery(hr *harness.Harness, ca *chatAgent) {
 	state := ca.State()
+	est := hr.EstimateUsage(state.SystemPrompt, state.Messages, chatToolsCore())
+
+	ui.PrintInfo("🗜  Context check: %d tokens used, %d messages", est.Used, len(state.Messages))
+
 	if !hr.ShouldCompact(state.SystemPrompt, state.Messages, chatToolsCore()) {
 		return
 	}
@@ -549,5 +649,11 @@ func chatSubscriber(evt agentruntime.AgentEvent, hr *harness.Harness) {
 	switch e := evt.(type) {
 	case agentruntime.EventMessageEnd:
 		hr.AccumulateUsage(e.Message.Usage)
+		// Print usage information after each message
+		usage := e.Message.Usage
+		if usage.TotalTokens > 0 {
+			ui.PrintInfo("💰 Usage: Input=%d, Output=%d, Total=%d",
+				usage.Input, usage.Output, usage.TotalTokens)
+		}
 	}
 }

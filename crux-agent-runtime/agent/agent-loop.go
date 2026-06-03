@@ -62,6 +62,7 @@ func runLoop(ctx context.Context, config AgentLoopConfig, messages []core.Messag
 		// Inner loop: process tool calls and steering messages
 		for {
 			if ctx.Err() != nil {
+				log.Printf("agent: loop exiting - context cancelled: %v", ctx.Err())
 				stream.End(messages)
 				return
 			}
@@ -100,6 +101,7 @@ func runLoop(ctx context.Context, config AgentLoopConfig, messages []core.Messag
 
 			// Check for error/aborted stop reasons
 			if assistantMsg.StopReason == core.StopError || assistantMsg.StopReason == core.StopAborted {
+				log.Printf("agent: loop exiting - LLM stopped with reason: %v", assistantMsg.StopReason)
 				stream.Push(EventTurnEnd{Message: assistantMsg})
 				stream.End(messages)
 				return
@@ -123,6 +125,7 @@ func runLoop(ctx context.Context, config AgentLoopConfig, messages []core.Messag
 
 			// If any tool requested termination, stop the loop
 			if shouldTerminate {
+				log.Printf("agent: loop exiting - tool requested termination")
 				stream.End(messages)
 				return
 			}
@@ -134,6 +137,7 @@ func runLoop(ctx context.Context, config AgentLoopConfig, messages []core.Messag
 
 			// Should stop after turn hook
 			if config.ShouldStopAfterTurn != nil && config.ShouldStopAfterTurn(assistantMsg, toolResults) {
+				log.Printf("agent: loop exiting - ShouldStopAfterTurn returned true")
 				stream.End(messages)
 				return
 			}
@@ -156,6 +160,7 @@ func runLoop(ctx context.Context, config AgentLoopConfig, messages []core.Messag
 		}
 
 		if !hasFollowUp {
+			log.Printf("agent: loop exiting - no follow-up messages")
 			stream.End(messages)
 			return
 		}
@@ -172,7 +177,8 @@ func streamAssistantResponse(ctx context.Context, config AgentLoopConfig, messag
 	if config.TransformContext != nil {
 		trimmedMessages = config.TransformContext(messages)
 	} else {
-		trimmedMessages = messages
+		// Use default context management with automatic compaction
+		trimmedMessages = defaultTransformContext(ctx, config, messages)
 	}
 
 	// Convert to LLM messages
@@ -502,4 +508,124 @@ func msgSlice(msgs []core.ToolResultMessage) []core.Message {
 		result[i] = m
 	}
 	return result
+}
+
+// --- Context compaction ---
+
+// defaultTokenCounter provides a simple token counting heuristic.
+// It assumes ~4 chars per token (rough estimate for English text).
+func defaultTokenCounter(systemPrompt string, messages []core.Message, tools []core.Tool) int {
+	tokens := len(systemPrompt) / 4
+
+	for _, msg := range messages {
+		tokens += messageTokenCount(msg) / 4
+	}
+
+	// Add overhead for tools
+	tokens += len(tools) * 100
+
+	return tokens
+}
+
+// messageTokenCount estimates the token count for a single message.
+func messageTokenCount(msg core.Message) int {
+	switch m := msg.(type) {
+	case core.UserMessage:
+		return userMessageTokenCount(m)
+	case core.AssistantMessage:
+		return contentTokenCount(m.Content)
+	case core.ToolResultMessage:
+		return contentTokenCount(m.Content)
+	default:
+		return 0
+	}
+}
+
+// userMessageTokenCount handles the any type of UserMessage.Content
+func userMessageTokenCount(m core.UserMessage) int {
+	switch c := m.Content.(type) {
+	case []core.ContentBlock:
+		return contentTokenCount(c)
+	case string:
+		return len(c)
+	default:
+		return 0
+	}
+}
+
+// contentTokenCount estimates the token count for content blocks.
+func contentTokenCount(blocks []core.ContentBlock) int {
+	count := 0
+	for _, block := range blocks {
+		switch b := block.(type) {
+		case core.TextContent:
+			count += len(b.Text)
+		case core.ThinkingContent:
+			count += len(b.Thinking)
+		case core.ToolCall:
+			count += len(b.Name) + len(b.Arguments) + 50 // base overhead for tool call
+		}
+	}
+	return count
+}
+
+// defaultTransformContext provides default context management with automatic compaction.
+// It is used when TransformContext is not provided in the config.
+func defaultTransformContext(ctx context.Context, config AgentLoopConfig, messages []core.Message) []core.Message {
+	// If no compaction config is provided, return messages as-is
+	if config.Compaction == nil || config.Compactor == nil {
+		return messages
+	}
+
+	// Convert AgentTool to core.Tool
+	coreTools := make([]core.Tool, 0, len(config.Tools))
+	for _, t := range config.Tools {
+		coreTools = append(coreTools, core.Tool{
+			Name:        t.Name,
+			Description: t.Description,
+			Parameters:  t.Parameters,
+		})
+	}
+
+	// Check if compaction is needed
+	needsCompaction := core.NeedsCompaction(
+		defaultTokenCounter,
+		config.SystemPrompt,
+		messages,
+		coreTools,
+		*config.Compaction,
+	)
+
+	if !needsCompaction {
+		return messages
+	}
+
+	log.Printf("agent: context compaction triggered")
+
+	// Plan compaction
+	req, err := core.PlanCompaction(
+		defaultTokenCounter,
+		config.SystemPrompt,
+		messages,
+		coreTools,
+		*config.Compaction,
+	)
+	if err != nil {
+		log.Printf("agent: compaction plan failed: %v", err)
+		return messages
+	}
+
+	// Perform compaction
+	summary, err := config.Compactor.Compact(ctx, config.SystemPrompt, req.ToSummarize)
+	if err != nil {
+		log.Printf("agent: compaction failed: %v", err)
+		return messages
+	}
+
+	// Build compacted messages
+	compacted := core.BuildCompactedMessages(summary, req.ToKeep)
+
+	log.Printf("agent: compacted %d -> %d tokens", req.TokensBefore, defaultTokenCounter(config.SystemPrompt, compacted, coreTools))
+
+	return compacted
 }

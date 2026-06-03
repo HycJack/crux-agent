@@ -234,30 +234,37 @@ func unmarshalContentBlocks(data json.RawMessage, blocks *[]core.ContentBlock) e
 	for _, rawBlock := range rawBlocks {
 		var blockType string
 		if v, ok := rawBlock["type"]; ok {
-			json.Unmarshal(v, &blockType)
+			if err := json.Unmarshal(v, &blockType); err != nil {
+				return err
+			}
 		}
 
 		switch blockType {
 		case "text":
 			var tb core.TextContent
-			if err := json.Unmarshal(dataForBlock(rawBlock), &tb); err == nil {
-				*blocks = append(*blocks, tb)
+			if err := json.Unmarshal(dataForBlock(rawBlock), &tb); err != nil {
+				return err
 			}
+			*blocks = append(*blocks, tb)
 		case "thinking":
 			var tb core.ThinkingContent
-			if err := json.Unmarshal(dataForBlock(rawBlock), &tb); err == nil {
-				*blocks = append(*blocks, tb)
+			if err := json.Unmarshal(dataForBlock(rawBlock), &tb); err != nil {
+				return err
 			}
+			*blocks = append(*blocks, tb)
 		case "toolCall":
 			var tc core.ToolCall
-			if err := json.Unmarshal(dataForBlock(rawBlock), &tc); err == nil {
-				*blocks = append(*blocks, tc)
+			if err := json.Unmarshal(dataForBlock(rawBlock), &tc); err != nil {
+				return err
 			}
+			*blocks = append(*blocks, tc)
 		default:
 			// Handle unknown content types
 			var text string
 			if v, ok := rawBlock["text"]; ok {
-				json.Unmarshal(v, &text)
+				if err := json.Unmarshal(v, &text); err != nil {
+					return err
+				}
 			}
 			if text != "" {
 				*blocks = append(*blocks, core.TextContent{Type: "text", Text: text})

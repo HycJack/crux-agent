@@ -4,8 +4,10 @@ package agent
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -77,6 +79,23 @@ func NewCodingAgentWithHarness(opts Options) *agentruntime.Agent {
 				APIKey: cfg.APIKey,
 			},
 		},
+		// GetFollowUpMessages can be used to inject messages after each turn.
+		// Example: auto-summarization after every 5 messages.
+		GetFollowUpMessages: func() []core.Message {
+			// Customize this based on your needs.
+			// Example: Return nil to not inject any follow-up messages.
+			//
+			// To enable auto-summarization, you could do something like:
+			// if messageCount >= 5 {
+			//     return []core.Message{
+			//         core.UserMessage{
+			//             Role:    "user",
+			//             Content: "请总结一下我们刚才的对话。",
+			//         },
+			//     }
+			// }
+			return nil
+		},
 	}
 
 	if h != nil {
@@ -87,7 +106,7 @@ func NewCodingAgentWithHarness(opts Options) *agentruntime.Agent {
 		// Load persisted messages from the session as the agent's initial
 		// message list.  This ensures session isolation: each program start
 		// loads its own session history and appends to it across turns.
-		state.Messages = h.BuildContext().Messages
+		state.Messages = h.BuildContext()
 
 		// contextToolsCore caches the core.Tool list for context checking.
 		var contextToolsOnce sync.Once
@@ -106,16 +125,22 @@ func NewCodingAgentWithHarness(opts Options) *agentruntime.Agent {
 			trimmed := tidyContext(messages)
 
 			// Step 2: if still over budget, run compaction on the trimmed list.
+			est := h.EstimateUsage(state.SystemPrompt, trimmed, contextTools)
+			log.Printf("TransformContext: %d tokens, %d messages", est.Used, len(trimmed))
+
 			if !h.ShouldCompact(state.SystemPrompt, trimmed, contextTools) {
 				return trimmed
 			}
+			log.Printf("TransformContext: compaction triggered")
 			compactCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			newMsgs, res, err := h.Compact(compactCtx, state.SystemPrompt, trimmed, contextTools)
 			if err != nil || res == nil {
+				log.Printf("TransformContext: compaction failed or not needed: %v", err)
 				return trimmed
 			}
 			_ = h.RecordCompaction(res.Summary, res.TokensBefore)
+			log.Printf("TransformContext: compacted %d -> %d tokens", res.TokensBefore, res.TokensAfter)
 			return newMsgs
 		}
 	}
@@ -224,20 +249,44 @@ func buildTrimmedSummary(msg core.ToolResultMessage) string {
 // approvalHook bridges the harness's approval gate to the agent's
 // BeforeToolCall hook. It blocks tools when the gate says so, or
 // delegates the ask to the harness (which prompts on stdin).
-func approvalHook(h *harness.Harness, ctx agentruntime.BeforeToolCallContext) *agentruntime.ToolCallBlock {
+func approvalHook(h *harness.Harness, ctx agentruntime.BeforeToolCallContext) (blockResult *agentruntime.ToolCallBlock) {
+	// Recover from any panic during approval to prevent crashing the agent loop.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("🔒 approvalHook: panic recovered: %v", r)
+			stack := debug.Stack()
+			log.Printf("🔒 approvalHook: stack: %s", string(stack))
+			// On panic, block the tool to be safe rather than crashing the loop.
+			blockResult = &agentruntime.ToolCallBlock{
+				Block:  true,
+				Reason: fmt.Sprintf("approval hook panicked: %v", r),
+			}
+		}
+	}()
+
 	req := approval.Request{
 		ToolName: ctx.ToolCall.Name,
 		ToolID:   ctx.ToolCall.ID,
 		Args:     ctx.Args,
 	}
+	log.Printf("🔒 approvalHook: evaluating tool call: %s", req.ToolName)
 	res := h.EvaluateApproval(req)
+	log.Printf("🔒 approvalHook: decision: %v, reason: %s", res.Decision, res.Reason)
 	switch res.Decision {
 	case approval.DecisionBlock:
+		log.Printf("🔒 approvalHook: tool call blocked: %s", res.Reason)
 		return &agentruntime.ToolCallBlock{Block: true, Reason: res.Reason}
+	case approval.DecisionAllow:
+		log.Printf("🔒 approvalHook: tool call allowed")
+		return nil
 	case approval.DecisionAsk:
+		log.Printf("🔒 approvalHook: asking user for approval")
 		if !h.AskUser(req) {
+			log.Printf("🔒 approvalHook: user denied")
 			return &agentruntime.ToolCallBlock{Block: true, Reason: "user denied"}
 		}
+		log.Printf("🔒 approvalHook: user approved")
+		return nil
 	}
 	return nil
 }

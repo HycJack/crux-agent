@@ -26,6 +26,9 @@ type AgentState struct {
 	AfterToolCall       func(AfterToolCallContext) *ToolCallOverride
 	StreamFn            StreamFn
 	SimpleStreamOptions core.SimpleStreamOptions
+
+	// GetFollowUpMessages returns messages to inject after the current turn.
+	GetFollowUpMessages func() []core.Message
 }
 
 // AgentOptions configures a new Agent.
@@ -147,11 +150,19 @@ func (a *Agent) Run(ctx context.Context, prompts ...core.Message) ([]core.Messag
 		a.mu.Unlock()
 		return msgs
 	}
+
+	// Combine state's GetFollowUpMessages with temporary followUp messages
+	stateFollowUp := a.state.GetFollowUpMessages
 	config.GetFollowUpMessages = func() []core.Message {
 		a.mu.Lock()
 		msgs := followUp
 		followUp = nil
 		a.mu.Unlock()
+
+		// If state has a GetFollowUpMessages callback, append its result
+		if stateFollowUp != nil {
+			msgs = append(msgs, stateFollowUp()...)
+		}
 		return msgs
 	}
 
@@ -197,11 +208,19 @@ func (a *Agent) RunContinue(ctx context.Context) ([]core.Message, error) {
 		a.mu.Unlock()
 		return msgs
 	}
+
+	// Combine state's GetFollowUpMessages with temporary followUp messages
+	stateFollowUp := a.state.GetFollowUpMessages
 	config.GetFollowUpMessages = func() []core.Message {
 		a.mu.Lock()
 		msgs := followUp
 		followUp = nil
 		a.mu.Unlock()
+
+		// If state has a GetFollowUpMessages callback, append its result
+		if stateFollowUp != nil {
+			msgs = append(msgs, stateFollowUp()...)
+		}
 		return msgs
 	}
 
@@ -238,6 +257,7 @@ func (a *Agent) buildConfig() AgentLoopConfig {
 		BeforeToolCall:      a.state.BeforeToolCall,
 		AfterToolCall:       a.state.AfterToolCall,
 		StreamFn:            a.state.StreamFn,
+		GetFollowUpMessages: a.state.GetFollowUpMessages,
 	}
 }
 

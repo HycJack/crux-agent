@@ -173,7 +173,7 @@ func handleRestore(ctx *Context, input string) HandlerResult {
 }
 
 func handleListSessions(ctx *Context, input string) HandlerResult {
-	sessions, err := harness.ListSessions("")
+	sessions, err := ctx.Harness.ListSessions()
 	if err != nil {
 		ui.PrintError("Failed to list sessions: %v", err)
 		return HandlerResult{Handled: true}
