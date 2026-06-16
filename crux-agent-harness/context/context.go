@@ -4,7 +4,7 @@ package context
 import (
 	"fmt"
 
-	"crux-agent-harness/token"
+	"github.com/hycjack/crux-agent-harness/token"
 	core "github.com/hycjack/crux-ai/core"
 )
 

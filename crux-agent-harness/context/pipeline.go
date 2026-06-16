@@ -5,7 +5,7 @@ import (
 	"sync"
 
 	core "github.com/hycjack/crux-ai/core"
-	"crux-agent-harness/token"
+	"github.com/hycjack/crux-agent-harness/token"
 )
 
 // PipelineConfig configures the context management pipeline.
