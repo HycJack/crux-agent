@@ -22,14 +22,6 @@ import (
 
 // Memory is a long-term memory KV store.
 // || 长期记忆 KV 存储
-//
-// Example:
-//
-//	mem, _ := memory.New("/path/to/memory.json")
-//	mem.Set("user.name", "小明")
-//	mem.Set("user.preferred_language", "zh-CN")
-//	name, ok := mem.Get("user.name")
-//	mem.Save() // persist to disk
 type Memory struct {
 	mu   sync.RWMutex
 	path string
@@ -39,27 +31,27 @@ type Memory struct {
 // Entry is a single memory entry.
 // || 单条记忆条目
 type Entry struct {
-	Value     string    `json:"value"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
-	// Category for grouping (e.g. "user", "task", "preference").
-	Category string `json:"category,omitempty"`
+	ID        string            `json:"id,omitempty"`
+	Key       string            `json:"key"`
+	Value     string            `json:"value"`
+	Category  string            `json:"category,omitempty"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
+	Embedding []float32         `json:"embedding,omitempty"`
+	CreatedAt time.Time         `json:"created_at"`
+	UpdatedAt time.Time         `json:"updated_at"`
 }
 
-// New loads or creates a memory file. If the file doesn't exist,
-// it creates an empty memory store.
+// New loads or creates a memory file.
 func New(path string) (*Memory, error) {
 	m := &Memory{
 		path: path,
 		data: make(map[string]Entry),
 	}
 
-	// Ensure directory exists.
 	if dir := filepath.Dir(path); dir != "" {
 		_ = os.MkdirAll(dir, 0755)
 	}
 
-	// Try to load existing data.
 	if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
 		if err := json.Unmarshal(data, &m.data); err != nil {
 			return nil, err
@@ -70,7 +62,6 @@ func New(path string) (*Memory, error) {
 }
 
 // Get retrieves the value for a key.
-// Returns the value and whether it exists.
 func (m *Memory) Get(key string) (string, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -82,7 +73,6 @@ func (m *Memory) Get(key string) (string, bool) {
 }
 
 // Set stores a key-value pair.
-// Automatically updates the UpdatedAt timestamp.
 func (m *Memory) Set(key, value string) {
 	m.SetWithCategory(key, value, "")
 }
@@ -103,10 +93,11 @@ func (m *Memory) SetWithCategory(key, value, category string) {
 		m.data[key] = existing
 	} else {
 		m.data[key] = Entry{
+			Key:       key,
 			Value:     value,
+			Category:  category,
 			CreatedAt: now,
 			UpdatedAt: now,
-			Category:  category,
 		}
 	}
 }
@@ -168,7 +159,6 @@ func (m *Memory) Size() int {
 }
 
 // Hash returns a quick hash of memory contents.
-// Used to detect changes (to decide whether to rebuild system prompt).
 func (m *Memory) Hash() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -233,16 +223,7 @@ func (m *Memory) Load() error {
 	return json.Unmarshal(data, &m.data)
 }
 
-// FormatForPrompt formats long-term memory as a string for injection
-// into the system prompt.
-//
-// Format:
-//
-//	# Long-term Memory
-//
-//	- user.name: 小明
-//	- user.language: zh-CN
-//	- task.current: 完善 demo 项目
+// FormatForPrompt formats long-term memory as a string for system prompt injection.
 func (m *Memory) FormatForPrompt() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -251,7 +232,6 @@ func (m *Memory) FormatForPrompt() string {
 		return ""
 	}
 
-	// Group by category.
 	categories := make(map[string][]string)
 	for k, v := range m.data {
 		cat := v.Category
@@ -261,7 +241,6 @@ func (m *Memory) FormatForPrompt() string {
 		categories[cat] = append(categories[cat], k+": "+v.Value)
 	}
 
-	// Sort category names.
 	catNames := make([]string, 0, len(categories))
 	for c := range categories {
 		catNames = append(catNames, c)
