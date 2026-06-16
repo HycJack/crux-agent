@@ -1,8 +1,11 @@
 package session
 
 import (
+	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/hycjack/crux-ai/core"
 )
@@ -10,10 +13,12 @@ import (
 // Session manages a conversation session as a tree of entries.
 // || 会话管理器
 type Session struct {
-	mu      sync.RWMutex
-	storage SessionStorage
-	entries []SessionTreeEntry
-	id      string
+	mu            sync.RWMutex
+	storage       SessionStorage
+	entries       []SessionTreeEntry
+	id            string
+	branches      map[string]*Branch
+	currentBranch string
 }
 
 // NewSession creates a new session with the given storage backend.
@@ -283,3 +288,150 @@ type EventToolExecution struct {
 }
 
 func (EventToolExecution) agentEventTag() {}
+
+// Branch support methods for Session
+
+// Fork creates a new branch from the current position.
+// || 从当前位置创建分支
+func (s *Session) Fork(ctx context.Context, name string, config BranchConfig) (*Branch, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check branch limit
+	if config.MaxBranches > 0 {
+		branches := s.listBranchesUnsafe()
+		if len(branches) >= config.MaxBranches {
+			return nil, fmt.Errorf("maximum number of branches (%d) reached", config.MaxBranches)
+		}
+	}
+
+	// Generate branch ID
+	branchID := fmt.Sprintf("branch-%d", time.Now().UnixNano())
+
+	// Get messages up to current point
+	messages := make([]SessionTreeEntry, len(s.entries))
+	copy(messages, s.entries)
+
+	// Generate summary
+	var summary string
+	if config.AutoSummary {
+		if config.SummaryFunc != nil {
+			var err error
+			summary, err = config.SummaryFunc(ctx, name, messages)
+			if err != nil {
+				// Fallback to truncation
+				summary = TruncateSummary(messages, 5)
+			}
+		} else {
+			summary = TruncateSummary(messages, 5)
+		}
+	}
+
+	// Create branch
+	branch := &Branch{
+		ID:        branchID,
+		Name:      name,
+		SessionID: s.id,
+		Summary:   summary,
+		Messages:  messages,
+		CreatedAt: time.Now(),
+	}
+
+	// Store branch
+	if s.branches == nil {
+		s.branches = make(map[string]*Branch)
+	}
+	s.branches[branchID] = branch
+
+	// Append summary to the branch messages
+	if summary != "" {
+		branch.Messages = append(branch.Messages, SessionTreeEntry{
+			Type:      EntrySystemPrompt,
+			Timestamp: time.Now(),
+			Metadata: map[string]any{
+				"prompt": "## Branch summary\n\n" + summary,
+				"type":   "branch_summary",
+			},
+		})
+	}
+
+	return branch, nil
+}
+
+// SwitchTo switches to a different branch.
+// || 切换到指定分支
+func (s *Session) SwitchTo(branchID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	branch, ok := s.branches[branchID]
+	if !ok {
+		return fmt.Errorf("branch %q not found", branchID)
+	}
+
+	// Save current state to current branch
+	if s.currentBranch != "" {
+		if current, ok := s.branches[s.currentBranch]; ok {
+			current.Messages = make([]SessionTreeEntry, len(s.entries))
+			copy(current.Messages, s.entries)
+		}
+	}
+
+	// Switch to new branch
+	s.currentBranch = branchID
+	s.entries = make([]SessionTreeEntry, len(branch.Messages))
+	copy(s.entries, branch.Messages)
+
+	return nil
+}
+
+// Branches returns all branches.
+// || 返回所有分支
+func (s *Session) Branches() []*Branch {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.listBranchesUnsafe()
+}
+
+func (s *Session) listBranchesUnsafe() []*Branch {
+	branches := make([]*Branch, 0, len(s.branches))
+	for _, b := range s.branches {
+		branches = append(branches, b)
+	}
+	return branches
+}
+
+// CurrentBranch returns the current active branch.
+// || 返回当前分支
+func (s *Session) CurrentBranch() *Branch {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.currentBranch == "" {
+		return nil
+	}
+	return s.branches[s.currentBranch]
+}
+
+// DeleteBranch removes a branch. Cannot delete the current branch.
+// || 删除分支（不能删除当前分支）
+func (s *Session) DeleteBranch(branchID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if branchID == s.currentBranch {
+		return fmt.Errorf("cannot delete the current branch")
+	}
+
+	if _, ok := s.branches[branchID]; !ok {
+		return fmt.Errorf("branch %q not found", branchID)
+	}
+
+	delete(s.branches, branchID)
+	return nil
+}
+
+// AppendToCurrentBranch appends entries to the current branch.
+// || 追加到当前分支
+func (s *Session) AppendToCurrentBranch(entries ...SessionTreeEntry) error {
+	return s.Append(entries...)
+}
