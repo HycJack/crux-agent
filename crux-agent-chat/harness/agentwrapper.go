@@ -2,7 +2,7 @@ package harness
 
 import (
 	agentruntime "crux-agent-runtime/agent"
-	"crux-ai/core"
+	"github.com/hycjack/crux-ai/core"
 )
 
 // AgentToolsToCore converts runtime AgentTool definitions into the

@@ -12,8 +12,8 @@ import (
 
 	"crux-agent-chat/config"
 	runtime "crux-agent-runtime/agent"
-	"crux-ai/core"
-	_ "crux-ai/providers"
+	"github.com/hycjack/crux-ai/core"
+	_ "github.com/hycjack/crux-ai/providers"
 )
 
 func main() {

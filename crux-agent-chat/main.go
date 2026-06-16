@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	_ "crux-ai/providers"
+	_ "github.com/hycjack/crux-ai/providers"
 
 	"crux-agent-chat/agent"
 	"crux-agent-chat/command"
@@ -23,7 +23,7 @@ import (
 	"crux-agent-chat/ui"
 
 	agentruntime "crux-agent-runtime/agent"
-	"crux-ai/core"
+	"github.com/hycjack/crux-ai/core"
 
 	"golang.org/x/term"
 )

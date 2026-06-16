@@ -17,7 +17,7 @@ import (
 	"crux-agent-chat/tools"
 	"crux-agent-harness/approval"
 	agentruntime "crux-agent-runtime/agent"
-	"crux-ai/core"
+	"github.com/hycjack/crux-ai/core"
 )
 
 // maxToolResultSize is the maximum size of a tool result content before it gets

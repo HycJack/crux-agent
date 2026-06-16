@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"crux-ai/core"
+	"github.com/hycjack/crux-ai/core"
 	"crux-agent-runtime/agent"
 )
 

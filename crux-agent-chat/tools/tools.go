@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 
 	"crux-agent-runtime/agent"
-	"crux-ai/core"
+	"github.com/hycjack/crux-ai/core"
 )
 
 // ToolDef is a tool definition with its execution function.

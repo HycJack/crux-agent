@@ -4,7 +4,7 @@ import (
 	"context"
 	"crux-agent-chat/harness"
 	"crux-agent-chat/ui"
-	"crux-ai/core"
+	"github.com/hycjack/crux-ai/core"
 	"fmt"
 	"strings"
 

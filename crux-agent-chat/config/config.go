@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"crux-ai/core"
+	"github.com/hycjack/crux-ai/core"
 
 	"github.com/joho/godotenv"
 )

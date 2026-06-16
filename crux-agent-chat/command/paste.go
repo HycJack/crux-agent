@@ -3,7 +3,7 @@ package command
 import (
 	"crux-agent-chat/tools"
 	"crux-agent-chat/ui"
-	"crux-ai/core"
+	"github.com/hycjack/crux-ai/core"
 	"fmt"
 	"os"
 	"path/filepath"

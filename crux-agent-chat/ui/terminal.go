@@ -10,7 +10,7 @@ import (
 	"sync"
 
 	runtime "crux-agent-runtime/agent"
-	"crux-ai/core"
+	"github.com/hycjack/crux-ai/core"
 )
 
 // ANSI color codes

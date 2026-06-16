@@ -25,7 +25,7 @@ import (
 	hcontext "crux-agent-harness/context"
 	"crux-agent-harness/session"
 	"crux-agent-harness/skills"
-	"crux-ai/core"
+	"github.com/hycjack/crux-ai/core"
 )
 
 // Harness provides session management, approval gating, and context management.
