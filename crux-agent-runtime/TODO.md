@@ -86,3 +86,40 @@ module crux-agent-runtime  // 应该是 github.com/hycjack/crux-agent-runtime
 | Phase 4 | session + memory + context + autolearn 集成 | 1-2 天 |
 | Phase 5 | SQLite Store | 1 天 |
 | **总计** | | **6-10 天** |
+
+---
+
+## 🏗️ Skill 系统 & Sandbox 设计
+
+详见 [docs/architecture-design.md](docs/architecture-design.md)
+
+### 实现计划
+
+| Phase | 内容 | 工作量 |
+|-------|------|--------|
+| Phase 1 | Skill 系统（registry, 接口, 内置技能）| 2-3 天 |
+| Phase 2 | Sandbox 系统（接口, ProcessSandbox, 第三方适配）| 2-3 天 |
+| Phase 3 | Harness 层分离（policy, dispatch, approval, hooks）| 3-5 天 |
+| Phase 4 | 集成测试 | 2-3 天 |
+| **总计** | | **9-14 天** |
+
+### Skill 清单
+
+| 技能 | 优先级 | 说明 |
+|------|--------|------|
+| terminal | P0 | Shell 命令执行 |
+| readfile | P0 | 文件读取 |
+| writefile | P0 | 文件写入 |
+| listfiles | P1 | 目录列表 |
+| memory | P1 | 长期记忆（LLM 可调用）|
+| websearch | P2 | 网页搜索 |
+| delegate | P2 | 跨 Agent 委托 |
+
+### Sandbox 清单
+
+| 实现 | 优先级 | 说明 |
+|------|--------|------|
+| NoneSandbox | P0 | 无限制（开发用）|
+| ProcessSandbox | P0 | 进程级限制 |
+| DockerSandbox | P2 | 容器隔离 |
+| E2BAdapter | P2 | E2B 云沙箱 |
