@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // AgentState holds the agent's mutable state.

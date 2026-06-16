@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // ToolExecutionMode controls how tools are executed.

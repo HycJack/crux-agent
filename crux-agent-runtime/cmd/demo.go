@@ -10,12 +10,12 @@ import (
 	"syscall"
 	"time"
 
-	"crux-ai/core"
+	"github.com/hycjack/crux-ai/core"
 
 	"crux-agent-runtime/agent"
 
 	// Register all built-in providers
-	_ "crux-ai/providers"
+	_ "github.com/hycjack/crux-ai/providers"
 )
 
 func main() {

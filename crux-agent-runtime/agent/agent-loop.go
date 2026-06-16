@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"crux-ai/ai"
-	core "crux-ai/core"
+	"github.com/hycjack/crux-ai/ai"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // AgentEventStream is the type alias for the agent event stream.
