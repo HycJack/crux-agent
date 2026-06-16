@@ -1,3 +1,12 @@
+// Package agent provides the runtime for executing autonomous LLM
+// agents. It implements a two-level event loop:
+//
+//   outer loop  — checks for follow-up user messages between runs
+//   inner loop  — processes tool calls and steering messages
+//
+// All agent state is passed in as values; the package has no
+// process-wide mutable state. Use AgentLoop / AgentLoopContinue to
+// start a run, and consume events from the returned AgentEventStream.
 package agent
 
 import (
@@ -8,12 +17,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hycjack/crux-ai/ai"
 	core "github.com/hycjack/crux-ai/core"
+	"github.com/hycjack/crux-ai/llm"
 )
 
 // AgentEventStream is the type alias for the agent event stream.
 type AgentEventStream = core.EventStream[AgentEvent, []core.Message]
+
+// MaxAgentRounds is the default maximum number of inner-loop rounds
+// before the agent forces a stop. Use 0 for unlimited.
+const MaxAgentRounds = 50
 
 // AgentLoop starts a new agent run with the given prompt messages.
 func AgentLoop(ctx context.Context, msgs []core.Message, config AgentLoopConfig) *AgentEventStream {
@@ -56,245 +69,244 @@ func AgentLoopContinue(ctx context.Context, config AgentLoopConfig, messages []c
 	return stream
 }
 
-// runLoop implements the core two-level agent loop.
+// runLoop is the top-level dispatcher. It runs the inner loop until
+// the LLM stops calling tools (or hits an error), then checks for
+// follow-up messages.
 func runLoop(ctx context.Context, config AgentLoopConfig, messages []core.Message, stream *AgentEventStream) {
 	for {
-		// Inner loop: process tool calls and steering messages
-		for {
-			if ctx.Err() != nil {
-				log.Printf("agent: loop exiting - context cancelled: %v", ctx.Err())
-				stream.End(messages)
-				return
-			}
-
-			// Inject steering messages before emitting turn_start
-			hasSteering := false
-			if config.GetSteeringMessages != nil {
-				steering := config.GetSteeringMessages()
-				if len(steering) > 0 {
-					messages = append(messages, steering...)
-					hasSteering = true
-				}
-			}
-
-			stream.Push(EventTurnStart{})
-
-			// Stream assistant response
-			assistantMsg, trimmedMsgs, err := streamAssistantResponse(ctx, config, messages, stream)
-			if err != nil {
-				log.Printf("agent: streamAssistantResponse error: %v", err)
-				errMsg := core.AssistantMessage{
-					Role:         "assistant",
-					StopReason:   core.StopError,
-					ErrorMessage: err.Error(),
-				}
-				messages = append(messages, errMsg)
-				stream.Push(EventTurnEnd{Message: errMsg})
-				stream.End(messages)
-				return
-			}
-
-			// Persist the trimmed/compacted messages so Agent.state.Messages reflects the
-			// compacted state — this prevents large tool results from accumulating forever.
-			messages = trimmedMsgs
-			messages = append(messages, assistantMsg)
-
-			// Check for error/aborted stop reasons
-			if assistantMsg.StopReason == core.StopError || assistantMsg.StopReason == core.StopAborted {
-				log.Printf("agent: loop exiting - LLM stopped with reason: %v", assistantMsg.StopReason)
-				stream.Push(EventTurnEnd{Message: assistantMsg})
-				stream.End(messages)
-				return
-			}
-
-			// Extract tool calls
-			toolCalls := extractToolCalls(assistantMsg)
-
-			// Execute tool calls if any
-			var toolResults []core.ToolResultMessage
-			shouldTerminate := false
-			if len(toolCalls) > 0 {
-				toolResults, shouldTerminate = executeToolCalls(ctx, config, assistantMsg, toolCalls, messages, stream)
-				messages = append(messages, msgSlice(toolResults)...)
-			}
-
-			stream.Push(EventTurnEnd{
-				Message:     assistantMsg,
-				ToolResults: toolResults,
-			})
-
-			// If any tool requested termination, stop the loop
-			if shouldTerminate {
-				log.Printf("agent: loop exiting - tool requested termination")
-				stream.End(messages)
-				return
-			}
-
-			// Prepare next turn hook
-			if config.PrepareNextTurn != nil {
-				config.PrepareNextTurn(&config, assistantMsg, toolResults, messages)
-			}
-
-			// Should stop after turn hook
-			if config.ShouldStopAfterTurn != nil && config.ShouldStopAfterTurn(assistantMsg, toolResults) {
-				log.Printf("agent: loop exiting - ShouldStopAfterTurn returned true")
-				stream.End(messages)
-				return
-			}
-
-			// If no tool calls and no steering was injected, exit inner loop
-			if len(toolCalls) == 0 && !hasSteering {
-				break // Exit inner loop, check follow-up
-			}
-			// Has tool calls or had steering, continue inner loop
+		if err := ctx.Err(); err != nil {
+			log.Printf("agent: loop exiting - context cancelled: %v", err)
+			stream.End(messages)
+			return
 		}
 
-		// Check follow-up messages (outer loop)
-		hasFollowUp := false
-		if config.GetFollowUpMessages != nil {
-			followUp := config.GetFollowUpMessages()
-			if len(followUp) > 0 {
-				messages = append(messages, followUp...)
-				hasFollowUp = true
-			}
+		hasMoreTurns := runInnerLoop(ctx, config, messages, stream)
+		if !hasMoreTurns {
+			stream.End(messages)
+			return
 		}
 
+		hasFollowUp := injectFollowUpMessages(&config, messages)
 		if !hasFollowUp {
 			log.Printf("agent: loop exiting - no follow-up messages")
 			stream.End(messages)
 			return
 		}
-		// Has follow-up, continue outer loop
 	}
 }
 
-// streamAssistantResponse streams an LLM response and returns the final message
-// together with the (possibly compacted/trimmed) messages that were actually sent to the LLM.
-// The caller should use trimmedMessages to update its own message list so that
-// trimming/compaction results are persisted back to Agent.state.Messages.
-func streamAssistantResponse(ctx context.Context, config AgentLoopConfig, messages []core.Message, stream *AgentEventStream) (assistantMsg core.AssistantMessage, trimmedMessages []core.Message, err error) {
-	// Transform context — the returned slice may be a trimmed/compacted copy.
-	if config.TransformContext != nil {
-		trimmedMessages = config.TransformContext(messages)
-	} else {
-		// Use default context management with automatic compaction
-		trimmedMessages = defaultTransformContext(ctx, config, messages)
-	}
+// runInnerLoop runs model turns until the LLM stops calling tools.
+func runInnerLoop(ctx context.Context, config AgentLoopConfig, messages []core.Message, stream *AgentEventStream) bool {
+	for round := 0; round < MaxAgentRounds; round++ {
+		if err := ctx.Err(); err != nil {
+			return false
+		}
 
-	// Convert to LLM messages
-	convertFn := config.ConvertToLlm
-	if convertFn == nil {
-		convertFn = defaultConvertToLlm
-	}
-	llmMessages := convertFn(trimmedMessages)
+		hasSteering := injectSteeringMessages(&config, messages)
+		stream.Push(EventTurnStart{})
 
-	// Resolve API key
-	apiKey := ""
-	if config.GetApiKey != nil {
-		apiKey = config.GetApiKey()
-	}
-	if apiKey == "" {
-		apiKey = config.SimpleStreamOptions.APIKey
-	}
+		assistantMsg, trimmedMsgs, err := streamAssistantResponse(ctx, config, messages, stream)
+		if err != nil {
+			return handleStreamError(err, messages, stream)
+		}
+		messages = trimmedMsgs
+		messages = append(messages, assistantMsg)
 
-	opts := config.SimpleStreamOptions
-	opts.APIKey = apiKey
+		if isTerminalStop(assistantMsg.StopReason) {
+			stream.Push(EventTurnEnd{Message: assistantMsg})
+			return false
+		}
 
-	// Build context
+		toolCalls := extractToolCalls(assistantMsg)
+		var toolResults []core.ToolResultMessage
+		shouldTerminate := false
+		if len(toolCalls) > 0 {
+			toolResults, shouldTerminate = executeToolCalls(ctx, config, assistantMsg, toolCalls, messages, stream)
+			messages = append(messages, msgSlice(toolResults)...)
+		}
+
+		stream.Push(EventTurnEnd{Message: assistantMsg, ToolResults: toolResults})
+
+		if shouldTerminate {
+			return false
+		}
+		if config.PrepareNextTurn != nil {
+			config.PrepareNextTurn(&config, assistantMsg, toolResults, messages)
+		}
+		if config.ShouldStopAfterTurn != nil && config.ShouldStopAfterTurn(assistantMsg, toolResults) {
+			return false
+		}
+
+		if len(toolCalls) == 0 && !hasSteering {
+			return true
+		}
+	}
+	log.Printf("agent: inner loop hit MaxAgentRounds=%d", MaxAgentRounds)
+	return true
+}
+
+func handleStreamError(err error, messages []core.Message, stream *AgentEventStream) bool {
+	log.Printf("agent: streamAssistantResponse error: %v", err)
+	errMsg := core.AssistantMessage{
+		Role:         core.MessageRoleAssistant,
+		StopReason:   core.StopError,
+		ErrorMessage: err.Error(),
+	}
+	messages = append(messages, errMsg)
+	stream.Push(EventTurnEnd{Message: errMsg})
+	return false
+}
+
+func isTerminalStop(reason core.StopReason) bool {
+	return reason == core.StopError || reason == core.StopAborted
+}
+
+func injectSteeringMessages(config *AgentLoopConfig, messages []core.Message) bool {
+	if config.GetSteeringMessages == nil {
+		return false
+	}
+	steering := config.GetSteeringMessages()
+	if len(steering) == 0 {
+		return false
+	}
+	messages = append(messages, steering...)
+	return true
+}
+
+func injectFollowUpMessages(config *AgentLoopConfig, messages []core.Message) bool {
+	if config.GetFollowUpMessages == nil {
+		return false
+	}
+	followUp := config.GetFollowUpMessages()
+	if len(followUp) == 0 {
+		return false
+	}
+	messages = append(messages, followUp...)
+	return true
+}
+
+func streamAssistantResponse(ctx context.Context, config AgentLoopConfig, messages []core.Message, stream *AgentEventStream) (core.AssistantMessage, []core.Message, error) {
+	trimmedMessages := transformContext(ctx, config, messages)
+	llmMessages := convertToLLM(config, trimmedMessages)
+	opts := resolveStreamOptions(&config)
 	llmCtx := toContextMessages(llmMessages, config.SystemPrompt, config.Tools)
 
-	// Stream response
-	streamFn := config.StreamFn
-	if streamFn == nil {
-		streamFn = func(ctx context.Context, m core.Model, c core.Context, o core.SimpleStreamOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error) {
-			return ai.StreamSimpleWithContext(ctx, m, c, o)
-		}
-	}
-
-	llmStream, err := streamFn(ctx, config.Model, llmCtx, opts)
-	if err != nil {
-		log.Printf("agent: streamFn error: %v", err)
-		return core.AssistantMessage{}, trimmedMessages, err
-	}
-	if llmStream == nil {
-		log.Printf("agent: streamFn returned nil stream")
-		return core.AssistantMessage{}, trimmedMessages, fmt.Errorf("agent: stream function returned nil stream")
-	}
-
-	// Partial message for streaming updates
-	var partialMsg core.AssistantMessage
-	partialMsg.Role = "assistant"
-	partialMsg.Timestamp = time.Now()
-
-	stream.Push(EventMessageStart{Message: partialMsg})
-
-	// Iterate over LLM events
-	_, err = llmStream.ForEach(ctx, func(evt core.AssistantMessageEvent) error {
-		switch e := evt.(type) {
-		case core.EventStart:
-			partialMsg.API = e.API
-			partialMsg.Provider = e.Provider
-			partialMsg.Model = e.Model
-		case core.EventTextDelta:
-			partialMsg.Content = appendOrUpdateText(partialMsg.Content, e.Delta)
-		case core.EventThinkingDelta:
-			partialMsg.Content = appendOrUpdateThinking(partialMsg.Content, e.Delta)
-		case core.EventToolCallStart:
-			partialMsg.Content = append(partialMsg.Content, core.ToolCall{
-				Type: "toolCall", ID: e.ID, Name: e.Name,
-			})
-		case core.EventToolCallDelta:
-			partialMsg.Content = updateToolCallArgs(partialMsg.Content, e.ID, e.ArgumentsDelta)
-		case core.EventToolCallEnd:
-			partialMsg.Content = finalizeToolCallArgs(partialMsg.Content, e.ID, e.Arguments)
-		case core.EventTextEnd:
-			if e.TextSignature != "" {
-				partialMsg.Content = setTextSignature(partialMsg.Content, e.TextSignature)
-			}
-		case core.EventThinkingEnd:
-			if e.ThinkingSignature != "" {
-				partialMsg.Content = setThinkingSignature(partialMsg.Content, e.ThinkingSignature)
-			}
-		case core.EventDone:
-			partialMsg = e.Message
-		case core.EventError:
-			return fmt.Errorf("%s", e.ErrorMessage)
-		}
-
-		stream.Push(EventMessageUpdate{
-			Message:        partialMsg,
-			AssistantEvent: evt,
-		})
-		return nil
-	})
+	llmStream, err := invokeStreamFn(ctx, config, llmCtx, opts)
 	if err != nil {
 		return core.AssistantMessage{}, trimmedMessages, err
 	}
 
-	// Use partialMsg which has been updated with EventDone.Message containing Usage data
+	partialMsg, err := consumeStreamEvents(ctx, llmStream, stream)
+	if err != nil {
+		return core.AssistantMessage{}, trimmedMessages, err
+	}
+
 	stream.Push(EventMessageEnd{Message: partialMsg})
 	return partialMsg, trimmedMessages, nil
 }
 
-// executeToolCalls executes tool calls and returns the results.
+func transformContext(ctx context.Context, config AgentLoopConfig, messages []core.Message) []core.Message {
+	if config.TransformContext != nil {
+		return config.TransformContext(messages)
+	}
+	return messages
+}
+
+func convertToLLM(config AgentLoopConfig, messages []core.Message) []core.Message {
+	if config.ConvertToLlm != nil {
+		return config.ConvertToLlm(messages)
+	}
+	return defaultConvertToLlm(messages)
+}
+
+func resolveStreamOptions(config *AgentLoopConfig) core.SimpleStreamOptions {
+	opts := config.SimpleStreamOptions
+	if config.GetApiKey != nil {
+		if key := config.GetApiKey(); key != "" {
+			opts.APIKey = key
+		}
+	}
+	return opts
+}
+
+func invokeStreamFn(ctx context.Context, config AgentLoopConfig, llmCtx core.Context, opts core.SimpleStreamOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error) {
+	if config.StreamFn != nil {
+		return config.StreamFn(ctx, config.Model, llmCtx, opts)
+	}
+	return llm.StreamSimpleWithContext(ctx, config.Model, llmCtx, opts)
+}
+
+func consumeStreamEvents(ctx context.Context, llmStream *core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], stream *AgentEventStream) (core.AssistantMessage, error) {
+	partialMsg := core.AssistantMessage{
+		Role:      core.MessageRoleAssistant,
+		Timestamp: time.Now(),
+	}
+	stream.Push(EventMessageStart{Message: partialMsg})
+
+	_, err := llmStream.ForEach(ctx, func(evt core.AssistantMessageEvent) error {
+		partialMsg = applyAssistantEvent(partialMsg, evt)
+		stream.Push(EventMessageUpdate{Message: partialMsg, AssistantEvent: evt})
+		return nil
+	})
+	if err != nil {
+		return core.AssistantMessage{}, err
+	}
+	return partialMsg, nil
+}
+
+func applyAssistantEvent(msg core.AssistantMessage, evt core.AssistantMessageEvent) core.AssistantMessage {
+	switch e := evt.(type) {
+	case core.EventStart:
+		msg.API = e.API
+		msg.Provider = e.Provider
+		msg.Model = e.Model
+	case core.EventTextDelta:
+		msg.Content = appendOrUpdateText(msg.Content, e.Delta)
+	case core.EventThinkingDelta:
+		msg.Content = appendOrUpdateThinking(msg.Content, e.Delta)
+	case core.EventToolCallStart:
+		msg.Content = append(msg.Content, core.ToolCall{
+			Type: "toolCall", ID: e.ID, Name: e.Name,
+		})
+	case core.EventToolCallDelta:
+		msg.Content = updateToolCallArgs(msg.Content, e.ID, e.ArgumentsDelta)
+	case core.EventToolCallEnd:
+		msg.Content = finalizeToolCallArgs(msg.Content, e.ID, e.Arguments)
+	case core.EventTextEnd:
+		if e.TextSignature != "" {
+			msg.Content = setTextSignature(msg.Content, e.TextSignature)
+		}
+	case core.EventThinkingEnd:
+		if e.ThinkingSignature != "" {
+			msg.Content = setThinkingSignature(msg.Content, e.ThinkingSignature)
+		}
+	case core.EventDone:
+		msg = e.Message
+	}
+	return msg
+}
+
 func executeToolCalls(ctx context.Context, config AgentLoopConfig, assistantMsg core.AssistantMessage, toolCalls []core.ToolCall, messages []core.Message, stream *AgentEventStream) ([]core.ToolResultMessage, bool) {
-	// Determine execution mode
+	mode := resolveExecutionMode(config, toolCalls)
+	switch mode {
+	case ToolExecSequential:
+		return executeToolCallsSequential(ctx, config, assistantMsg, toolCalls, messages, stream)
+	default:
+		return executeToolCallsParallel(ctx, config, assistantMsg, toolCalls, messages, stream)
+	}
+}
+
+func resolveExecutionMode(config AgentLoopConfig, toolCalls []core.ToolCall) ToolExecutionMode {
 	mode := config.ToolExecution
 	if mode == "" {
 		mode = ToolExecParallel
 	}
-	// Check if any tool requests sequential
 	for _, tc := range toolCalls {
 		if tool := findTool(config.Tools, tc.Name); tool != nil && tool.ExecutionMode == ToolExecSequential {
-			mode = ToolExecSequential
-			break
+			return ToolExecSequential
 		}
 	}
-
-	if mode == ToolExecSequential {
-		return executeToolCallsSequential(ctx, config, assistantMsg, toolCalls, messages, stream)
-	}
-	return executeToolCallsParallel(ctx, config, assistantMsg, toolCalls, messages, stream)
+	return mode
 }
 
 func executeToolCallsSequential(ctx context.Context, config AgentLoopConfig, assistantMsg core.AssistantMessage, toolCalls []core.ToolCall, messages []core.Message, stream *AgentEventStream) ([]core.ToolResultMessage, bool) {
@@ -367,7 +379,7 @@ func executeSingleToolCall(ctx context.Context, config AgentLoopConfig, assistan
 	})
 
 	resultMsg := core.ToolResultMessage{
-		Role: "tool", ToolCallID: tc.ID, ToolName: tc.Name,
+		Role: core.MessageRoleTool, ToolCallID: tc.ID, ToolName: tc.Name,
 		Content: result.Content, IsError: result.IsError,
 	}
 	return result, resultMsg
@@ -508,124 +520,4 @@ func msgSlice(msgs []core.ToolResultMessage) []core.Message {
 		result[i] = m
 	}
 	return result
-}
-
-// --- Context compaction ---
-
-// defaultTokenCounter provides a simple token counting heuristic.
-// It assumes ~4 chars per token (rough estimate for English text).
-func defaultTokenCounter(systemPrompt string, messages []core.Message, tools []core.Tool) int {
-	tokens := len(systemPrompt) / 4
-
-	for _, msg := range messages {
-		tokens += messageTokenCount(msg) / 4
-	}
-
-	// Add overhead for tools
-	tokens += len(tools) * 100
-
-	return tokens
-}
-
-// messageTokenCount estimates the token count for a single message.
-func messageTokenCount(msg core.Message) int {
-	switch m := msg.(type) {
-	case core.UserMessage:
-		return userMessageTokenCount(m)
-	case core.AssistantMessage:
-		return contentTokenCount(m.Content)
-	case core.ToolResultMessage:
-		return contentTokenCount(m.Content)
-	default:
-		return 0
-	}
-}
-
-// userMessageTokenCount handles the any type of UserMessage.Content
-func userMessageTokenCount(m core.UserMessage) int {
-	switch c := m.Content.(type) {
-	case []core.ContentBlock:
-		return contentTokenCount(c)
-	case string:
-		return len(c)
-	default:
-		return 0
-	}
-}
-
-// contentTokenCount estimates the token count for content blocks.
-func contentTokenCount(blocks []core.ContentBlock) int {
-	count := 0
-	for _, block := range blocks {
-		switch b := block.(type) {
-		case core.TextContent:
-			count += len(b.Text)
-		case core.ThinkingContent:
-			count += len(b.Thinking)
-		case core.ToolCall:
-			count += len(b.Name) + len(b.Arguments) + 50 // base overhead for tool call
-		}
-	}
-	return count
-}
-
-// defaultTransformContext provides default context management with automatic compaction.
-// It is used when TransformContext is not provided in the config.
-func defaultTransformContext(ctx context.Context, config AgentLoopConfig, messages []core.Message) []core.Message {
-	// If no compaction config is provided, return messages as-is
-	if config.Compaction == nil || config.Compactor == nil {
-		return messages
-	}
-
-	// Convert AgentTool to core.Tool
-	coreTools := make([]core.Tool, 0, len(config.Tools))
-	for _, t := range config.Tools {
-		coreTools = append(coreTools, core.Tool{
-			Name:        t.Name,
-			Description: t.Description,
-			Parameters:  t.Parameters,
-		})
-	}
-
-	// Check if compaction is needed
-	needsCompaction := core.NeedsCompaction(
-		defaultTokenCounter,
-		config.SystemPrompt,
-		messages,
-		coreTools,
-		*config.Compaction,
-	)
-
-	if !needsCompaction {
-		return messages
-	}
-
-	log.Printf("agent: context compaction triggered")
-
-	// Plan compaction
-	req, err := core.PlanCompaction(
-		defaultTokenCounter,
-		config.SystemPrompt,
-		messages,
-		coreTools,
-		*config.Compaction,
-	)
-	if err != nil {
-		log.Printf("agent: compaction plan failed: %v", err)
-		return messages
-	}
-
-	// Perform compaction
-	summary, err := config.Compactor.Compact(ctx, config.SystemPrompt, req.ToSummarize)
-	if err != nil {
-		log.Printf("agent: compaction failed: %v", err)
-		return messages
-	}
-
-	// Build compacted messages
-	compacted := core.BuildCompactedMessages(summary, req.ToKeep)
-
-	log.Printf("agent: compacted %d -> %d tokens", req.TokensBefore, defaultTokenCounter(config.SystemPrompt, compacted, coreTools))
-
-	return compacted
 }

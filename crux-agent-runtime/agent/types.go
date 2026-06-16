@@ -194,9 +194,7 @@ type AgentLoopConfig struct {
 	StreamFn StreamFn
 
 	// Compaction configures automatic context compaction.
-	Compaction *core.CompactionConfig
 	// Compactor is the compaction strategy.
-	Compactor core.Compactor
 }
 
 // findTool looks up a tool by name.

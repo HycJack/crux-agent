@@ -3,6 +3,6 @@ module crux-agent-runtime
 
 go 1.23.0
 
-require crux-ai v0.0.1
+require github.com/hycjack/crux-ai v0.0.1
 
-replace crux-ai => ../crux-ai
+replace github.com/hycjack/crux-ai => ../crux-ai

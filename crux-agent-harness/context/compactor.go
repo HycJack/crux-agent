@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/hycjack/crux-ai/ai"
+	"github.com/hycjack/crux-ai/llm"
 	core "github.com/hycjack/crux-ai/core"
 )
 
@@ -48,7 +48,7 @@ func (c *LLMCompactor) Compact(ctx context.Context, req CompactionRequest, opts 
 		streamOpts = opts
 	}
 
-	msg, err := ai.CompleteSimple(ctx, c.Model, []core.Message{
+	msg, err := llm.CompleteSimple(ctx, c.Model, []core.Message{
 		core.UserMessage{Content: prompt},
 	}, streamOpts...)
 	if err != nil {
