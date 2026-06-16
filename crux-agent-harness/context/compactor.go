@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"crux-ai/ai"
-	core "crux-ai/core"
+	"github.com/hycjack/crux-ai/ai"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // Compactor is the interface for compaction strategies.

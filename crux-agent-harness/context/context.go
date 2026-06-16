@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"crux-agent-harness/token"
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // Budget describes the token budget for a context window.

@@ -5,7 +5,7 @@ import (
 	"os"
 	"sync"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // JSONLStorage persists session entries as newline-delimited JSON.

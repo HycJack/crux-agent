@@ -3,7 +3,7 @@ package token
 import (
 	"encoding/json"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // MessageCounter counts tokens in a slice of messages.

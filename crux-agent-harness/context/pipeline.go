@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 	"crux-agent-harness/token"
 )
 

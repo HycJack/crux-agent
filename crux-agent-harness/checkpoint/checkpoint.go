@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // Snapshot is a point-in-time capture of the message history.

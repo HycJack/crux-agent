@@ -3,7 +3,7 @@ package session
 import (
 	"sync"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // Session manages a conversation session as a tree of entries.
