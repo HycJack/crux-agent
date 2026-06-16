@@ -572,3 +572,718 @@ learner.ProcessUserInput("我叫小明")
 | [LangChain Memory](https://python.langchain.com/docs/modules/memory/) | 记忆抽象 | Python |
 | [Qdrant](https://github.com/qdrant/qdrant) | 向量数据库 | Rust |
 | [Chroma](https://github.com/chroma-core/chroma) | 向量数据库 | Python |
+
+---
+
+## 9. 完整配置管理
+
+### 9.1 YAML 配置
+
+```yaml
+# config.yaml
+memory:
+  # 默认 provider
+  default: vector
+  
+  # Provider 配置
+  providers:
+    # KV 存储（本地文件）
+    kv:
+      type: kv
+      path: ./data/memory.json
+      
+    # 向量数据库（Qdrant）
+    vector:
+      type: vector
+      client:
+        type: qdrant
+        host: localhost
+        port: 6333
+        collection: agent-memory
+      embedder:
+        type: openai
+        model: text-embedding-3-small
+        api_key: ${OPENAI_API_KEY}
+        
+    # 向量数据库（Chroma）
+    chroma:
+      type: vector
+      client:
+        type: chroma
+        host: localhost
+        port: 8000
+        collection: agent-memory
+      embedder:
+        type: openai
+        model: text-embedding-3-small
+        
+    # Mem0 云服务
+    mem0:
+      type: mem0
+      api_key: ${MEM0_API_KEY}
+      user_id: user-123
+      
+    # Zep 服务
+    zep:
+      type: zep
+      url: http://localhost:8000
+      api_key: ${ZEP_API_KEY}
+      
+    # RAG（文档检索）
+    rag:
+      type: rag
+      retriever:
+        type: vector
+        client:
+          type: qdrant
+          host: localhost
+          port: 6333
+          collection: documents
+        embedder:
+          type: openai
+          model: text-embedding-3-small
+          
+  # 组合策略
+  strategy:
+    type: cascade  # cascade | round_robin | primary_fallback
+    providers: [kv, vector]
+    search_limit: 10
+```
+
+### 9.2 配置加载
+
+```go
+type MemoryConfig struct {
+    Default   string                     `yaml:"default"`
+    Providers map[string]ProviderConfig  `yaml:"providers"`
+    Strategy  StrategyConfig             `yaml:"strategy"`
+}
+
+type ProviderConfig struct {
+    Type     string         `yaml:"type"`
+    Path     string         `yaml:"path,omitempty"`
+    URL      string         `yaml:"url,omitempty"`
+    APIKey   string         `yaml:"api_key,omitempty"`
+    UserID   string         `yaml:"user_id,omitempty"`
+    Client   *ClientConfig  `yaml:"client,omitempty"`
+    Embedder *EmbedderConfig `yaml:"embedder,omitempty"`
+}
+
+// LoadFromYAML 从 YAML 文件加载配置
+func LoadFromYAML(path string) (*MemoryConfig, error) {
+    data, err := os.ReadFile(path)
+    if err != nil {
+        return nil, err
+    }
+    var cfg MemoryConfig
+    if err := yaml.Unmarshal(data, &cfg); err != nil {
+        return nil, err
+    }
+    return &cfg, nil
+}
+
+// NewFromConfig 根据配置创建 MemoryProvider
+func NewFromConfig(cfg ProviderConfig) (MemoryProvider, error) {
+    switch cfg.Type {
+    case "kv":
+        return NewKVStore(cfg.Path)
+    case "vector":
+        client, err := newVectorClient(cfg.Client)
+        if err != nil {
+            return nil, err
+        }
+        embedder, err := newEmbedder(cfg.Embedder)
+        if err != nil {
+            return nil, err
+        }
+        return NewVectorStore(client, embedder, cfg.Client.Collection), nil
+    case "mem0":
+        return NewMem0Provider(cfg.APIKey, cfg.UserID), nil
+    case "zep":
+        return NewZepProvider(cfg.URL, cfg.APIKey), nil
+    default:
+        return nil, fmt.Errorf("unknown provider type: %s", cfg.Type)
+    }
+}
+```
+
+---
+
+## 10. 错误处理和重试
+
+### 10.1 错误类型
+
+```go
+// MemoryError 记忆系统错误
+type MemoryError struct {
+    Code    ErrorCode
+    Message string
+    Err     error
+    Provider string
+}
+
+type ErrorCode string
+
+const (
+    ErrCodeConnection  ErrorCode = "CONNECTION_ERROR"
+    ErrCodeTimeout     ErrorCode = "TIMEOUT"
+    ErrCodeRateLimit   ErrorCode = "RATE_LIMIT"
+    ErrCodeAuth        ErrorCode = "AUTH_ERROR"
+    ErrCodeNotFound    ErrorCode = "NOT_FOUND"
+    ErrCodeInternal    ErrorCode = "INTERNAL_ERROR"
+)
+
+func (e *MemoryError) Error() string {
+    return fmt.Sprintf("[%s] %s: %s", e.Provider, e.Code, e.Message)
+}
+
+func (e *MemoryError) Unwrap() error { return e.Err }
+
+// IsRetryable 判断是否可重试
+func (e *MemoryError) IsRetryable() bool {
+    switch e.Code {
+    case ErrCodeConnection, ErrCodeTimeout, ErrCodeRateLimit:
+        return true
+    default:
+        return false
+    }
+}
+```
+
+### 10.2 重试包装器
+
+```go
+// RetryableProvider 包装 MemoryProvider，添加重试逻辑
+type RetryableProvider struct {
+    inner      MemoryProvider
+    maxRetries int
+    baseDelay  time.Duration
+    maxDelay   time.Duration
+}
+
+func NewRetryableProvider(inner MemoryProvider, maxRetries int) *RetryableProvider {
+    return &RetryableProvider{
+        inner:      inner,
+        maxRetries: maxRetries,
+        baseDelay:  1 * time.Second,
+        maxDelay:   30 * time.Second,
+    }
+}
+
+func (p *RetryableProvider) Store(ctx context.Context, entry Entry) error {
+    return p.retry(ctx, func() error {
+        return p.inner.Store(ctx, entry)
+    })
+}
+
+func (p *RetryableProvider) Search(ctx context.Context, query string, limit int) ([]Entry, error) {
+    var result []Entry
+    err := p.retry(ctx, func() error {
+        var err error
+        result, err = p.inner.Search(ctx, query, limit)
+        return err
+    })
+    return result, err
+}
+
+func (p *RetryableProvider) retry(ctx context.Context, fn func() error) error {
+    var lastErr error
+    for attempt := 0; attempt <= p.maxRetries; attempt++ {
+        if attempt > 0 {
+            delay := p.baseDelay * time.Duration(1<<uint(attempt-1))
+            if delay > p.maxDelay {
+                delay = p.maxDelay
+            }
+            select {
+            case <-time.After(delay):
+            case <-ctx.Done():
+                return ctx.Err()
+            }
+        }
+        
+        err := fn()
+        if err == nil {
+            return nil
+        }
+        
+        lastErr = err
+        
+        // 检查是否可重试
+        var memErr *MemoryError
+        if errors.As(err, &memErr) && !memErr.IsRetryable() {
+            return err
+        }
+    }
+    return fmt.Errorf("max retries exceeded: %w", lastErr)
+}
+```
+
+---
+
+## 11. 多 Provider 组合策略
+
+### 11.1 CascadeProvider（级联查询）
+
+```go
+// CascadeProvider 依次查询多个 provider，返回第一个成功的结果
+type CascadeProvider struct {
+    providers []MemoryProvider
+    logger    *slog.Logger
+}
+
+func NewCascadeProvider(providers ...MemoryProvider) *CascadeProvider {
+    return &CascadeProvider{providers: providers}
+}
+
+func (p *CascadeProvider) Search(ctx context.Context, query string, limit int) ([]Entry, error) {
+    var lastErr error
+    for _, provider := range p.providers {
+        entries, err := provider.Search(ctx, query, limit)
+        if err == nil {
+            return entries, nil
+        }
+        lastErr = err
+        p.logger.Warn("provider search failed, trying next", 
+            "provider", providerName(provider), "error", err)
+    }
+    return nil, fmt.Errorf("all providers failed: %w", lastErr)
+}
+
+func (p *CascadeProvider) Store(ctx context.Context, entry Entry) error {
+    // 写入所有 provider
+    var errs []error
+    for _, provider := range p.providers {
+        if err := provider.Store(ctx, entry); err != nil {
+            errs = append(errs, err)
+        }
+    }
+    if len(errs) == len(p.providers) {
+        return fmt.Errorf("all providers failed to store: %v", errs)
+    }
+    return nil
+}
+```
+
+### 11.2 PrimaryFallbackProvider（主备切换）
+
+```go
+// PrimaryFallbackProvider 主 provider 失败时切换到备 provider
+type PrimaryFallbackProvider struct {
+    primary   MemoryProvider
+    fallback  MemoryProvider
+    healthy   atomic.Bool
+    logger    *slog.Logger
+}
+
+func (p *PrimaryFallbackProvider) Search(ctx context.Context, query string, limit int) ([]Entry, error) {
+    if p.healthy.Load() {
+        entries, err := p.primary.Search(ctx, query, limit)
+        if err == nil {
+            return entries, nil
+        }
+        p.logger.Warn("primary provider failed, switching to fallback", "error", err)
+        p.healthy.Store(false)
+    }
+    return p.fallback.Search(ctx, query, limit)
+}
+
+// HealthCheck 定期检查主 provider 健康状态
+func (p *PrimaryFallbackProvider) HealthCheck(ctx context.Context, interval time.Duration) {
+    ticker := time.NewTicker(interval)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ticker.C:
+            _, err := p.primary.Search(ctx, "health", 1)
+            if err == nil {
+                p.healthy.Store(true)
+            }
+        case <-ctx.Done():
+            return
+        }
+    }
+}
+```
+
+### 11.3 RoundRobinProvider（轮询）
+
+```go
+// RoundRobinProvider 轮询多个 provider
+type RoundRobinProvider struct {
+    providers []MemoryProvider
+    counter   atomic.Uint64
+}
+
+func (p *RoundRobinProvider) Search(ctx context.Context, query string, limit int) ([]Entry, error) {
+    idx := p.counter.Add(1) % uint64(len(p.providers))
+    return p.providers[idx].Search(ctx, query, limit)
+}
+```
+
+---
+
+## 12. 测试用 Mock Provider
+
+```go
+// MockProvider 用于测试的 mock 实现
+type MockProvider struct {
+    StoreFunc   func(ctx context.Context, entry Entry) error
+    SearchFunc  func(ctx context.Context, query string, limit int) ([]Entry, error)
+    GetFunc     func(ctx context.Context, key string) (Entry, bool, error)
+    DeleteFunc  func(ctx context.Context, key string) error
+    entries     map[string]Entry
+}
+
+func NewMockProvider() *MockProvider {
+    return &MockProvider{
+        entries: make(map[string]Entry),
+    }
+}
+
+func (m *MockProvider) Store(ctx context.Context, entry Entry) error {
+    if m.StoreFunc != nil {
+        return m.StoreFunc(ctx, entry)
+    }
+    m.entries[entry.Key] = entry
+    return nil
+}
+
+func (m *MockProvider) Search(ctx context.Context, query string, limit int) ([]Entry, error) {
+    if m.SearchFunc != nil {
+        return m.SearchFunc(ctx, query, limit)
+    }
+    var results []Entry
+    for _, e := range m.entries {
+        results = append(results, e)
+        if limit > 0 && len(results) >= limit {
+            break
+        }
+    }
+    return results, nil
+}
+
+func (m *MockProvider) Get(ctx context.Context, key string) (Entry, bool, error) {
+    if m.GetFunc != nil {
+        return m.GetFunc(ctx, key)
+    }
+    entry, ok := m.entries[key]
+    return entry, ok, nil
+}
+
+func (m *MockProvider) Delete(ctx context.Context, key string) error {
+    if m.DeleteFunc != nil {
+        return m.DeleteFunc(ctx, key)
+    }
+    delete(m.entries, key)
+    return nil
+}
+
+func (m *MockProvider) FormatForPrompt(ctx context.Context, query string, limit int) (string, error) {
+    entries, _ := m.Search(ctx, query, limit)
+    return formatEntries(entries), nil
+}
+
+func (m *MockProvider) Close() error { return nil }
+
+// WithError 设置下次调用返回错误
+func (m *MockProvider) WithError(err error) *MockProvider {
+    m.SearchFunc = func(ctx context.Context, query string, limit int) ([]Entry, error) {
+        return nil, err
+    }
+    return m
+}
+```
+
+---
+
+## 13. 迁移指南
+
+### 13.1 从旧 Memory 迁移
+
+```go
+// 旧代码
+mem, _ := memory.New("./memory.json")
+mem.Set("user.name", "小明")
+
+// 新代码（兼容旧 API）
+mem, _ := memory.New("./memory.json")
+mem.Set("user.name", "小明")  // 仍然可用
+
+// 新代码（使用 MemoryProvider 接口）
+var provider memory.MemoryProvider = memory.NewVectorStoreAdapter(mem)
+provider.Store(ctx, memory.Entry{
+    Key:   "user.name",
+    Value: "小明",
+})
+```
+
+### 13.2 从 KV 迁移到 Vector
+
+```go
+// 1. 读取旧数据
+oldMem, _ := memory.New("./memory.json")
+entries, _ := oldMem.ListByCategory("")
+
+// 2. 写入新 provider
+newMem := memory.NewVectorStore(client, embedder, "agent-memory")
+for _, e := range entries {
+    newMem.Store(ctx, memory.Entry{
+        Key:      e.Key,
+        Value:    e.Value,
+        Category: e.Category,
+    })
+}
+
+// 3. 切换配置
+// config.yaml: memory.default = vector
+```
+
+### 13.3 零停机迁移
+
+```go
+// 使用 PrimaryFallbackProvider 实现零停机迁移
+oldProvider := memory.NewKVStore("./old-memory.json")
+newProvider := memory.NewVectorStore(client, embedder, "new-memory")
+
+// 先从旧 provider 复制数据到新 provider
+migrateData(ctx, oldProvider, newProvider)
+
+// 使用 PrimaryFallbackProvider，新 provider 为主
+provider := memory.NewPrimaryFallbackProvider(newProvider, oldProvider)
+
+// 验证新 provider 正常后，移除旧 provider
+```
+
+---
+
+## 14. 监控和可观测性
+
+### 14.1 指标收集
+
+```go
+// MetricsProvider 包装 MemoryProvider，收集指标
+type MetricsProvider struct {
+    inner     MemoryProvider
+    storeOps  *prometheus.CounterVec
+    searchOps *prometheus.CounterVec
+    latency   *prometheus.HistogramVec
+}
+
+func NewMetricsProvider(inner MemoryProvider, reg prometheus.Registerer) *MetricsProvider {
+    return &MetricsProvider{
+        inner: inner,
+        storeOps: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+            Name: "memory_store_operations_total",
+            Help: "Total number of store operations",
+        }, []string{"status"}),
+        searchOps: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+            Name: "memory_search_operations_total",
+            Help: "Total number of search operations",
+        }, []string{"status"}),
+        latency: promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
+            Name:    "memory_operation_duration_seconds",
+            Help:    "Duration of memory operations",
+            Buckets: prometheus.ExponentialBuckets(0.001, 2, 10),
+        }, []string{"operation"}),
+    }
+}
+
+func (p *MetricsProvider) Store(ctx context.Context, entry Entry) error {
+    start := time.Now()
+    err := p.inner.Store(ctx, entry)
+    p.latency.WithLabelValues("store").Observe(time.Since(start).Seconds())
+    if err != nil {
+        p.storeOps.WithLabelValues("error").Inc()
+    } else {
+        p.storeOps.WithLabelValues("success").Inc()
+    }
+    return err
+}
+```
+
+### 14.2 健康检查
+
+```go
+// HealthChecker 定期检查 provider 健康状态
+type HealthChecker struct {
+    provider MemoryProvider
+    interval time.Duration
+    timeout  time.Duration
+    status   atomic.Bool
+}
+
+func (h *HealthChecker) Start(ctx context.Context) {
+    ticker := time.NewTicker(h.interval)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ticker.C:
+            checkCtx, cancel := context.WithTimeout(ctx, h.timeout)
+            _, err := h.provider.Search(checkCtx, "health", 1)
+            h.status.Store(err == nil)
+            cancel()
+        case <-ctx.Done():
+            return
+        }
+    }
+}
+
+func (h *HealthChecker) IsHealthy() bool {
+    return h.status.Load()
+}
+```
+
+---
+
+## 15. 性能优化
+
+### 15.1 连接池
+
+```go
+// PooledClient 带连接池的向量客户端
+type PooledClient struct {
+    pool *sync.Pool
+    factory func() VectorClient
+}
+
+func NewPooledClient(factory func() VectorClient, size int) *PooledClient {
+    return &PooledClient{
+        factory: factory,
+        pool: &sync.Pool{
+            New: func() interface{} {
+                return factory()
+            },
+        },
+    }
+}
+
+func (c *PooledClient) Search(ctx context.Context, collection string, vector []float32, limit int) ([]SearchResult, error) {
+    client := c.pool.Get().(VectorClient)
+    defer c.pool.Put(client)
+    return client.Search(ctx, collection, vector, limit)
+}
+```
+
+### 15.2 批量操作
+
+```go
+// BatchStore 批量存储
+func BatchStore(ctx context.Context, provider MemoryProvider, entries []Entry, batchSize int) error {
+    for i := 0; i < len(entries); i += batchSize {
+        end := i + batchSize
+        if end > len(entries) {
+            end = len(entries)
+        }
+        batch := entries[i:end]
+        
+        // 并行存储
+        var wg sync.WaitGroup
+        errCh := make(chan error, len(batch))
+        for _, entry := range batch {
+            wg.Add(1)
+            go func(e Entry) {
+                defer wg.Done()
+                if err := provider.Store(ctx, e); err != nil {
+                    errCh <- err
+                }
+            }(entry)
+        }
+        wg.Wait()
+        close(errCh)
+        
+        for err := range errCh {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+### 15.3 缓存层
+
+```go
+// CachedProvider 带 LRU 缓存的 provider
+type CachedProvider struct {
+    inner   MemoryProvider
+    cache   *lru.Cache[string, Entry]
+    ttl     time.Duration
+}
+
+func NewCachedProvider(inner MemoryProvider, cacheSize int, ttl time.Duration) *CachedProvider {
+    cache, _ := lru.New[string, Entry](cacheSize)
+    return &CachedProvider{
+        inner: inner,
+        cache: cache,
+        ttl:   ttl,
+    }
+}
+
+func (p *CachedProvider) Get(ctx context.Context, key string) (Entry, bool, error) {
+    // 先查缓存
+    if entry, ok := p.cache.Get(key); ok {
+        if time.Since(entry.UpdatedAt) < p.ttl {
+            return entry, true, nil
+        }
+        p.cache.Remove(key)
+    }
+    
+    // 查 provider
+    entry, found, err := p.inner.Get(ctx, key)
+    if err != nil {
+        return Entry{}, false, err
+    }
+    if found {
+        p.cache.Add(key, entry)
+    }
+    return entry, found, nil
+}
+```
+
+---
+
+## 16. 完整使用示例
+
+### 16.1 生产环境配置
+
+```go
+func setupMemory(cfg *MemoryConfig) (memory.MemoryProvider, error) {
+    // 1. 创建主 provider（向量数据库）
+    mainProvider, err := memory.NewFromConfig(cfg.Providers["vector"])
+    if err != nil {
+        return nil, err
+    }
+    
+    // 2. 添加重试
+    retryableProvider := memory.NewRetryableProvider(mainProvider, 3)
+    
+    // 3. 添加缓存
+    cachedProvider := memory.NewCachedProvider(retryableProvider, 1000, 5*time.Minute)
+    
+    // 4. 添加指标
+    metricsProvider := memory.NewMetricsProvider(cachedProvider, prometheus.DefaultRegisterer)
+    
+    // 5. 启动健康检查
+    healthChecker := memory.NewHealthChecker(metricsProvider, 30*time.Second, 5*time.Second)
+    go healthChecker.Start(context.Background())
+    
+    return metricsProvider, nil
+}
+```
+
+### 16.2 开发环境配置
+
+```go
+func setupMemoryDev() memory.MemoryProvider {
+    // 简单的内存存储
+    return memory.NewKVStore("./dev-memory.json")
+}
+```
+
+### 16.3 测试配置
+
+```go
+func setupMemoryTest() memory.MemoryProvider {
+    // Mock provider
+    return memory.NewMockProvider()
+}
