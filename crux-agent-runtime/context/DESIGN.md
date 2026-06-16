@@ -10,37 +10,54 @@
 
 Token 计数、上下文窗口压缩、自动触发压缩。
 
-**关键属性**：
-- 基于字符的 token 粗略估算（~4 chars/token）
-- 多种压缩策略（滑动窗口、LLM 摘要、链式）
-- 软限制触发压缩，硬限制强制截断
-- 与 session 集成，自动重建上下文
+**核心能力**：
+- 多种 Token 计数策略
+- 4 种压缩策略
+- 自动触发压缩
+- 上下文管理器（自动管理）
 
-## 2. 设计原则
+## 2. 架构
 
-1. **策略模式** — Compactor 接口，可替换压缩策略
-2. **链式组合** — ChainedCompactor 按顺序尝试多个策略
-3. **增量统计** — TokenStats 只计算新增消息
-4. **自动触发** — Manager 在 AddMessage 时自动检查是否需要压缩
+```
+Manager (上下文管理器)
+  │
+  ├── TokenCounter (接口)
+  │     └── DefaultTokenCounter  # ~4 chars/token
+  │
+  ├── Compactor (接口)
+  │     ├── SlideWindow          # 滑动窗口
+  │     ├── LLMSummarize         # LLM 摘要
+  │     ├── ChainedCompactor     # 链式组合
+  │     └── ContextWindowCompactor # Token 感知
+  │
+  └── ContextWindowConfig       # 配置
+```
 
 ## 3. 核心类型
 
-```go
-// Token 计数函数
-type TokenCounter func(systemPrompt string, messages []core.Message, tools []core.Tool) int
+### TokenCounter
 
-// 压缩策略接口
+```go
+type TokenCounter func(systemPrompt string, messages []core.Message, tools []core.Tool) int
+```
+
+### ContextWindowConfig
+
+```go
+type ContextWindowConfig struct {
+    MaxTokens     int          // 最大 token 数（默认 128000）
+    ReserveTokens int          // 预留给响应（默认 4096）
+    MinMessages   int          // 压缩后最少消息数（默认 4）
+    TokenCounter  TokenCounter // 自定义计数器
+}
+```
+
+### Compactor 接口
+
+```go
 type Compactor interface {
     Compact(ctx context.Context, msgs []core.Message) ([]core.Message, bool, error)
     Name() string
-}
-
-// 上下文窗口配置
-type ContextWindowConfig struct {
-    MaxTokens     int  // 最大 token 数
-    ReserveTokens int  // 预留给响应的 token
-    MinMessages   int  // 压缩后最少保留的消息数
-    TokenCounter  TokenCounter
 }
 ```
 
@@ -48,10 +65,76 @@ type ContextWindowConfig struct {
 
 | 策略 | LLM 调用 | 信息保留 | 性能 | 使用场景 |
 |------|----------|----------|------|----------|
-| SlideWindow | ❌ | 低（丢弃旧消息）| 最快 | 高吞吐、低延迟 |
-| LLMSummarize | ✅ | 高（生成摘要）| 慢 | 长对话、重要上下文 |
-| ChainedCompactor | 可选 | 灵活 | 中等 | 组合策略 |
-| ContextWindowCompactor | 可选 | 自动 | 中等 | 自动管理 |
+| **SlideWindow** | ❌ | 低 | 最快 | 高吞吐、低延迟 |
+| **LLMSummarize** | ✅ | 高 | 慢 | 长对话、重要上下文 |
+| **ChainedCompactor** | 可选 | 灵活 | 中等 | 组合策略 |
+| **ContextWindowCompactor** | 可选 | 自动 | 中等 | 自动管理 |
+
+### SlideWindow
+
+```go
+compactor := NewSlideWindow(50)  // 保留最后 50 条消息
+```
+
+**逻辑**：
+```
+[msg1, msg2, ..., msg100] → [msg51, msg52, ..., msg100]
+```
+
+### LLMSummarize
+
+```go
+compactor := NewLLMSummarize()
+compactor.KeepLast = 10      // 保留最后 10 条
+compactor.MinTrigger = 30    // 至少 30 条才触发
+compactor.Summarize = func(ctx context.Context, dropped []core.Message) (string, error) {
+    return llm.CompleteSimple(ctx, model, dropped)
+}
+```
+
+**逻辑**：
+```
+[msg1, ..., msg100] 
+  → 摘要: "用户询问天气，助手回复..."
+  → [摘要, msg91, msg92, ..., msg100]
+```
+
+### ChainedCompactor
+
+```go
+compactor := &ChainedCompactor{
+    Compactors: []Compactor{
+        NewLLMSummarize(),   // 先尝试 LLM 摘要
+        NewSlideWindow(50),  // 失败则滑动窗口
+    },
+}
+```
+
+**逻辑**：
+```
+策略1.Compact() → 成功？返回
+策略2.Compact() → 成功？返回
+原始消息（无变化）
+```
+
+### ContextWindowCompactor
+
+```go
+config := ContextWindowConfig{
+    MaxTokens:     1000,
+    ReserveTokens: 200,
+    MinMessages:   2,
+}
+compactor := NewContextWindowCompactor(config, NewSlideWindow(5))
+```
+
+**逻辑**：
+```
+Token > MaxTokens - ReserveTokens?
+  │
+  ├─ Yes → 触发内部 compactor
+  └─ No  → 返回原消息
+```
 
 ## 5. Token 估算策略
 
@@ -71,9 +154,61 @@ func estimateStringTokens(s string) int {
 }
 ```
 
-**注意**：这是粗略估算。精确计数需要使用 tiktoken 等库。
+**精度说明**：
+- 粗略估算，误差 ±20%
+- 精确计数需要 tiktoken 等库
+- CJK 字符按 1.5 字符/token 计算
+- ASCII 字符按 4 字符/token 计算
 
-## 6. 压缩流程
+## 6. Manager（上下文管理器）
+
+```go
+type Manager struct {
+    config    ContextWindowConfig
+    compactor Compactor
+    counter   TokenCounter
+    messages  []core.Message
+    totalTokens int
+    compactions int
+}
+```
+
+### 核心功能
+
+```go
+// 创建管理器
+mgr := NewManager(config)
+mgr.SetCompactor(NewSlideWindow(50))
+mgr.LoadFromSession(session)
+
+// 添加消息（自动触发压缩）
+mgr.AddMessage(msg)
+
+// 获取当前上下文
+ctx := mgr.GetContext()
+msgs := mgr.GetMessages()
+
+// 监控
+stats := mgr.GetStats()
+// {TotalTokens, MessageCount, Compactions, MaxTokens, UsagePercent}
+
+mgr.IsNearLimit(0.8)  // 是否接近限制
+```
+
+### Stats
+
+```go
+type Stats struct {
+    TotalTokens     int
+    MessageCount    int
+    Compactions     int
+    MaxTokens       int
+    AvailableTokens int
+    UsagePercent    float64
+}
+```
+
+## 7. 压缩流程
 
 ```
 Manager.AddMessage(msg)
@@ -90,29 +225,6 @@ Manager.AddMessage(msg)
             ├─ SlideWindow: 保留最后 N 条
             ├─ LLMSummarize: 生成摘要 + 保留最后 N 条
             └─ ChainedCompactor: 按顺序尝试
-```
-
-## 7. Manager 统计
-
-```go
-type Stats struct {
-    TotalTokens     int
-    MessageCount    int
-    Compactions     int
-    MaxTokens       int
-    AvailableTokens int
-    UsagePercent    float64
-}
-
-mgr.GetStats()
-// {
-//   TotalTokens: 50000,
-//   MessageCount: 100,
-//   Compactions: 3,
-//   MaxTokens: 128000,
-//   AvailableTokens: 123904,
-//   UsagePercent: 40.3
-// }
 ```
 
 ## 8. 集成点
@@ -138,13 +250,23 @@ ctxMgr.LoadFromSession(sess)
 ### 与 Memory
 
 ```go
-// Memory 格式化为 prompt 后，也计入 token
-memPrompt := mem.FormatForPrompt()
+memPrompt := mem.FormatForPrompt(ctx, "", 0)
 ctxMgr.SetSystemPrompt(basePrompt + "\n\n" + memPrompt)
 ```
 
-## 9. 后续计划
+## 9. 测试策略
 
-- [ ] 支持 tiktoken 精确计数
-- [ ] 按消息类型加权（工具结果 token 更多）
-- [ ] 压缩历史记录（记录每次压缩的摘要）
+| 测试类型 | 测试内容 |
+|----------|----------|
+| Token 计数 | 中英文混合、空消息、超长消息 |
+| 滑动窗口 | 边界条件、空消息、单条消息 |
+| LLM 摘要 | 触发条件、摘要生成、错误处理 |
+| 链式压缩 | 策略顺序、失败回退 |
+| Manager | 添加消息、自动压缩、统计 |
+
+## 10. 后续计划
+
+- [ ] tiktoken 精确计数
+- [ ] 按消息类型加权
+- [ ] 压缩历史记录
+- [ ] 异步压缩

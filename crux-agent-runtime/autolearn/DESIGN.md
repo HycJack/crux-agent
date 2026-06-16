@@ -10,32 +10,72 @@
 
 从对话中自动提取可记忆的事实，写入 memory。
 
-**关键属性**：
+**核心能力**：
 - 4 种触发源：显式标记、工具结果、自然语言、LLM 提取
 - Key 白名单过滤（防止 LLM 幻觉）
 - 增量去重（同 key 只更新一次）
 - 可禁用（Settings.AutoLearn = false）
 
-## 2. 设计原则
+## 2. 架构
 
-1. **多源触发** — 支持显式标记、工具输出、自然语言、LLM 提取
-2. **异步执行** — LLM 提取不阻塞主对话
-3. **白名单过滤** — LLM 输出必须在允许的 key 前缀内
-4. **可禁用** — Settings.AutoLearn = false 关闭 LLM 提取
+```
+AutoLearner
+  │
+  ├── MemoryProvider (接口)  ← 注入
+  │
+  ├── 触发源
+  │     ├── ExtractFromUserInput()     # 显式标记
+  │     ├── ExtractFromToolResult()    # 工具结果
+  │     ├── ExtractFromNaturalLanguage() # 自然语言
+  │     └── LLMSimpleExtractor         # LLM 提取
+  │
+  └── apply(triggers) → MemoryProvider.Store()
+```
 
-## 3. 触发源对比
+## 3. 核心类型
+
+### Settings
+
+```go
+type Settings struct {
+    AutoLearn     bool    // 启用 LLM 提取（默认 false）
+    ExtractEveryN int     // 每 N 轮触发（默认 5）
+    MinConfidence float64 // 置信度阈值（默认 0.7）
+}
+```
+
+### Trigger
+
+```go
+type Trigger struct {
+    Source  TriggerSource  // "user", "tool", "extract"
+    Key     string
+    Value   string
+    Context string
+    Time    time.Time
+}
+```
+
+### Extractor
+
+```go
+type Extractor interface {
+    Extract(ctx context.Context, messages []core.Message) ([]Trigger, error)
+}
+```
+
+## 4. 触发源对比
 
 | 触发源 | 延迟 | 准确性 | 成本 | 使用场景 |
 |--------|------|--------|------|----------|
-| 显式标记 | 无 | 100% | 无 | 用户主动 [remember:key=val] |
-| 工具结果 | 无 | 100% | 无 | 工具输出 REMEMBER:key=val |
-| 自然语言 | 无 | ~80% | 无 | "我叫张三" → user.name=张三 |
-| LLM 提取 | 高 | ~90% | 有 | 每 N 轮异步提取 |
+| **显式标记** | 无 | 100% | 无 | [remember:key=val] |
+| **工具结果** | 无 | 100% | 无 | REMEMBER:key=val |
+| **自然语言** | 无 | ~80% | 无 | "我叫张三" |
+| **LLM 提取** | 高 | ~90% | 有 | 每 N 轮触发 |
 
-## 4. 自然语言提取规则
+## 5. 自然语言提取规则
 
 ```go
-// 支持的模式
 "你叫小七"          → assistant.name=小七
 "你的名字叫小七"    → assistant.name=小七
 "你是小七"          → assistant.name=小七
@@ -45,30 +85,30 @@
 "请用中文回答"      → user.preferred_language=中文
 ```
 
-## 5. LLM 提取 Key 白名单
+## 6. LLM 提取 Key 白名单
 
 ```
-A. user.*          — 用户信息
-B. assistant.*     — AI 信息
-C. task.*          — 当前任务
-D. project.*       — 项目信息
-E. fact.*          — 关键事实
-F. decision.*      — 已做决策
-G. constraint.*    — 约束条件
-H. relation.*      — 关系
-I. family.*        — 家庭
-J. pet.*           — 宠物
-K. health.*        — 健康
-L. diet.*          — 饮食
-M. date.*          — 日期
-N. asset.*         — 资产
-O. style.*         — 风格
-P. tool.*          — 工具
-Q. goal.*          — 目标
-R. pain.*          — 痛点
+user.*          — 用户信息
+assistant.*     — AI 信息
+task.*          — 当前任务
+project.*       — 项目信息
+fact.*          — 关键事实
+decision.*      — 已做决策
+constraint.*    — 约束条件
+relation.*      — 关系
+family.*        — 家庭
+pet.*           — 宠物
+health.*        — 健康
+diet.*          — 饮食
+date.*          — 日期
+asset.*         — 资产
+style.*         — 风格
+tool.*          — 工具
+goal.*          — 目标
+pain.*          — 痛点
 ```
 
-## 6. 提取流程
+## 7. 提取流程
 
 ```
 ProcessUserInput(text)
@@ -81,11 +121,11 @@ ProcessUserInput(text)
   │
   └─ apply(triggers)
        ├─ 过滤空 key/value
-       ├─ mem.SetWithCategory(key, value, source)
-       └─ mem.Save()
+       ├─ MemoryProvider.Store(ctx, Entry{...})
+       └─ 去重
 ```
 
-## 7. LLM 提取流程
+## 8. LLM 提取流程
 
 ```
 MaybeExtract(ctx, messages, extractor)
@@ -102,7 +142,7 @@ MaybeExtract(ctx, messages, extractor)
        └─ 去重
 ```
 
-## 8. 集成点
+## 9. 集成点
 
 ### 与 Agent Loop
 
@@ -126,21 +166,36 @@ config.OnEvent = func(e agent.AgentEvent) {
 ### 与 Memory
 
 ```go
+// AutoLearn 使用 MemoryProvider 接口
 mem, _ := memory.New("./memory.json")
 learner := autolearn.New(mem, settings)
-// learner.ProcessUserInput() 自动调用 mem.Set()
+
+// 或使用向量存储
+vecMem := memory.NewVectorStore(client, embedder, "memory")
+learner := autolearn.New(vecMem, settings)
 ```
 
 ### 与 Session
 
 ```go
 // AutoLearn 独立于 session
-// session 记录对话历史，autolearn 提取长期记忆
+// Session 记录对话历史
+// AutoLearn 提取长期记忆
 ```
 
-## 9. 后续计划
+## 10. 测试策略
 
-- [ ] LLM 提取的置信度过滤
-- [ ] 记忆冲突检测（同 key 不同 value）
-- [ ] 记忆衰减（长时间未提及的记忆权重降低）
+| 测试类型 | 测试内容 |
+|----------|----------|
+| 自然语言提取 | 用户名、地点、语言偏好 |
+| 显式标记 | [remember:key=val] |
+| 工具结果 | REMEMBER:key=val |
+| LLM 提取 | 白名单过滤、去重 |
+| 集成 | ProcessUserInput + MemoryProvider |
+
+## 11. 后续计划
+
+- [ ] LLM 提取置信度过滤
+- [ ] 记忆冲突检测
+- [ ] 记忆衰减（长时间未提及权重降低）
 - [ ] 记忆分类优化（自动推断 category）
