@@ -5,39 +5,42 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // Options holds Google-specific options.
 type Options struct {
-	ToolChoice any             `json:"toolChoice,omitempty"`
+	ToolChoice any `json:"toolChoice,omitempty"`
 	Thinking   *ThinkingConfig `json:"thinking,omitempty"`
 }
 
 // ThinkingConfig configures thinking/reasoning.
 type ThinkingConfig struct {
-	Enabled      bool   `json:"enabled"`
-	BudgetTokens int    `json:"budgetTokens,omitempty"`
-	Level        string `json:"level,omitempty"`
+	Enabled     bool   `json:"enabled"`
+	BudgetTokens int   `json:"budgetTokens,omitempty"`
+	Level       string `json:"level,omitempty"` // MINIMAL, LOW, MEDIUM, HIGH
 }
 
 // Provider implements the Google Generative AI API.
 type Provider struct{}
 
 // New creates a new Google provider.
-func New() *Provider { return &Provider{} }
+func New() *Provider {
+	return &Provider{}
+}
 
-func (p *Provider) Stream(ctx context.Context, model core.Model, llmCtx core.Context, opts core.StreamOptions) (*core.AssistantMessageEventStream, error) {
+func (p *Provider) Stream(ctx context.Context, model core.Model, llmCtx core.Context, opts core.StreamOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error) {
 	return streamGoogle(ctx, model, llmCtx, opts, Options{})
 }
 
-func (p *Provider) StreamSimple(ctx context.Context, model core.Model, llmCtx core.Context, opts core.SimpleStreamOptions) (*core.AssistantMessageEventStream, error) {
+func (p *Provider) StreamSimple(ctx context.Context, model core.Model, llmCtx core.Context, opts core.SimpleStreamOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error) {
 	googleOpts := Options{}
 	if opts.Reasoning != "" {
 		googleOpts.Thinking = &ThinkingConfig{
@@ -68,17 +71,19 @@ func mapThinkingLevel(level core.ThinkingLevel) string {
 	}
 }
 
-func streamGoogle(ctx context.Context, model core.Model, c core.Context, opts core.StreamOptions, googleOpts Options) (*core.AssistantMessageEventStream, error) {
+func streamGoogle(ctx context.Context, model core.Model, c core.Context, opts core.StreamOptions, googleOpts Options) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error) {
 	apiKey := core.ResolveAPIKey(model.Provider, opts.APIKey)
 	if apiKey == "" {
 		return nil, fmt.Errorf("google: no API key provided")
 	}
+
 	baseURL := core.ResolveBaseURL(model, defaultBaseURL)
 
 	body, err := buildGoogleBody(model, c, opts, googleOpts)
 	if err != nil {
 		return nil, fmt.Errorf("google: failed to build request: %w", err)
 	}
+
 	if opts.OnPayload != nil {
 		opts.OnPayload(body)
 	}
@@ -91,6 +96,7 @@ func streamGoogle(ctx context.Context, model core.Model, c core.Context, opts co
 				stream.Error(fmt.Errorf("google: panic: %v", r))
 			}
 		}()
+
 		msg, err := doGoogleStream(ctx, baseURL, apiKey, model, body, stream, opts)
 		if err != nil {
 			stream.Error(err)
@@ -104,16 +110,24 @@ func streamGoogle(ctx context.Context, model core.Model, c core.Context, opts co
 
 func buildGoogleBody(model core.Model, c core.Context, opts core.StreamOptions, googleOpts Options) (map[string]any, error) {
 	body := map[string]any{}
+
+	// Contents (messages)
 	contents, err := ConvertMessages(c.Messages)
 	if err != nil {
 		return nil, err
 	}
 	body["contents"] = contents
+
+	// System instruction
 	if c.SystemPrompt != "" {
 		body["systemInstruction"] = map[string]any{
-			"parts": []any{map[string]any{"text": c.SystemPrompt}},
+			"parts": []any{
+				map[string]any{"text": c.SystemPrompt},
+			},
 		}
 	}
+
+	// Generation config
 	genConfig := map[string]any{}
 	if opts.MaxTokens != nil && *opts.MaxTokens > 0 {
 		genConfig["maxOutputTokens"] = *opts.MaxTokens
@@ -126,14 +140,24 @@ func buildGoogleBody(model core.Model, c core.Context, opts core.StreamOptions, 
 	if len(genConfig) > 0 {
 		body["generationConfig"] = genConfig
 	}
+
+	// Tools
 	if len(c.Tools) > 0 {
 		body["tools"] = ConvertTools(c.Tools)
 	}
+
+	// Tool config
 	if googleOpts.ToolChoice != nil {
-		body["toolConfig"] = map[string]any{"functionCallingConfig": googleOpts.ToolChoice}
+		body["toolConfig"] = map[string]any{
+			"functionCallingConfig": googleOpts.ToolChoice,
+		}
 	}
+
+	// Thinking config
 	if googleOpts.Thinking != nil {
-		thinkingConfig := map[string]any{"includeThoughts": googleOpts.Thinking.Enabled}
+		thinkingConfig := map[string]any{
+			"includeThoughts": googleOpts.Thinking.Enabled,
+		}
 		if googleOpts.Thinking.BudgetTokens > 0 {
 			thinkingConfig["thinkingBudget"] = googleOpts.Thinking.BudgetTokens
 		} else if googleOpts.Thinking.Level != "" {
@@ -141,22 +165,25 @@ func buildGoogleBody(model core.Model, c core.Context, opts core.StreamOptions, 
 		}
 		body["thinkingConfig"] = thinkingConfig
 	}
+
 	return body, nil
 }
 
-func doGoogleStream(ctx context.Context, baseURL, apiKey string, model core.Model, body map[string]any, stream *core.AssistantMessageEventStream, opts core.StreamOptions) (core.AssistantMessage, error) {
+func doGoogleStream(ctx context.Context, baseURL, apiKey string, model core.Model, body map[string]any, stream *core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], opts core.StreamOptions) (core.AssistantMessage, error) {
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
 		return core.AssistantMessage{}, err
 	}
-	url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", baseURL, model.ID)
+
+	url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s", baseURL, model.ID, apiKey)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return core.AssistantMessage{}, err
 	}
+
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-goog-api-key", apiKey)
+
 	for k, v := range model.Headers {
 		req.Header.Set(k, v)
 	}
@@ -164,21 +191,27 @@ func doGoogleStream(ctx context.Context, baseURL, apiKey string, model core.Mode
 		req.Header.Set(k, v)
 	}
 
-	client := core.NewTimeoutClient(opts.TimeoutMs)
-	resp, err := client.Do(req)
+	resp, err := core.SSEClient.Do(req)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return core.AssistantMessage{}, core.WrapHTTPTimeout(core.ProviderGoogle, 5*time.Minute, err)
+		}
 		return core.AssistantMessage{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
+		if classified := core.ClassifyHTTPError(model.Provider, resp.StatusCode, string(bodyBytes)); classified != nil {
+			return core.AssistantMessage{}, classified
+		}
 		return core.AssistantMessage{}, fmt.Errorf("google: API error %d: %s", resp.StatusCode, string(bodyBytes))
 	}
+
 	return processGoogleSSE(resp.Body, stream, model, opts)
 }
 
-func processGoogleSSE(body io.Reader, stream *core.AssistantMessageEventStream, model core.Model, opts core.StreamOptions) (core.AssistantMessage, error) {
+func processGoogleSSE(body io.Reader, stream *core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], model core.Model, opts core.StreamOptions) (core.AssistantMessage, error) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
@@ -188,70 +221,111 @@ func processGoogleSSE(body io.Reader, stream *core.AssistantMessageEventStream, 
 		thinkBuf  strings.Builder
 		toolCalls []core.ToolCall
 	)
+
 	msg.API = model.API
 	msg.Provider = model.Provider
 	msg.Model = model.ID
 	msg.Role = "assistant"
 	msg.Timestamp = time.Now()
 
-	stream.Push(core.EventStart{Type: "start", API: model.API, Provider: model.Provider, Model: model.ID, Timestamp: time.Now()})
+	stream.Push(core.EventStart{
+		Type:      "start",
+		API:       model.API,
+		Provider:  model.Provider,
+		Model:     model.ID,
+		Timestamp: time.Now(),
+	})
 
 	for scanner.Scan() {
 		line := scanner.Text()
+
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
+
 		data := strings.TrimPrefix(line, "data: ")
+
 		if opts.OnResponse != nil {
 			opts.OnResponse(data)
 		}
+
 		var chunk map[string]any
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
 		}
+
 		candidates, ok := chunk["candidates"].([]any)
 		if !ok || len(candidates) == 0 {
 			continue
 		}
+
 		candidate, ok := candidates[0].(map[string]any)
 		if !ok {
 			continue
 		}
+
+		// Finish reason
 		if finishReason, ok := candidate["finishReason"].(string); ok {
 			msg.StopReason = MapStopReason(finishReason)
 		}
+
+		// Content parts
 		content, ok := candidate["content"].(map[string]any)
 		if !ok {
 			continue
 		}
+
 		parts, ok := content["parts"].([]any)
 		if !ok {
 			continue
 		}
+
 		for _, part := range parts {
 			p, ok := part.(map[string]any)
 			if !ok {
 				continue
 			}
+
 			if IsThinkingPart(p) {
 				if text, ok := p["text"].(string); ok {
 					thinkBuf.WriteString(text)
-					stream.Push(core.EventThinkingDelta{Type: "thinking_delta", Delta: text})
+					stream.Push(core.EventThinkingDelta{
+						Type:  "thinking_delta",
+						Delta: text,
+					})
 				}
 			} else if text, ok := p["text"].(string); ok {
 				textBuf.WriteString(text)
-				stream.Push(core.EventTextDelta{Type: "text_delta", Delta: text})
+				stream.Push(core.EventTextDelta{
+					Type:  "text_delta",
+					Delta: text,
+				})
 			} else if fc, ok := p["functionCall"].(map[string]any); ok {
 				name, _ := fc["name"].(string)
 				args, _ := fc["args"].(map[string]any)
 				argsBytes, _ := json.Marshal(args)
 				id := fmt.Sprintf("call_%d", len(toolCalls))
-				tc := core.ToolCall{Type: "toolCall", ID: id, Name: name, Arguments: argsBytes}
+				tc := core.ToolCall{
+					Type:      "toolCall",
+					ID:        id,
+					Name:      name,
+					Arguments: argsBytes,
+				}
 				toolCalls = append(toolCalls, tc)
-				stream.Push(core.EventToolCallStart{Type: "toolcall_start", ID: id, Name: name})
-				stream.Push(core.EventToolCallEnd{Type: "toolcall_end", ID: id, Arguments: argsBytes})
+				stream.Push(core.EventToolCallStart{
+					Type: "toolcall_start",
+					ID:   id,
+					Name: name,
+				})
+				stream.Push(core.EventToolCallEnd{
+					Type:      "toolcall_end",
+					ID:        id,
+					Arguments: argsBytes,
+				})
 			}
 		}
+
+		// Usage metadata
 		if usageMetadata, ok := chunk["usageMetadata"].(map[string]any); ok {
 			msg.Usage.Input = int(getFloat(usageMetadata, "promptTokenCount"))
 			msg.Usage.Output = int(getFloat(usageMetadata, "candidatesTokenCount"))
@@ -259,19 +333,32 @@ func processGoogleSSE(body io.Reader, stream *core.AssistantMessageEventStream, 
 		}
 	}
 
+	// Finalize
 	if textBuf.Len() > 0 {
-		msg.Content = append(msg.Content, core.TextContent{Type: "text", Text: textBuf.String()})
+		msg.Content = append(msg.Content, core.TextContent{
+			Type: "text",
+			Text: textBuf.String(),
+		})
 		stream.Push(core.EventTextEnd{Type: "text_end"})
 	}
+
 	if thinkBuf.Len() > 0 {
-		msg.Content = append(msg.Content, core.ThinkingContent{Type: "thinking", Thinking: thinkBuf.String()})
+		msg.Content = append(msg.Content, core.ThinkingContent{
+			Type:     "thinking",
+			Thinking: thinkBuf.String(),
+		})
 	}
+
 	for _, tc := range toolCalls {
 		msg.Content = append(msg.Content, tc)
 	}
 
 	msg.Usage.Cost = core.CalculateCost(model, msg.Usage)
-	stream.Push(core.EventDone{Type: "done", Message: msg})
+
+	stream.Push(core.EventDone{
+		Type:    "done",
+		Message: msg,
+	})
 
 	return msg, nil
 }

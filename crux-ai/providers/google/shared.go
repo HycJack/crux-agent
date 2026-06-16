@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 const defaultBaseURL = "https://generativelanguage.googleapis.com"
@@ -13,6 +13,7 @@ const defaultBaseURL = "https://generativelanguage.googleapis.com"
 // ConvertMessages converts internal messages to Google Gemini format.
 func ConvertMessages(messages []core.Message) ([]map[string]any, error) {
 	var result []map[string]any
+
 	for _, msg := range messages {
 		switch m := msg.(type) {
 		case core.UserMessage:
@@ -20,14 +21,22 @@ func ConvertMessages(messages []core.Message) ([]map[string]any, error) {
 			if err != nil {
 				return nil, err
 			}
-			result = append(result, map[string]any{"role": "user", "parts": parts})
+			result = append(result, map[string]any{
+				"role":  "user",
+				"parts": parts,
+			})
+
 		case core.AssistantMessage:
 			parts := convertAssistantParts(m.Content)
-			result = append(result, map[string]any{"role": "model", "parts": parts})
+			result = append(result, map[string]any{
+				"role":  "model",
+				"parts": parts,
+			})
+
 		case core.ToolResultMessage:
 			parts := convertToolResultParts(m.Content)
 			result = append(result, map[string]any{
-				"role": "user",
+				"role":  "user",
 				"parts": []any{
 					map[string]any{
 						"functionResponse": map[string]any{
@@ -39,13 +48,16 @@ func ConvertMessages(messages []core.Message) ([]map[string]any, error) {
 			})
 		}
 	}
+
 	return result, nil
 }
 
 func convertUserParts(content any) ([]any, error) {
 	switch c := content.(type) {
 	case string:
-		return []any{map[string]any{"text": c}}, nil
+		return []any{
+			map[string]any{"text": c},
+		}, nil
 	case []core.ContentBlock:
 		var parts []any
 		for _, block := range c {
@@ -54,13 +66,18 @@ func convertUserParts(content any) ([]any, error) {
 				parts = append(parts, map[string]any{"text": b.Text})
 			case core.ImageContent:
 				parts = append(parts, map[string]any{
-					"inlineData": map[string]any{"mimeType": b.MimeType, "data": b.Data},
+					"inlineData": map[string]any{
+						"mimeType": b.MimeType,
+						"data":     b.Data,
+					},
 				})
 			}
 		}
 		return parts, nil
 	default:
-		return []any{map[string]any{"text": strings.TrimSpace(stringify(c))}}, nil
+		return []any{
+			map[string]any{"text": strings.TrimSpace(stringify(c))},
+		}, nil
 	}
 }
 
@@ -71,10 +88,16 @@ func convertAssistantParts(content []core.ContentBlock) []any {
 		case core.TextContent:
 			parts = append(parts, map[string]any{"text": b.Text})
 		case core.ThinkingContent:
-			parts = append(parts, map[string]any{"thought": true, "text": b.Thinking})
+			parts = append(parts, map[string]any{
+				"thought": true,
+				"text":    b.Thinking,
+			})
 		case core.ToolCall:
 			parts = append(parts, map[string]any{
-				"functionCall": map[string]any{"name": b.Name, "args": json.RawMessage(b.Arguments)},
+				"functionCall": map[string]any{
+					"name": b.Name,
+					"args": json.RawMessage(b.Arguments),
+				},
 			})
 		}
 	}
@@ -82,25 +105,36 @@ func convertAssistantParts(content []core.ContentBlock) []any {
 }
 
 func convertToolResultParts(content []core.ContentBlock) map[string]any {
+	result := make(map[string]any)
+	var texts []string
 	for _, block := range content {
 		if text, ok := block.(core.TextContent); ok {
-			var v any
-			if err := json.Unmarshal([]byte(text.Text), &v); err == nil {
-				if m, ok := v.(map[string]any); ok {
-					return m
-				}
-			}
-			return map[string]any{"text": text.Text}
+			texts = append(texts, text.Text)
 		}
 	}
-	return nil
+	if len(texts) == 1 {
+		// Single text block: try to parse as JSON object for structured response
+		var v any
+		if err := json.Unmarshal([]byte(texts[0]), &v); err == nil {
+			if m, ok := v.(map[string]any); ok {
+				return m
+			}
+		}
+		result["text"] = texts[0]
+	} else if len(texts) > 1 {
+		// Multiple text blocks: join them
+		result["text"] = strings.Join(texts, "\n")
+	}
+	return result
 }
 
 // ConvertTools converts tools to Google Gemini format.
 func ConvertTools(tools []core.Tool) []map[string]any {
 	declarations := make([]map[string]any, len(tools))
 	for i, tool := range tools {
-		d := map[string]any{"name": tool.Name}
+		d := map[string]any{
+			"name": tool.Name,
+		}
 		if tool.Description != "" {
 			d["description"] = tool.Description
 		}
@@ -112,7 +146,11 @@ func ConvertTools(tools []core.Tool) []map[string]any {
 		}
 		declarations[i] = d
 	}
-	return []map[string]any{{"functionDeclarations": declarations}}
+	return []map[string]any{
+		{
+			"functionDeclarations": declarations,
+		},
+	}
 }
 
 // MapStopReason maps Google finish reasons to StopReason.
@@ -122,7 +160,11 @@ func MapStopReason(reason string) core.StopReason {
 		return core.StopStop
 	case "MAX_TOKENS":
 		return core.StopLength
-	case "SAFETY", "RECITATION", "OTHER":
+	case "SAFETY":
+		return core.StopError
+	case "RECITATION":
+		return core.StopError
+	case "OTHER":
 		return core.StopError
 	default:
 		return core.StopStop

@@ -1,4 +1,23 @@
-// Package core 提供 AI provider 抽象层
+/*
+ * 功能说明：错误类型定义和 HTTP 错误分类
+ *
+ * 解决的问题：
+ * 1. 需要统一的错误类型来区分不同类型的失败
+ * 2. 需要支持 errors.Is/As 模式进行错误判断
+ * 3. 需要将 HTTP 错误映射到语义化的错误类型
+ * 4. 需要携带上下文信息（提供者、状态码等）
+ *
+ * 解决方案：
+ * 1. 定义哨兵错误（ErrOverflow、ErrAuth 等）支持 errors.Is
+ * 2. 定义具体错误类型（OverflowError、RateLimitError 等）携带详细信息
+ * 3. 实现 Is/Unwrap 方法支持错误链
+ * 4. ClassifyHTTPError 将 HTTP 状态码映射到错误类型
+ *
+ * 应用场景：
+ * - providers/ 层在解析响应时创建错误
+ * - retry.go 使用错误类型判断是否重试
+ * - agent 层根据错误类型采取不同策略
+ */
 package core
 
 import (
@@ -10,310 +29,375 @@ import (
 	"time"
 )
 
-// ============================================================================
-// 错误分类系统
-//
-// 参考 oh-my-pi (packages/ai/src/utils/retry.ts) 的设计：
-//   - 错误按来源/类型分类，不是每个 provider 自己写 retry
-//   - retry 决策与 provider 实现解耦，通过接口组合
-// ============================================================================
+// Sentinel error reasons used by classification helpers. They are exposed as
+// plain error values so callers can use errors.Is.
+// || 哨兵错误，用于 errors.Is 判断
+var (
+	// ErrOverflow is a generic context-overflow marker. Prefer *OverflowError
+	// for richer context.
+	// || 上下文溢出错误标记
+	ErrOverflow = errors.New("context overflow")
 
-// ErrorKind 表示一个分类后的错误类型
-type ErrorKind int
+	// ErrAborted indicates the caller cancelled the operation.
+	// || 操作被中止错误
+	ErrAborted = errors.New("operation aborted")
 
-const (
-	ErrorKindUnknown       ErrorKind = iota
-	ErrorKindRateLimit                // 429 — 速率限制
-	ErrorKindOverloaded               // 500/503 — 服务端过载
-	ErrorKindAuth                     // 401/403 — 认证/授权失败
-	ErrorKindModelNotFound            // 404 — 模型不存在
-	ErrorKindContextLength            // 上下文超长（400+特殊 code）
-	ErrorKindTimeout                  // 请求超时
-	ErrorKindBadRequest               // 400（不可重试）
-	ErrorKindServerError              // 500（非过载，不可重试）
+	// ErrAuth indicates an authentication / authorization failure.
+	// || 认证/授权失败错误
+	ErrAuth = errors.New("authentication failed")
+
+	// ErrRateLimit indicates the provider rate-limited the request.
+	// || 请求被限流错误
+	ErrRateLimit = errors.New("rate limited")
+
+	// ErrServer indicates a transient server-side failure.
+	// || 服务器端临时错误
+	ErrServer = errors.New("server error")
+
+	// ErrNetwork indicates a transport / connection failure.
+	// || 网络/连接错误
+	ErrNetwork = errors.New("network error")
+
+	// ErrTimeout indicates a timeout occurred. Use *TimeoutError for
+	// richer context about the timeout source.
+	// || 超时错误标记
+	ErrTimeout = errors.New("timeout")
 )
 
-// ErrorKind 的中文描述
-func (k ErrorKind) String() string {
-	switch k {
-	case ErrorKindRateLimit:
-		return "rate_limit"
-	case ErrorKindOverloaded:
-		return "overloaded"
-	case ErrorKindAuth:
-		return "auth"
-	case ErrorKindModelNotFound:
-		return "model_not_found"
-	case ErrorKindContextLength:
-		return "context_length"
-	case ErrorKindTimeout:
-		return "timeout"
-	case ErrorKindBadRequest:
-		return "bad_request"
-	case ErrorKindServerError:
-		return "server_error"
-	default:
-		return "unknown"
-	}
+// OverflowError is the typed signal raised when a request exceeds the
+// provider's context window. Downstream code can detect it via
+// errors.As(err, &oe) and inspect the numeric context.
+// || 上下文溢出错误，当请求超过提供者的上下文窗口时触发
+type OverflowError struct {
+	// Provider is the provider that returned the overflow.
+	// || 返回溢出错误的提供者
+	Provider KnownProvider
+	// Message is the underlying provider error text (may be empty for
+	// silent-overflow cases detected from usage).
+	// || 提供者返回的错误文本
+	Message string
+	// ContextWindow is the model's context window (0 if unknown).
+	// || 模型的上下文窗口大小
+	ContextWindow int
+	// Usage is the input token count that overflowed (0 if unknown).
+	// || 溢出的输入 token 数
+	Usage int
 }
 
-// IsRetryable 返回该错误类型是否可重试。
-// 参考 omp 的 isRetryableError() 逻辑。
-func (k ErrorKind) IsRetryable() bool {
-	switch k {
-	case ErrorKindRateLimit, ErrorKindOverloaded, ErrorKindTimeout:
-		return true
-	default:
-		return false
-	}
-}
-
-// ProviderError 携带分类信息的错误。
-// provider 在返回错误时应该用 NewProviderError 包裹，自动分类。
-type ProviderError struct {
-	Kind     ErrorKind
-	Message  string
-	HTTPCode int
-	Wrapped  error
-}
-
-func (e *ProviderError) Error() string {
-	if e.Wrapped != nil {
-		return fmt.Sprintf("[%s] %s: %v", e.Kind, e.Message, e.Wrapped)
-	}
-	return fmt.Sprintf("[%s] %s", e.Kind, e.Message)
-}
-
-func (e *ProviderError) Unwrap() error {
-	return e.Wrapped
-}
-
-// NewProviderError 创建一个分类后的 provider 错误。
-// 自动根据 HTTP 状态码推断错误类型。
-func NewProviderError(httpCode int, message string, wrapped error) *ProviderError {
-	kind := classifyHTTPCode(httpCode)
-	return &ProviderError{
-		Kind:     kind,
-		Message:  message,
-		HTTPCode: httpCode,
-		Wrapped:  wrapped,
-	}
-}
-
-// IsRetryableProviderError 判断一个 error 是否是分类后的可重试错误。
-func IsRetryableProviderError(err error) bool {
-	var pe *ProviderError
-	if errors.As(err, &pe) {
-		return pe.Kind.IsRetryable()
-	}
-	// 未分类的错误也保守判断
-	return false
-}
-
-// ExtractErrorKind 提取错误分类，未分类的返回 ErrorKindUnknown。
-func ExtractErrorKind(err error) ErrorKind {
-	var pe *ProviderError
-	if errors.As(err, &pe) {
-		return pe.Kind
-	}
-	return ErrorKindUnknown
-}
-
-// classifyHTTPCode 根据 HTTP 状态码返回错误分类。
-func classifyHTTPCode(code int) ErrorKind {
+// Error returns the error message.
+// || 返回错误消息
+func (e *OverflowError) Error() string {
 	switch {
-	case code == http.StatusTooManyRequests: // 429
-		return ErrorKindRateLimit
-	case code == http.StatusUnauthorized, code == http.StatusForbidden: // 401, 403
-		return ErrorKindAuth
-	case code == http.StatusNotFound: // 404
-		return ErrorKindModelNotFound
-	case code == http.StatusBadRequest: // 400
-		return ErrorKindBadRequest // 大部分 400 不可重试
-	case code == http.StatusServiceUnavailable || code == http.StatusBadGateway || code == http.StatusGatewayTimeout:
-		return ErrorKindOverloaded // 503, 502, 504
-	case code >= 500:
-		return ErrorKindServerError
+	case e.Message != "":
+		return fmt.Sprintf("%s: context overflow: %s", e.Provider, e.Message)
+	case e.ContextWindow > 0 && e.Usage > 0:
+		return fmt.Sprintf("%s: context overflow: usage %d > window %d", e.Provider, e.Usage, e.ContextWindow)
 	default:
-		return ErrorKindUnknown
+		return fmt.Sprintf("%s: context overflow", e.Provider)
 	}
 }
 
-// Retryable 标识一个错误可以重试的接口。
-// 实现该接口的类型可以用在重试装饰器中。
-type Retryable interface {
-	Retryable() bool
+// Is allows errors.Is to match ErrOverflow.
+// || 支持 errors.Is 匹配 ErrOverflow
+func (e *OverflowError) Is(target error) bool { return target == ErrOverflow }
+
+// Unwrap allows errors.Is to recognize *OverflowError.
+// || 支持 errors.Is 识别 *OverflowError
+func (e *OverflowError) Unwrap() error { return ErrOverflow }
+
+// CompactionCancelledError is the typed signal raised when a compaction is
+// explicitly aborted. It mirrors oh-my-pi's `CompactionCancelledError` so
+// callers can discriminate cancellation from other failures via errors.As
+// rather than string matching.
+// || 压缩操作被取消错误
+type CompactionCancelledError struct {
+	Reason string // 取消原因
 }
 
-// ============================================================================
-// 可组合的重试装饰器
+// Error returns the error message.
+// || 返回错误消息
+func (e *CompactionCancelledError) Error() string {
+	if e.Reason == "" {
+		return "compaction cancelled"
+	}
+	return "compaction cancelled: " + e.Reason
+}
+
+// AbortError signals the consumer cancelled the in-flight operation.
+// || 消费者取消正在进行的操作错误
+type AbortError struct {
+	Cause error // 原因
+}
+
+// Error returns the error message.
+// || 返回错误消息
+func (e *AbortError) Error() string {
+	if e.Cause == nil {
+		return "operation aborted"
+	}
+	return "operation aborted: " + e.Cause.Error()
+}
+
+// Unwrap returns the underlying cause.
+// || 返回底层原因
+func (e *AbortError) Unwrap() error { return e.Cause }
+
+// Is allows errors.Is to match ErrAborted or context.Canceled.
+// || 支持 errors.Is 匹配 ErrAborted 或 context.Canceled
+func (e *AbortError) Is(t error) bool {
+	return t == ErrAborted || t == context.Canceled
+}
+
+// AuthError wraps a 401/403 from the provider.
+// || 认证错误（401/403）
+type AuthError struct {
+	Provider KnownProvider // 提供者
+	Cause    error         // 原因
+}
+
+// Error returns the error message.
+// || 返回错误消息
+func (e *AuthError) Error() string {
+	if e.Cause == nil {
+		return fmt.Sprintf("%s: authentication failed", e.Provider)
+	}
+	return fmt.Sprintf("%s: authentication failed: %v", e.Provider, e.Cause)
+}
+
+// Unwrap returns the underlying cause.
+// || 返回底层原因
+func (e *AuthError) Unwrap() error { return e.Cause }
+
+// Is allows errors.Is to match ErrAuth.
+// || 支持 errors.Is 匹配 ErrAuth
+func (e *AuthError) Is(t error) bool { return t == ErrAuth }
+
+// RateLimitError wraps a 429 with optional retry-after hint.
+// || 限流错误（429），包含可选的重试等待时间
+type RateLimitError struct {
+	Provider   KnownProvider // 提供者
+	RetryAfter time.Duration // 重试等待时间
+	Cause      error         // 原因
+}
+
+// Error returns the error message.
+// || 返回错误消息
+func (e *RateLimitError) Error() string {
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("%s: rate limited (retry after %s)", e.Provider, e.RetryAfter)
+	}
+	if e.Cause == nil {
+		return fmt.Sprintf("%s: rate limited", e.Provider)
+	}
+	return fmt.Sprintf("%s: rate limited: %v", e.Provider, e.Cause)
+}
+
+// Unwrap returns the underlying cause.
+// || 返回底层原因
+func (e *RateLimitError) Unwrap() error { return e.Cause }
+
+// Is allows errors.Is to match ErrRateLimit.
+// || 支持 errors.Is 匹配 ErrRateLimit
+func (e *RateLimitError) Is(t error) bool { return t == ErrRateLimit }
+
+// ServerError wraps a 5xx response.
+// || 服务器错误（5xx）
+type ServerError struct {
+	Provider   KnownProvider // 提供者
+	StatusCode int           // HTTP 状态码
+	Cause      error         // 原因
+}
+
+// Error returns the error message.
+// || 返回错误消息
+func (e *ServerError) Error() string {
+	if e.Cause == nil {
+		return fmt.Sprintf("%s: server error %d", e.Provider, e.StatusCode)
+	}
+	return fmt.Sprintf("%s: server error %d: %v", e.Provider, e.StatusCode, e.Cause)
+}
+
+// Unwrap returns the underlying cause.
+// || 返回底层原因
+func (e *ServerError) Unwrap() error { return e.Cause }
+
+// Is allows errors.Is to match ErrServer.
+// || 支持 errors.Is 匹配 ErrServer
+func (e *ServerError) Is(t error) bool { return t == ErrServer }
+
+// NetworkError wraps a transport-level failure (DNS, connect, EOF, etc.).
+// || 网络错误（DNS、连接、EOF 等）
+type NetworkError struct {
+	Provider KnownProvider // 提供者
+	Cause    error         // 原因
+}
+
+// Error returns the error message.
+// || 返回错误消息
+func (e *NetworkError) Error() string {
+	if e.Cause == nil {
+		return fmt.Sprintf("%s: network error", e.Provider)
+	}
+	return fmt.Sprintf("%s: network error: %v", e.Provider, e.Cause)
+}
+
+// Unwrap returns the underlying cause.
+// || 返回底层原因
+func (e *NetworkError) Unwrap() error { return e.Cause }
+
+// Is allows errors.Is to match ErrNetwork.
+// || 支持 errors.Is 匹配 ErrNetwork
+func (e *NetworkError) Is(t error) bool { return t == ErrNetwork }
+
+// TimeoutSource identifies where a timeout originated.
+// || 超时来源标识
+type TimeoutSource string
+
+const (
+	// TimeoutSourceAgent indicates the entire agent run exceeded its timeout.
+	// || Agent 运行超时
+	TimeoutSourceAgent TimeoutSource = "agent"
+
+	// TimeoutSourceHTTP indicates an HTTP request to the LLM provider timed out.
+	// || HTTP 请求超时
+	TimeoutSourceHTTP TimeoutSource = "http"
+
+	// TimeoutSourceTool indicates a tool execution (e.g., bash) timed out.
+	// || 工具执行超时
+	TimeoutSourceTool TimeoutSource = "tool"
+)
+
+// TimeoutError wraps a context.DeadlineExceeded with source information.
+// || 超时错误，携带来源信息
+type TimeoutError struct {
+	Source   TimeoutSource // 超时来源
+	Duration time.Duration // 超时时长
+	Provider KnownProvider // 提供者（HTTP 超时时使用）
+	ToolName string        // 工具名称（工具超时时使用）
+	Cause    error         // 底层原因
+}
+
+// Error returns the error message.
+// || 返回错误消息
+func (e *TimeoutError) Error() string {
+	var parts []string
+	parts = append(parts, string(e.Source))
+
+	if e.Duration > 0 {
+		parts = append(parts, fmt.Sprintf("after %s", e.Duration))
+	}
+
+	if e.Provider != "" {
+		parts = append(parts, fmt.Sprintf("provider=%s", e.Provider))
+	}
+
+	if e.ToolName != "" {
+		parts = append(parts, fmt.Sprintf("tool=%s", e.ToolName))
+	}
+
+	if e.Cause != nil && e.Cause != context.DeadlineExceeded {
+		parts = append(parts, fmt.Sprintf("cause=%v", e.Cause))
+	}
+
+	return fmt.Sprintf("timeout: %s", strings.Join(parts, " "))
+}
+
+// Unwrap returns the underlying cause.
+// || 返回底层原因
+func (e *TimeoutError) Unwrap() error {
+	if e.Cause != nil {
+		return e.Cause
+	}
+	return ErrTimeout
+}
+
+// Is allows errors.Is to match ErrTimeout or context.DeadlineExceeded.
+// || 支持 errors.Is 匹配 ErrTimeout 或 context.DeadlineExceeded
+func (e *TimeoutError) Is(t error) bool {
+	return t == ErrTimeout || t == context.DeadlineExceeded
+}
+
+// ClassifyHTTPError maps an HTTP error response to a typed error. The body
+// is the error payload returned by the provider. If no classification
+// applies, nil is returned and the caller is expected to surface the raw
+// error.
+// || 将 HTTP 错误响应映射到类型化错误
+// 参数：
 //
-// 参考 omp 的 callWithCopilotModelRetry() 设计：
-//   - WrapRetry 不侵入 provider 代码
-//   - 支持分层重试策略
-//   - provider 可以通过 IsRetryableProviderError 或 Retryable 接口自定义重试决策
-// ============================================================================
-
-// RetryPolicy 定义重试策略。
-type RetryPolicy struct {
-	// MaxAttempts 最大尝试次数（包括第一次）。默认 3。
-	MaxAttempts int
-	// InitialBackoff 首次退避时间。默认 1s。
-	InitialBackoff time.Duration
-	// MaxBackoff 最大退避时间。默认 30s。
-	MaxBackoff time.Duration
-	// BackoffFactor 退避增长因子。默认 2。
-	BackoffFactor float64
-	// ShouldRetry 可选的判重函数。返回 true 表示应该重试。
-	// 为 nil 时使用默认的 IsRetryableProviderError。
-	ShouldRetry func(error) bool
-	// OnRetry 每次重试前的回调（可用于日志记录）。
-	OnRetry func(attempt int, err error)
-}
-
-// DefaultRetryPolicy 返回默认重试策略。
+//	provider - 提供者
+//	status - HTTP 状态码
+//	body - 响应体
 //
-//	MaxAttempts: 3
-//	InitialBackoff: 1s
-//	MaxBackoff: 30s
-//	BackoffFactor: 2
-//	ShouldRetry: IsRetryableProviderError
-func DefaultRetryPolicy() RetryPolicy {
-	return RetryPolicy{
-		MaxAttempts:    3,
-		InitialBackoff: 1 * time.Second,
-		MaxBackoff:     30 * time.Second,
-		BackoffFactor:  2.0,
-		ShouldRetry:    IsRetryableProviderError,
-	}
-}
-
-// WrapRetry 包裹一个函数，按照 RetryPolicy 自动重试。
+// 返回：
 //
-// 使用方式：
-//
-//	policy := DefaultRetryPolicy()
-//	policy.OnRetry = func(attempt int, err error) {
-//	    log.Printf("retry attempt %d: %v", attempt, err)
-//	}
-//	result, err := WrapRetry(ctx, policy, func(ctx context.Context) (AssistantMessage, error) {
-//	    return provider.Stream(ctx, ...)
-//	})
-func WrapRetry[T any](ctx context.Context, policy RetryPolicy, fn func(context.Context) (T, error)) (T, error) {
-	// 设置默认值
-	if policy.MaxAttempts <= 0 {
-		policy.MaxAttempts = 3
+//	类型化错误（如果无法分类返回 nil）
+func ClassifyHTTPError(provider KnownProvider, status int, body string) error {
+	switch {
+	case status == http.StatusRequestTimeout, status == http.StatusTooManyRequests:
+		// 408 Request Timeout 或 429 Too Many Requests -> 限流错误
+		return &RateLimitError{Provider: provider, Cause: fmt.Errorf("status %d: %s", status, trimBody(body))}
+	case status == http.StatusUnauthorized, status == http.StatusForbidden:
+		// 401 Unauthorized 或 403 Forbidden -> 认证错误
+		return &AuthError{Provider: provider, Cause: fmt.Errorf("status %d: %s", status, trimBody(body))}
+	case status >= 500 && status <= 599:
+		// 5xx -> 服务器错误
+		return &ServerError{Provider: provider, StatusCode: status, Cause: fmt.Errorf("%s", trimBody(body))}
+	case status == http.StatusRequestEntityTooLarge:
+		// 413 Request Entity Too Large -> 溢出错误
+		return &OverflowError{Provider: provider, Message: trimBody(body)}
+	default:
+		return nil
 	}
-	if policy.InitialBackoff <= 0 {
-		policy.InitialBackoff = 1 * time.Second
-	}
-	if policy.MaxBackoff <= 0 {
-		policy.MaxBackoff = 30 * time.Second
-	}
-	if policy.BackoffFactor <= 0 {
-		policy.BackoffFactor = 2.0
-	}
-	if policy.ShouldRetry == nil {
-		policy.ShouldRetry = IsRetryableProviderError
-	}
-
-	var lastErr error
-	backoff := policy.InitialBackoff
-
-	for attempt := 0; attempt < policy.MaxAttempts; attempt++ {
-		if ctx.Err() != nil {
-			var zero T
-			return zero, ctx.Err()
-		}
-
-		result, err := fn(ctx)
-		if err == nil {
-			return result, nil
-		}
-		lastErr = err
-
-		// 判断是否应该重试
-		if !policy.ShouldRetry(err) {
-			break
-		}
-
-		// 最后一次尝试失败后不再等待
-		if attempt == policy.MaxAttempts-1 {
-			break
-		}
-
-		if policy.OnRetry != nil {
-			policy.OnRetry(attempt+1, err)
-		}
-
-		// 对于速率限制错误，等待5分钟
-		waitTime := backoff
-		if ExtractErrorKind(err) == ErrorKindRateLimit {
-			waitTime = 5 * time.Minute
-		}
-
-		// 等待，注意 context 取消
-		select {
-		case <-ctx.Done():
-			var zero T
-			return zero, ctx.Err()
-		case <-time.After(waitTime):
-		}
-
-		// 非速率限制错误使用指数退避
-		if ExtractErrorKind(err) != ErrorKindRateLimit {
-			backoff = time.Duration(float64(backoff) * policy.BackoffFactor)
-			if backoff > policy.MaxBackoff {
-				backoff = policy.MaxBackoff
-			}
-		}
-	}
-
-	var zero T
-	return zero, lastErr
 }
 
-// ============================================================================
-// Provider 特定的错误辅助函数
-//
-// 参考 omp 在 single-provider 级别的特殊 retry 逻辑：
-//   - isCopilotTransientModelError() — GitHub Copilot 的 400 model_not_supported
-//   - 这些函数适合在 provider 实现中调用
-// ============================================================================
-
-// IsHTTPCodeError 检查错误是否来自 HTTP 状态码。
-func IsHTTPCodeError(err error, code int) bool {
-	var pe *ProviderError
-	if errors.As(err, &pe) {
-		return pe.HTTPCode == code
+// trimBody trims the response body for error messages.
+// || 截断响应体用于错误消息
+func trimBody(body string) string {
+	body = strings.TrimSpace(body)
+	const max = 500 // 最大长度
+	if len(body) > max {
+		return body[:max] + "..."
 	}
-	return false
+	return body
 }
 
-// IsTransient400Error 检查是否是特定 API 返回的"瞬态 400"错误。
-// 有些 provider（如 GitHub Copilot）在某些情况下会返回 400 但实际可以重试。
-// 调用方通过 providerID 来判断。
-func IsTransient400Error(err error, transientCodes ...string) bool {
-	if !IsHTTPCodeError(err, http.StatusBadRequest) {
-		return false
+// WrapTimeout wraps a context.DeadlineExceeded error with source information.
+// || 包装超时错误，添加来源信息
+func WrapTimeout(source TimeoutSource, duration time.Duration, cause error) error {
+	if cause == nil {
+		cause = context.DeadlineExceeded
 	}
-	if len(transientCodes) == 0 {
-		return false
+	return &TimeoutError{
+		Source:   source,
+		Duration: duration,
+		Cause:    cause,
 	}
-	msg := err.Error()
-	for _, code := range transientCodes {
-		if strings.Contains(msg, code) {
-			return true
-		}
-	}
-	return false
 }
 
-// NewContextError 构造上下文超长错误，便于 error propagation 时携带分类。
-func NewContextError(message string, wrapped error) *ProviderError {
-	return &ProviderError{
-		Kind:    ErrorKindContextLength,
-		Message: message,
-		Wrapped: wrapped,
+// WrapHTTPTimeout wraps an HTTP request timeout with provider information.
+// || 包装 HTTP 请求超时错误
+func WrapHTTPTimeout(provider KnownProvider, duration time.Duration, cause error) error {
+	if cause == nil {
+		cause = context.DeadlineExceeded
+	}
+	return &TimeoutError{
+		Source:   TimeoutSourceHTTP,
+		Duration: duration,
+		Provider: provider,
+		Cause:    cause,
+	}
+}
+
+// WrapToolTimeout wraps a tool execution timeout with tool name.
+// || 包装工具执行超时错误
+func WrapToolTimeout(toolName string, duration time.Duration, cause error) error {
+	if cause == nil {
+		cause = context.DeadlineExceeded
+	}
+	return &TimeoutError{
+		Source:   TimeoutSourceTool,
+		Duration: duration,
+		ToolName: toolName,
+		Cause:    cause,
 	}
 }
