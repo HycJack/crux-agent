@@ -8,8 +8,8 @@
 package kimi
 
 import (
-	core "github.com/hycjack/crux-ai/core"
-	"github.com/hycjack/crux-ai/providers/compat"
+	core "crux-ai/core"
+	"crux-ai/providers/compat"
 )
 
 const defaultBaseURL = "https://api.moonshot.ai/v1"
@@ -17,7 +17,7 @@ const defaultBaseURL = "https://api.moonshot.ai/v1"
 // New returns a Kimi provider config to be added to the compat Router.
 func New() compat.Config {
 	return compat.Config{
-		Provider:       core.ProviderKimi,
+		Provider:       core.ProviderMoonshotCN,
 		DefaultBaseURL: defaultBaseURL,
 	}
 }

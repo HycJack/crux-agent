@@ -4,14 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"time"
 
-	core "github.com/hycjack/crux-ai/core"
+	core "crux-ai/core"
 )
 
 // VertexOptions holds Google Vertex AI-specific options.
@@ -26,15 +24,13 @@ type VertexOptions struct {
 type VertexProvider struct{}
 
 // NewVertex creates a new Google Vertex AI provider.
-func NewVertex() *VertexProvider {
-	return &VertexProvider{}
-}
+func NewVertex() *VertexProvider { return &VertexProvider{} }
 
-func (p *VertexProvider) Stream(ctx context.Context, model core.Model, llmCtx core.Context, opts core.StreamOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error) {
+func (p *VertexProvider) Stream(ctx context.Context, model core.Model, llmCtx core.Context, opts core.StreamOptions) (*core.AssistantMessageEventStream, error) {
 	return streamVertex(ctx, model, llmCtx, opts, VertexOptions{})
 }
 
-func (p *VertexProvider) StreamSimple(ctx context.Context, model core.Model, llmCtx core.Context, opts core.SimpleStreamOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error) {
+func (p *VertexProvider) StreamSimple(ctx context.Context, model core.Model, llmCtx core.Context, opts core.SimpleStreamOptions) (*core.AssistantMessageEventStream, error) {
 	vertexOpts := VertexOptions{}
 	if opts.Reasoning != "" {
 		vertexOpts.Thinking = &ThinkingConfig{
@@ -50,7 +46,7 @@ func (p *VertexProvider) StreamSimple(ctx context.Context, model core.Model, llm
 	return streamVertex(ctx, model, llmCtx, opts.StreamOptions, vertexOpts)
 }
 
-func streamVertex(ctx context.Context, model core.Model, c core.Context, opts core.StreamOptions, vertexOpts VertexOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error) {
+func streamVertex(ctx context.Context, model core.Model, c core.Context, opts core.StreamOptions, vertexOpts VertexOptions) (*core.AssistantMessageEventStream, error) {
 	apiKey := core.ResolveAPIKey(model.Provider, opts.APIKey)
 
 	project := vertexOpts.Project
@@ -69,7 +65,6 @@ func streamVertex(ctx context.Context, model core.Model, c core.Context, opts co
 		location = "us-central1"
 	}
 
-	// Build Vertex AI-specific body
 	body, err := buildGoogleBody(model, c, opts, Options{
 		ToolChoice: vertexOpts.ToolChoice,
 		Thinking:   vertexOpts.Thinking,
@@ -77,7 +72,6 @@ func streamVertex(ctx context.Context, model core.Model, c core.Context, opts co
 	if err != nil {
 		return nil, fmt.Errorf("google-vertex: failed to build request: %w", err)
 	}
-
 	if opts.OnPayload != nil {
 		opts.OnPayload(body)
 	}
@@ -90,7 +84,6 @@ func streamVertex(ctx context.Context, model core.Model, c core.Context, opts co
 				stream.Error(fmt.Errorf("google-vertex: panic: %v", r))
 			}
 		}()
-
 		baseURL := fmt.Sprintf("https://%s-aiplatform.googleapis.com", location)
 		msg, err := doVertexStream(ctx, baseURL, apiKey, project, location, model, body, stream, opts)
 		if err != nil {
@@ -103,28 +96,22 @@ func streamVertex(ctx context.Context, model core.Model, c core.Context, opts co
 	return stream, nil
 }
 
-func doVertexStream(ctx context.Context, baseURL, apiKey, project, location string, model core.Model, body map[string]any, stream *core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], opts core.StreamOptions) (core.AssistantMessage, error) {
+func doVertexStream(ctx context.Context, baseURL, apiKey, project, location string, model core.Model, body map[string]any, stream *core.AssistantMessageEventStream, opts core.StreamOptions) (core.AssistantMessage, error) {
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
 		return core.AssistantMessage{}, err
 	}
-
-	// Vertex AI uses a different URL pattern than Google AI.
-	// API key is passed as a query parameter per Google's API convention.
 	url := fmt.Sprintf("%s/v1/projects/%s/locations/%s/publishers/google/models/%s:streamGenerateContent?alt=sse",
 		baseURL, project, location, model.ID)
-
-	if apiKey != "" {
-		url += "&key=" + apiKey
-	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return core.AssistantMessage{}, err
 	}
-
 	req.Header.Set("Content-Type", "application/json")
-
+	if apiKey != "" {
+		req.Header.Set("x-goog-api-key", apiKey)
+	}
 	for k, v := range model.Headers {
 		req.Header.Set(k, v)
 	}
@@ -132,22 +119,16 @@ func doVertexStream(ctx context.Context, baseURL, apiKey, project, location stri
 		req.Header.Set(k, v)
 	}
 
-	resp, err := core.SSEClient.Do(req)
+	client := core.NewTimeoutClient(opts.TimeoutMs)
+	resp, err := client.Do(req)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return core.AssistantMessage{}, core.WrapHTTPTimeout(core.ProviderGoogleVertex, 5*time.Minute, err)
-		}
 		return core.AssistantMessage{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(resp.Body)
-		if classified := core.ClassifyHTTPError(model.Provider, resp.StatusCode, string(errBody)); classified != nil {
-			return core.AssistantMessage{}, classified
-		}
 		return core.AssistantMessage{}, fmt.Errorf("google-vertex: API error %d: %s", resp.StatusCode, string(errBody))
 	}
-
 	return processGoogleSSE(resp.Body, stream, model, opts)
 }

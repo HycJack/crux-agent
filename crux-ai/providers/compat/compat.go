@@ -21,9 +21,9 @@ import (
 	"sync"
 	"time"
 
-	core "github.com/hycjack/crux-ai/core"
-	"github.com/hycjack/crux-ai/internal/sse"
-	"github.com/hycjack/crux-ai/providers/openai/convert"
+	core "crux-ai/core"
+	"crux-ai/internal/sse"
+	"crux-ai/providers/openai/convert"
 )
 
 // Config describes a single OpenAI-compatible provider.

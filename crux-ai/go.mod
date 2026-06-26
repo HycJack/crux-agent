@@ -1,5 +1,5 @@
 // Module crux-ai — version v0.0.1
-module github.com/hycjack/crux-ai
+module crux-ai
 
 go 1.23.0
 

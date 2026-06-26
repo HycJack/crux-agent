@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	core "github.com/hycjack/crux-ai/core"
+	core "crux-ai/core"
 )
 
 // CodexOptions holds OpenAI Codex-specific options.
@@ -19,15 +19,13 @@ type CodexOptions struct {
 type CodexProvider struct{}
 
 // NewCodex creates a new OpenAI Codex provider.
-func NewCodex() *CodexProvider {
-	return &CodexProvider{}
-}
+func NewCodex() *CodexProvider { return &CodexProvider{} }
 
-func (p *CodexProvider) Stream(ctx context.Context, model core.Model, llmCtx core.Context, opts core.StreamOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error) {
+func (p *CodexProvider) Stream(ctx context.Context, model core.Model, llmCtx core.Context, opts core.StreamOptions) (*core.AssistantMessageEventStream, error) {
 	return streamCodex(ctx, model, llmCtx, opts, CodexOptions{})
 }
 
-func (p *CodexProvider) StreamSimple(ctx context.Context, model core.Model, llmCtx core.Context, opts core.SimpleStreamOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error) {
+func (p *CodexProvider) StreamSimple(ctx context.Context, model core.Model, llmCtx core.Context, opts core.SimpleStreamOptions) (*core.AssistantMessageEventStream, error) {
 	codexOpts := CodexOptions{}
 	if opts.Reasoning != "" {
 		codexOpts.ReasoningEffort = string(clampEffort(opts.Reasoning))
@@ -35,15 +33,13 @@ func (p *CodexProvider) StreamSimple(ctx context.Context, model core.Model, llmC
 	return streamCodex(ctx, model, llmCtx, opts.StreamOptions, codexOpts)
 }
 
-func streamCodex(ctx context.Context, model core.Model, c core.Context, opts core.StreamOptions, codexOpts CodexOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error) {
+func streamCodex(ctx context.Context, model core.Model, c core.Context, opts core.StreamOptions, codexOpts CodexOptions) (*core.AssistantMessageEventStream, error) {
 	apiKey := core.ResolveAPIKey(model.Provider, opts.APIKey)
 	if apiKey == "" {
 		return nil, fmt.Errorf("openai-codex: no API key provided")
 	}
-
 	baseURL := core.ResolveBaseURL(model, "https://api.openai.com/v1")
 
-	// Build body with Codex-specific options
 	body, err := buildResponsesBody(model, c, opts, ResponsesOptions{
 		ReasoningEffort:  codexOpts.ReasoningEffort,
 		ReasoningSummary: codexOpts.ReasoningSummary,
@@ -54,11 +50,8 @@ func streamCodex(ctx context.Context, model core.Model, c core.Context, opts cor
 	}
 
 	if codexOpts.TextVerbosity != "" {
-		body["text"] = map[string]any{
-			"verbosity": codexOpts.TextVerbosity,
-		}
+		body["text"] = map[string]any{"verbosity": codexOpts.TextVerbosity}
 	}
-
 	if opts.OnPayload != nil {
 		opts.OnPayload(body)
 	}
@@ -71,7 +64,6 @@ func streamCodex(ctx context.Context, model core.Model, c core.Context, opts cor
 				stream.Error(fmt.Errorf("openai-codex: panic: %v", r))
 			}
 		}()
-
 		msg, err := doResponsesStream(ctx, baseURL, apiKey, model, body, stream, opts)
 		if err != nil {
 			stream.Error(err)

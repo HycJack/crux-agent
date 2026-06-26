@@ -1,43 +1,54 @@
 // Package openai implements OpenAI-compatible API providers.
-//
-// The conversion helpers (ConvertMessages, ConvertTools, MapStopReason) live
-// in the leaf sub-package `providers/openai/convert`. The streaming engine
-// shared by all OpenAI-compat providers lives in `providers/compat`.
-//
-// This file re-exports the public converters (so the pre-refactor test
-// suite and external callers keep working) and provides a handful of
-// package-internal helpers used by the Responses / Codex providers.
 package openai
 
 import (
-	"strings"
+	"encoding/json"
 
-	core "github.com/hycjack/crux-ai/core"
-	"github.com/hycjack/crux-ai/providers/openai/convert"
+	core "crux-ai/core"
+	"crux-ai/internal/conv"
 )
 
 const defaultCompletionsURL = "https://api.openai.com/v1"
 const defaultResponsesURL = "https://api.openai.com/v1"
 
-// ConvertMessages is a backward-compatible alias for convert.Messages.
+// ConvertMessages converts internal messages to OpenAI Chat Completions format.
 func ConvertMessages(messages []core.Message, model core.Model) ([]map[string]any, error) {
-	return convert.Messages(messages, model)
+	var result []map[string]any
+	for _, msg := range messages {
+		switch m := msg.(type) {
+		case core.UserMessage:
+			content, err := convertUserContent(m.Content)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, map[string]any{"role": "user", "content": content})
+		case core.AssistantMessage:
+			openaiMsg := map[string]any{"role": "assistant"}
+			content, toolCalls := convertAssistantContentSplit(m.Content)
+			if len(content) == 1 {
+				if textBlock, ok := content[0].(map[string]any); ok && textBlock["type"] == "text" {
+					openaiMsg["content"] = textBlock["text"]
+				} else if len(content) > 0 {
+					openaiMsg["content"] = content
+				}
+			} else if len(content) > 0 {
+				openaiMsg["content"] = content
+			}
+			if len(toolCalls) > 0 {
+				openaiMsg["tool_calls"] = toolCalls
+			}
+			result = append(result, openaiMsg)
+		case core.ToolResultMessage:
+			result = append(result, map[string]any{
+				"role":         "tool",
+				"tool_call_id": m.ToolCallID,
+				"content":      convertToolResultContent(m.Content),
+			})
+		}
+	}
+	return result, nil
 }
 
-// ConvertTools is a backward-compatible alias for convert.Tools.
-func ConvertTools(tools []core.Tool) []map[string]any {
-	return convert.Tools(tools)
-}
-
-// MapStopReason is a backward-compatible alias for convert.StopReason.
-func MapStopReason(reason string) core.StopReason {
-	return convert.StopReason(reason)
-}
-
-// --- package-internal helpers used by the Responses / Codex providers ---
-
-// convertUserContent wraps convert.convertUserContent for use within this
-// package (the convert package's helper is unexported).
 func convertUserContent(content any) (any, error) {
 	switch c := content.(type) {
 	case string:
@@ -50,8 +61,10 @@ func convertUserContent(content any) (any, error) {
 				blocks = append(blocks, map[string]any{"type": "text", "text": b.Text})
 			case core.ImageContent:
 				blocks = append(blocks, map[string]any{
-					"type":      "image_url",
-					"image_url": map[string]any{"url": "data:" + b.MimeType + ";base64," + b.Data},
+					"type": "image_url",
+					"image_url": map[string]any{
+						"url": "data:" + b.MimeType + ";base64," + b.Data,
+					},
 				})
 			}
 		}
@@ -61,8 +74,39 @@ func convertUserContent(content any) (any, error) {
 	}
 }
 
-// convertToolResultContent joins tool result text content into a single
-// string (newline-separated).
+func convertAssistantContent(content []core.ContentBlock) []any {
+	blocks, toolCalls := convertAssistantContentSplit(content)
+	if len(toolCalls) > 0 {
+		blocks = append(blocks, toolCalls...)
+	}
+	return blocks
+}
+
+// convertAssistantContentSplit separates text/thinking content from tool calls.
+func convertAssistantContentSplit(content []core.ContentBlock) (blocks []any, toolCalls []any) {
+	for _, block := range content {
+		switch b := block.(type) {
+		case core.TextContent:
+			blocks = append(blocks, map[string]any{"type": "text", "text": b.Text})
+		case core.ThinkingContent:
+			blocks = append(blocks, map[string]any{
+				"type":              "reasoning_content",
+				"reasoning_content": map[string]any{"text": b.Thinking},
+			})
+		case core.ToolCall:
+			toolCalls = append(toolCalls, map[string]any{
+				"id":   b.ID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      b.Name,
+					"arguments": string(b.Arguments),
+				},
+			})
+		}
+	}
+	return blocks, toolCalls
+}
+
 func convertToolResultContent(content []core.ContentBlock) string {
 	var parts []string
 	for _, block := range content {
@@ -70,35 +114,41 @@ func convertToolResultContent(content []core.ContentBlock) string {
 			parts = append(parts, text.Text)
 		}
 	}
-	return strings.Join(parts, "\n")
+	return conv.JoinStrings(parts, "\n")
 }
 
-// getFloat retrieves a possibly-nested float value from a JSON-decoded map.
-func getFloat(m map[string]any, key string) float64 {
-	keys := strings.Split(key, ".")
-	current := m
-	for i, k := range keys {
-		if i == len(keys)-1 {
-			if v, ok := current[k]; ok {
-				if f, ok := v.(float64); ok {
-					return f
-				}
+// ConvertTools converts tools to OpenAI format.
+func ConvertTools(tools []core.Tool) []map[string]any {
+	result := make([]map[string]any, len(tools))
+	for i, tool := range tools {
+		t := map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        tool.Name,
+				"description": tool.Description,
+			},
+		}
+		if len(tool.Parameters) > 0 {
+			var params map[string]any
+			if err := json.Unmarshal(tool.Parameters, &params); err == nil {
+				t["function"].(map[string]any)["parameters"] = params
 			}
-			return 0
 		}
-		next, ok := current[k].(map[string]any)
-		if !ok {
-			return 0
-		}
-		current = next
+		result[i] = t
 	}
-	return 0
+	return result
 }
 
-// clampEffort clamps "xhigh" to "high" for providers that don't support it.
-func clampEffort(effort core.ThinkingLevel) core.ThinkingLevel {
-	if effort == core.ThinkingXHigh {
-		return core.ThinkingHigh
+// MapStopReason maps OpenAI finish reasons to StopReason.
+func MapStopReason(reason string) core.StopReason {
+	switch reason {
+	case "stop":
+		return core.StopStop
+	case "length":
+		return core.StopLength
+	case "tool_calls", "function_call":
+		return core.StopToolUse
+	default:
+		return core.StopStop
 	}
-	return effort
 }

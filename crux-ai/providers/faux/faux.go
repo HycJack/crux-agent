@@ -7,25 +7,25 @@ import (
 	"strings"
 	"time"
 
-	core "github.com/hycjack/crux-ai/core"
+	core "crux-ai/core"
 )
 
 // Provider is a mock provider that generates deterministic responses.
 type Provider struct {
-	Delay time.Duration // delay between tokens (0 = instant)
+	Delay time.Duration
 }
 
 func New() *Provider { return &Provider{} }
 
-func (p *Provider) Stream(ctx context.Context, model core.Model, llmCtx core.Context, opts core.StreamOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error) {
+func (p *Provider) Stream(ctx context.Context, model core.Model, llmCtx core.Context, opts core.StreamOptions) (*core.AssistantMessageEventStream, error) {
 	return p.stream(ctx, model, llmCtx, opts)
 }
 
-func (p *Provider) StreamSimple(ctx context.Context, model core.Model, llmCtx core.Context, opts core.SimpleStreamOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error) {
+func (p *Provider) StreamSimple(ctx context.Context, model core.Model, llmCtx core.Context, opts core.SimpleStreamOptions) (*core.AssistantMessageEventStream, error) {
 	return p.stream(ctx, model, llmCtx, opts.StreamOptions)
 }
 
-func (p *Provider) stream(ctx context.Context, model core.Model, llmCtx core.Context, opts core.StreamOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error) {
+func (p *Provider) stream(ctx context.Context, model core.Model, llmCtx core.Context, opts core.StreamOptions) (*core.AssistantMessageEventStream, error) {
 	stream := core.NewEventStream[core.AssistantMessageEvent, core.AssistantMessage]()
 
 	go func() {
@@ -37,7 +37,6 @@ func (p *Provider) stream(ctx context.Context, model core.Model, llmCtx core.Con
 
 		stream.Push(core.EventStart{Type: "start", API: model.API, Provider: model.Provider, Model: model.ID, Timestamp: time.Now()})
 
-		// Generate response from last user message
 		response := generateResponse(llmCtx.Messages)
 		stream.Push(core.EventTextStart{Type: "text_start"})
 
@@ -56,11 +55,9 @@ func (p *Provider) stream(ctx context.Context, model core.Model, llmCtx core.Con
 		stream.Push(core.EventTextEnd{Type: "text_end"})
 
 		msg := core.AssistantMessage{
-			Role:    "assistant",
-			API:     model.API, Provider: model.Provider, Model: model.ID,
-			Content:    []core.ContentBlock{core.TextContent{Type: "text", Text: response}},
-			StopReason: core.StopStop,
-			Timestamp:  time.Now(),
+			Role: "assistant", API: model.API, Provider: model.Provider, Model: model.ID,
+			Content: []core.ContentBlock{core.TextContent{Type: "text", Text: response}},
+			StopReason: core.StopStop, Timestamp: time.Now(),
 		}
 		stream.Push(core.EventDone{Type: "done", Message: msg})
 		stream.End(msg)

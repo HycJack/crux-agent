@@ -5,8 +5,8 @@
 package xiaomi
 
 import (
-	core "github.com/hycjack/crux-ai/core"
-	"github.com/hycjack/crux-ai/providers/compat"
+	core "crux-ai/core"
+	"crux-ai/providers/compat"
 )
 
 const defaultBaseURL = "https://api.xiaomimimo.com/v1"

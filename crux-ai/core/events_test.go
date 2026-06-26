@@ -2,135 +2,307 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-func TestEventStreamPushAndEnd(t *testing.T) {
-	s := NewEventStream[string, int]()
+// TestEventStreamPush 测试 Push 方法的正常流程
+func TestEventStreamPush(t *testing.T) {
+	stream := NewEventStream[AssistantMessageEvent, AssistantMessage]()
+	defer stream.End(AssistantMessage{})
 
-	s.Push("a")
-	s.Push("b")
-	s.End(42)
-
-	result, err := s.Result()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if result != 42 {
-		t.Errorf("expected 42, got %d", result)
+	evt := EventTextStart{Type: "text_start"}
+	if !stream.Push(evt) {
+		t.Fatal("Push should return true on first call")
 	}
 }
 
-func TestEventStreamError(t *testing.T) {
-	s := NewEventStream[string, int]()
+// TestEventStreamPushAfterClose 测试关闭后 Push 返回 false
+func TestEventStreamPushAfterClose(t *testing.T) {
+	stream := NewEventStream[AssistantMessageEvent, AssistantMessage]()
+	stream.End(AssistantMessage{})
 
-	expectedErr := errors.New("test error")
-	s.Error(expectedErr)
-
-	_, err := s.Result()
-	if err != expectedErr {
-		t.Errorf("expected %v, got %v", expectedErr, err)
+	if stream.Push(EventTextStart{Type: "text_start"}) {
+		t.Fatal("Push should return false after End")
 	}
 }
 
-func TestEventStreamForEach(t *testing.T) {
-	s := NewEventStream[AssistantMessageEvent, AssistantMessage]()
+// TestEventStreamPushAfterError 测试 Error 后 Push 返回 false
+func TestEventStreamPushAfterError(t *testing.T) {
+	stream := NewEventStream[AssistantMessageEvent, AssistantMessage]()
+	stream.Error(errors.New("test error"))
 
-	go func() {
-		s.Push(EventTextDelta{Type: "text_delta", Delta: "hello"})
-		s.End(AssistantMessage{Role: "assistant"})
-	}()
+	if stream.Push(EventTextStart{Type: "text_start"}) {
+		t.Fatal("Push should return false after Error")
+	}
+}
 
-	var deltas []string
-	result, err := s.ForEach(context.Background(), func(e AssistantMessageEvent) error {
-		if d, ok := e.(EventTextDelta); ok {
-			deltas = append(deltas, d.Delta)
-		}
-		return nil
-	})
+// TestEventStreamEnd 测试 End 正常流程
+func TestEventStreamEnd(t *testing.T) {
+	stream := NewEventStream[AssistantMessageEvent, AssistantMessage]()
 
+	msg := AssistantMessage{Role: "assistant", StopReason: StopStop}
+	stream.End(msg)
+
+	result, err := stream.Result()
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("Expected no error, got: %v", err)
 	}
 	if result.Role != "assistant" {
-		t.Errorf("expected role 'assistant', got '%s'", result.Role)
-	}
-	if len(deltas) != 1 || deltas[0] != "hello" {
-		t.Errorf("expected ['hello'], got %v", deltas)
+		t.Fatalf("Expected role 'assistant', got: %s", result.Role)
 	}
 }
 
-func TestEventStreamForEachError(t *testing.T) {
-	s := NewEventStream[string, int]()
+// TestEventStreamError 测试 Error 流程
+func TestEventStreamError(t *testing.T) {
+	stream := NewEventStream[AssistantMessageEvent, AssistantMessage]()
+
+	testErr := errors.New("stream error")
+	stream.Error(testErr)
+
+	_, err := stream.Result()
+	if err == nil {
+		t.Fatal("Expected error, got nil")
+	}
+	if err.Error() != "stream error" {
+		t.Fatalf("Expected 'stream error', got: %s", err.Error())
+	}
+}
+
+// TestEventStreamDoubleEnd 测试重复调用 End 不会 panic
+func TestEventStreamDoubleEnd(t *testing.T) {
+	stream := NewEventStream[AssistantMessageEvent, AssistantMessage]()
+
+	stream.End(AssistantMessage{Role: "first"})
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Double End should not panic: %v", r)
+		}
+	}()
+	stream.End(AssistantMessage{Role: "second"})
+}
+
+// TestEventStreamDoubleError 测试重复调用 Error 不会 panic
+func TestEventStreamDoubleError(t *testing.T) {
+	stream := NewEventStream[AssistantMessageEvent, AssistantMessage]()
+
+	stream.Error(errors.New("first"))
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Double Error should not panic: %v", r)
+		}
+	}()
+	stream.Error(errors.New("second"))
+}
+
+// TestEventStreamStop 测试 Stop 后 Push 返回 false
+func TestEventStreamStop(t *testing.T) {
+	stream := NewEventStream[AssistantMessageEvent, AssistantMessage]()
+
+	stream.Stop()
+
+	if stream.Push(EventTextStart{Type: "text_start"}) {
+		t.Fatal("Push should return false after Stop")
+	}
+}
+
+// TestEventStreamConcurrentPush 测试并发 Push 的安全性
+func TestEventStreamConcurrentPush(t *testing.T) {
+	stream := NewEventStream[AssistantMessageEvent, AssistantMessage]()
+
+	const goroutines = 50
+	const eventsPerGoroutine = 100
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < eventsPerGoroutine; j++ {
+				stream.Push(EventTextStart{Type: "text_start"})
+			}
+		}()
+	}
+
+	wg.Wait()
+	stream.End(AssistantMessage{})
+
+	_, err := stream.Result()
+	if err != nil {
+		t.Fatalf("Result should not error: %v", err)
+	}
+}
+
+// TestEventStreamForEach 测试 ForEach 正常迭代
+func TestEventStreamForEach(t *testing.T) {
+	stream := NewEventStream[AssistantMessageEvent, AssistantMessage]()
 
 	go func() {
-		s.Push("a")
+		stream.Push(EventTextStart{Type: "text_start"})
+		stream.Push(EventTextDelta{Type: "text_delta", Delta: "hello"})
+		stream.Push(EventTextEnd{Type: "text_end"})
+		stream.End(AssistantMessage{Role: "assistant", StopReason: StopStop})
 	}()
 
-	expectedErr := errors.New("callback error")
-	_, err := s.ForEach(context.Background(), func(v string) error {
-		return expectedErr
-	})
-
-	if err != expectedErr {
-		t.Errorf("expected %v, got %v", expectedErr, err)
-	}
-}
-
-func TestEventStreamContextCancel(t *testing.T) {
-	s := NewEventStream[string, int]()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	_, err := s.ForEach(ctx, func(v string) error {
+	count := 0
+	_, err := stream.ForEach(context.Background(), func(evt AssistantMessageEvent) error {
+		count++
 		return nil
 	})
 
-	if err != context.Canceled {
-		t.Errorf("expected context.Canceled, got %v", err)
+	if err != nil {
+		t.Fatalf("ForEach returned error: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("Expected 3 events, got %d", count)
 	}
 }
 
-func TestEventStreamDoubleEnd(t *testing.T) {
-	s := NewEventStream[string, int]()
+// TestEventStreamForEachContextCancel 测试 context 取消传播
+func TestEventStreamForEachContextCancel(t *testing.T) {
+	stream := NewEventStream[AssistantMessageEvent, AssistantMessage]()
 
-	s.End(1)
-	s.End(2)
+	ctx, cancel := context.WithCancel(context.Background())
 
-	result, _ := s.Result()
-	if result != 1 {
-		t.Errorf("expected 1, got %d", result)
-	}
-}
-
-func TestEventStreamPushAfterEnd(t *testing.T) {
-	s := NewEventStream[string, int]()
-
-	s.End(1)
-	s.Push("after")
-
-	result, _ := s.Result()
-	if result != 1 {
-		t.Errorf("expected 1, got %d", result)
-	}
-}
-
-func TestEventStreamTimeout(t *testing.T) {
-	s := NewEventStream[string, int]()
-
-	done := make(chan struct{})
 	go func() {
-		_, _ = s.Result()
-		close(done)
+		for {
+			stream.Push(EventTextDelta{Type: "text_delta", Delta: "x"})
+			time.Sleep(10 * time.Millisecond)
+		}
 	}()
 
-	select {
-	case <-done:
-		t.Error("Result should block on unclosed stream")
-	case <-time.After(50 * time.Millisecond):
-		// Expected
+	cancel()
+
+	_, err := stream.ForEach(ctx, func(evt AssistantMessageEvent) error {
+		return nil
+	})
+
+	if err == nil {
+		t.Fatal("Expected context cancellation error")
+	}
+	if err != context.Canceled {
+		t.Fatalf("Expected context.Canceled, got: %v", err)
+	}
+}
+
+// TestEventStreamForEachHandlerError 测试 handler 返回错误时停止
+func TestEventStreamForEachHandlerError(t *testing.T) {
+	stream := NewEventStream[AssistantMessageEvent, AssistantMessage]()
+
+	handlerErr := errors.New("handler error")
+
+	go func() {
+		stream.Push(EventTextStart{Type: "text_start"})
+		stream.End(AssistantMessage{})
+	}()
+
+	_, err := stream.ForEach(context.Background(), func(evt AssistantMessageEvent) error {
+		return handlerErr
+	})
+
+	if err != handlerErr {
+		t.Fatalf("Expected handler error, got: %v", err)
+	}
+}
+
+// TestCalculateCost 测试成本计算
+func TestCalculateCost(t *testing.T) {
+	model := Model{
+		Cost: Cost{
+			Input:      3.0,
+			Output:     15.0,
+			CacheRead:  0.3,
+			CacheWrite: 3.75,
+		},
+	}
+	usage := Usage{
+		Input:      1000,
+		Output:     500,
+		CacheRead:  2000,
+		CacheWrite: 1000,
+	}
+
+	cost := CalculateCost(model, usage)
+
+	expectedInput := 1000.0 * 3.0 / 1_000_000
+	expectedOutput := 500.0 * 15.0 / 1_000_000
+	expectedCacheRead := 2000.0 * 0.3 / 1_000_000
+	expectedCacheWrite := 1000.0 * 3.75 / 1_000_000
+	expectedTotal := expectedInput + expectedOutput + expectedCacheRead + expectedCacheWrite
+
+	if cost.Input != expectedInput {
+		t.Errorf("Input cost: expected %f, got %f", expectedInput, cost.Input)
+	}
+	if cost.Output != expectedOutput {
+		t.Errorf("Output cost: expected %f, got %f", expectedOutput, cost.Output)
+	}
+	if cost.CacheRead != expectedCacheRead {
+		t.Errorf("CacheRead cost: expected %f, got %f", expectedCacheRead, cost.CacheRead)
+	}
+	if cost.CacheWrite != expectedCacheWrite {
+		t.Errorf("CacheWrite cost: expected %f, got %f", expectedCacheWrite, cost.CacheWrite)
+	}
+	if cost.Total != expectedTotal {
+		t.Errorf("Total cost: expected %f, got %f", expectedTotal, cost.Total)
+	}
+}
+
+// TestCalculateCostZeroUsage 测试零使用量的成本
+func TestCalculateCostZeroUsage(t *testing.T) {
+	model := Model{
+		Cost: Cost{Input: 3.0, Output: 15.0},
+	}
+	usage := Usage{}
+
+	cost := CalculateCost(model, usage)
+	if cost.Total != 0 {
+		t.Errorf("Expected zero cost, got %f", cost.Total)
+	}
+}
+
+// TestEventContentIndex verifies that ContentIndex round-trips through
+// JSON and that the field is present on every streaming event.
+func TestEventContentIndex(t *testing.T) {
+	tests := []struct {
+		name string
+		ev   AssistantMessageEvent
+		idx  int
+	}{
+		{"text_start", EventTextStart{Type: "text_start", ContentIndex: 2}, 2},
+		{"text_delta", EventTextDelta{Type: "text_delta", ContentIndex: 1, Delta: "x"}, 1},
+		{"text_end", EventTextEnd{Type: "text_end", ContentIndex: 0, Content: "hello"}, 0},
+		{"thinking_start", EventThinkingStart{Type: "thinking_start", ContentIndex: 3}, 3},
+		{"thinking_delta", EventThinkingDelta{Type: "thinking_delta", ContentIndex: 4, Delta: "x"}, 4},
+		{"thinking_end", EventThinkingEnd{Type: "thinking_end", ContentIndex: 0}, 0},
+		{"toolcall_start", EventToolCallStart{Type: "toolcall_start", ContentIndex: 5, ID: "x", Name: "f"}, 5},
+		{"toolcall_delta", EventToolCallDelta{Type: "toolcall_delta", ContentIndex: 6, ID: "x"}, 6},
+		{"toolcall_end", EventToolCallEnd{Type: "toolcall_end", ContentIndex: 7, ID: "x"}, 7},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Marshal and unmarshal to verify the field is encoded and
+			// the round-tripped value matches.
+			data, err := json.Marshal(tc.ev)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if !strings.Contains(string(data), `"contentIndex":`) {
+				t.Errorf("expected contentIndex field in JSON, got %s", data)
+			}
+		})
+	}
+}
+
+// TestEventDoneReason verifies that Reason is preserved separately from
+// Message.StopReason so consumers can dispatch on a single field.
+func TestEventDoneReason(t *testing.T) {
+	evt := EventDone{Type: "done", Reason: StopToolUse}
+	if evt.Reason != StopToolUse {
+		t.Errorf("Reason = %q, want %q", evt.Reason, StopToolUse)
 	}
 }

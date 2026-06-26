@@ -1,18 +1,18 @@
-// Package cruxai is the unified entry point for crux-llm.
-// It re-exports types from core and functions from llm,
+// Package cruxai is the unified entry point for crux-ai.
+// It re-exports types from core and functions from ai,
 // so external consumers can import a single package.
 //
 // Architecture:
 //   core/      — pure types, EventStream, constants, provider registry
-//   llm/       — public API (Stream/Complete), model management
+//   ai/        — public API (Stream/Complete), model management
 //   providers/ — LLM provider implementations
 package cruxai
 
 import (
 	"context"
 
-	"github.com/hycjack/crux-ai/core"
-	"github.com/hycjack/crux-ai/llm"
+	"crux-ai/ai"
+	"crux-ai/core"
 )
 
 // ============================================================
@@ -177,61 +177,61 @@ func ClearImagesProviders() {
 // --- Model Registry (ai) ---
 
 func LoadModels(models map[KnownProvider]map[string]Model) {
-	llm.LoadModels(models)
+	ai.LoadModels(models)
 }
 func GetModel(provider KnownProvider, modelID string) (Model, error) {
-	return llm.GetModel(provider, modelID)
+	return ai.GetModel(provider, modelID)
 }
 func GetProviders() []KnownProvider {
-	return llm.GetProviders()
+	return ai.GetProviders()
 }
 func GetModels(provider KnownProvider) []Model {
-	return llm.GetModels(provider)
+	return ai.GetModels(provider)
 }
 func GetSupportedThinkingLevels(model Model) []ThinkingLevel {
-	return llm.GetSupportedThinkingLevels(model)
+	return ai.GetSupportedThinkingLevels(model)
 }
 func ClampThinkingLevel(model Model, level ThinkingLevel) ThinkingLevel {
-	return llm.ClampThinkingLevel(model, level)
+	return ai.ClampThinkingLevel(model, level)
 }
 func ModelsAreEqual(a, b Model) bool {
-	return llm.ModelsAreEqual(a, b)
+	return ai.ModelsAreEqual(a, b)
 }
 
 // --- Image Model Registry (ai) ---
 
 func LoadImageModels(models map[KnownProvider]map[string]ImagesModel) {
-	llm.LoadImageModels(models)
+	ai.LoadImageModels(models)
 }
 func GetImageModel(provider KnownProvider, modelID string) (ImagesModel, error) {
-	return llm.GetImageModel(provider, modelID)
+	return ai.GetImageModel(provider, modelID)
 }
 func GetImageProviders() []KnownProvider {
-	return llm.GetImageProviders()
+	return ai.GetImageProviders()
 }
 func GetImageModels(provider KnownProvider) []ImagesModel {
-	return llm.GetImageModels(provider)
+	return ai.GetImageModels(provider)
 }
 
 // --- Public API (ai) ---
 
 func Stream(ctx context.Context, model Model, msgs []Message, opts ...StreamOptions) (*core.AssistantMessageEventStream, error) {
-	return llm.Stream(ctx, model, msgs, opts...)
+	return ai.Stream(ctx, model, msgs, opts...)
 }
 func Complete(ctx context.Context, model Model, msgs []Message, opts ...StreamOptions) (AssistantMessage, error) {
-	return llm.Complete(ctx, model, msgs, opts...)
+	return ai.Complete(ctx, model, msgs, opts...)
 }
 func StreamSimple(ctx context.Context, model Model, msgs []Message, opts ...SimpleStreamOptions) (*core.AssistantMessageEventStream, error) {
-	return llm.StreamSimple(ctx, model, msgs, opts...)
+	return ai.StreamSimple(ctx, model, msgs, opts...)
 }
 func StreamSimpleWithContext(ctx context.Context, model Model, llmCtx Context, opts ...SimpleStreamOptions) (*core.AssistantMessageEventStream, error) {
-	return llm.StreamSimpleWithContext(ctx, model, llmCtx, opts...)
+	return ai.StreamSimpleWithContext(ctx, model, llmCtx, opts...)
 }
 func CompleteSimple(ctx context.Context, model Model, msgs []Message, opts ...SimpleStreamOptions) (AssistantMessage, error) {
-	return llm.CompleteSimple(ctx, model, msgs, opts...)
+	return ai.CompleteSimple(ctx, model, msgs, opts...)
 }
 func GenerateImages(ctx context.Context, model ImagesModel, msgs []Message, opts ...ImageOptions) (AssistantImages, error) {
-	return llm.GenerateImages(ctx, model, msgs, opts...)
+	return ai.GenerateImages(ctx, model, msgs, opts...)
 }
 
 // --- Utility Functions (core) ---
