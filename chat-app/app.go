@@ -27,10 +27,9 @@ import (
 type App struct {
 	ctx context.Context
 
-	mu          sync.RWMutex
-	workingDir  string
-	cancelFn    context.CancelFunc
-	activeAgent *agent.Agent
+	mu         sync.RWMutex
+	workingDir string
+	cancelFn   context.CancelFunc
 }
 
 // NewApp creates a new App instance.
@@ -67,9 +66,11 @@ func (a *App) SetWorkingDir(dir string) error {
 	if err != nil {
 		return err
 	}
-	if info, err := os.Stat(abs); err != nil {
+	info, err := os.Stat(abs)
+	if err != nil {
 		return fmt.Errorf("working directory is not accessible: %w", err)
-	} else if !info.IsDir() {
+	}
+	if !info.IsDir() {
 		return fmt.Errorf("working directory is not a directory: %s", abs)
 	}
 	a.mu.Lock()
@@ -112,96 +113,65 @@ type ModelInfo struct {
 	Name string `json:"name"`
 }
 
+// modelListing is the response shape shared by /v1/models endpoints.
+// Both OpenAI and Anthropic use the same `{data: [{id, ...}]}` envelope.
+type modelListing struct {
+	Data []struct {
+		ID          string `json:"id"`
+		DisplayName string `json:"display_name"`
+	} `json:"data"`
+}
+
 // GetModels lists models for a given provider, optionally using a custom base URL + API key.
 func (a *App) GetModels(params map[string]interface{}) ([]ModelInfo, error) {
-	providerStr, _ := params["provider"].(string)
-	baseURL, _ := params["baseUrl"].(string)
-	apiKey, _ := params["apiKey"].(string)
-
-	provider := core.KnownProvider(providerStr)
+	provider := core.KnownProvider(stringParam(params, "provider"))
 	switch provider {
 	case core.ProviderAnthropic:
-		return a.fetchAnthropicModels(baseURL, apiKey)
+		return a.fetchProviderModels(provider, stringParam(params, "baseUrl"), stringParam(params, "apiKey"))
 	case core.ProviderOpenAI:
-		return a.fetchOpenAIModels(baseURL, apiKey)
+		return a.fetchProviderModels(provider, stringParam(params, "baseUrl"), stringParam(params, "apiKey"))
 	}
-	return nil, fmt.Errorf("unsupported provider: %s", providerStr)
+	return nil, fmt.Errorf("unsupported provider: %s", provider)
 }
 
-func (a *App) fetchOpenAIModels(baseURL, apiKey string) ([]ModelInfo, error) {
+// fetchProviderModels hits the provider's /models endpoint. The two
+// providers share the same JSON shape, so they share this implementation
+// — the only real differences are the default base URL and the auth
+// header (handled by attachAuth).
+func (a *App) fetchProviderModels(provider core.KnownProvider, baseURL, apiKey string) ([]ModelInfo, error) {
 	url := baseURL
 	if url == "" {
-		url = "https://api.openai.com/v1"
+		url = defaultBaseURL(provider)
 	}
 	url += "/models"
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return a.cachedModels(core.ProviderOpenAI), nil
+		return a.cachedModels(provider), nil
 	}
-	a.attachAuth(req, core.ProviderOpenAI, apiKey)
+	a.attachAuth(req, provider, apiKey)
+	if provider == core.ProviderAnthropic {
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
 
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
-	if err != nil {
-		return a.cachedModels(core.ProviderOpenAI), nil
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		return a.cachedModels(provider), nil
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return a.cachedModels(core.ProviderOpenAI), nil
+	var listing modelListing
+	if err := json.NewDecoder(resp.Body).Decode(&listing); err != nil {
+		return a.cachedModels(provider), nil
 	}
 
-	var result struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return a.cachedModels(core.ProviderOpenAI), nil
-	}
-	out := make([]ModelInfo, 0, len(result.Data))
-	for _, m := range result.Data {
-		out = append(out, ModelInfo{ID: m.ID, Name: m.ID})
-	}
-	return out, nil
-}
-
-func (a *App) fetchAnthropicModels(baseURL, apiKey string) ([]ModelInfo, error) {
-	url := baseURL
-	if url == "" {
-		url = "https://api.anthropic.com/v1"
-	}
-	url += "/models"
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return a.cachedModels(core.ProviderAnthropic), nil
-	}
-	a.attachAuth(req, core.ProviderAnthropic, apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
-	if err != nil {
-		return a.cachedModels(core.ProviderAnthropic), nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return a.cachedModels(core.ProviderAnthropic), nil
-	}
-
-	var result struct {
-		Data []struct {
-			ID   string `json:"id"`
-			Name string `json:"display_name"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return a.cachedModels(core.ProviderAnthropic), nil
-	}
-	out := make([]ModelInfo, 0, len(result.Data))
-	for _, m := range result.Data {
-		name := m.Name
+	out := make([]ModelInfo, 0, len(listing.Data))
+	for _, m := range listing.Data {
+		name := m.DisplayName
 		if name == "" {
 			name = m.ID
 		}
@@ -210,23 +180,32 @@ func (a *App) fetchAnthropicModels(baseURL, apiKey string) ([]ModelInfo, error) 
 	return out, nil
 }
 
-func (a *App) attachAuth(req *http.Request, provider core.KnownProvider, apiKey string) {
-	key := apiKey
-	if key == "" {
-		key = core.ResolveAPIKey(provider, "")
-	}
-	if key == "" {
-		return
-	}
+func defaultBaseURL(provider core.KnownProvider) string {
 	switch provider {
 	case core.ProviderAnthropic:
-		req.Header.Set("x-api-key", key)
+		return "https://api.anthropic.com/v1"
 	default:
-		req.Header.Set("Authorization", "Bearer "+key)
+		return "https://api.openai.com/v1"
+	}
+}
+
+// attachAuth sets Authorization / x-api-key from the user-supplied key.
+// It does NOT fall back to env vars — model listing should reflect
+// exactly what the user typed. Chat sends its own key separately.
+func (a *App) attachAuth(req *http.Request, provider core.KnownProvider, apiKey string) {
+	if apiKey == "" {
+		return
+	}
+	if provider == core.ProviderAnthropic {
+		req.Header.Set("x-api-key", apiKey)
+	} else {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	req.Header.Set("Content-Type", "application/json")
 }
 
+// cachedModels returns the statically-known model list for a provider.
+// Used as the offline fallback when /v1/models fails.
 func (a *App) cachedModels(provider core.KnownProvider) []ModelInfo {
 	models := ai.GetModels(provider)
 	out := make([]ModelInfo, 0, len(models))
@@ -234,6 +213,15 @@ func (a *App) cachedModels(provider core.KnownProvider) []ModelInfo {
 		out = append(out, ModelInfo{ID: m.ID, Name: m.ID})
 	}
 	return out
+}
+
+// stringParam is a small helper for the untyped params map that Wails
+// passes from the frontend. Returns "" for missing or wrong-typed keys.
+func stringParam(params map[string]interface{}, key string) string {
+	if v, ok := params[key].(string); ok {
+		return v
+	}
+	return ""
 }
 
 // -------------------- Chat --------------------
@@ -247,34 +235,18 @@ type ChatParams struct {
 	Model    string
 }
 
-// SendMessage runs a single (non-streaming) agent turn and returns the final assistant text.
-func (a *App) SendMessage(params map[string]interface{}) (string, error) {
-	p, err := parseChatParams(params)
-	if err != nil {
-		return "", err
+func parseChatParams(params map[string]interface{}) (ChatParams, error) {
+	p := ChatParams{
+		Message:  stringParam(params, "message"),
+		Provider: stringParam(params, "provider"),
+		APIKey:   stringParam(params, "apiKey"),
+		BaseURL:  stringParam(params, "baseUrl"),
+		Model:    stringParam(params, "model"),
 	}
-
-	a.mu.RLock()
-	cwd := a.workingDir
-	a.mu.RUnlock()
-
-	model, err := a.resolveModel(p)
-	if err != nil {
-		return "", err
+	if p.Message == "" {
+		return p, fmt.Errorf("message is required")
 	}
-
-	agt := a.newAgent(model, cwd, p.APIKey)
-	wruntime.EventsEmit(a.ctx, "stream-text-start", "")
-
-	go func() {
-		_, _ = agt.Run(a.ctx, core.UserMessage{
-			Role:      core.MessageRoleUser,
-			Content:   p.Message,
-			Timestamp: time.Now(),
-		})
-	}()
-
-	return "", nil
+	return p, nil
 }
 
 // StreamMessage runs an agent turn and streams events to the frontend.
@@ -285,9 +257,7 @@ func (a *App) StreamMessage(params map[string]interface{}) error {
 		return err
 	}
 
-	a.mu.RLock()
-	cwd := a.workingDir
-	a.mu.RUnlock()
+	cwd := a.GetWorkingDir()
 
 	model, err := a.resolveModel(p)
 	if err != nil {
@@ -296,10 +266,6 @@ func (a *App) StreamMessage(params map[string]interface{}) error {
 	}
 
 	agt := a.newAgent(model, cwd, p.APIKey)
-	a.mu.Lock()
-	a.activeAgent = agt
-	a.mu.Unlock()
-
 	runCtx, cancel := context.WithCancel(a.ctx)
 	a.mu.Lock()
 	a.cancelFn = cancel
@@ -309,7 +275,6 @@ func (a *App) StreamMessage(params map[string]interface{}) error {
 		defer func() {
 			a.mu.Lock()
 			a.cancelFn = nil
-			a.activeAgent = nil
 			a.mu.Unlock()
 		}()
 		_, _ = agt.Run(runCtx, core.UserMessage{
@@ -321,32 +286,13 @@ func (a *App) StreamMessage(params map[string]interface{}) error {
 	return nil
 }
 
-func parseChatParams(params map[string]interface{}) (ChatParams, error) {
-	get := func(k string) string {
-		if v, ok := params[k].(string); ok {
-			return v
-		}
-		return ""
-	}
-	p := ChatParams{
-		Message:  get("message"),
-		Provider: get("provider"),
-		APIKey:   get("apiKey"),
-		BaseURL:  get("baseUrl"),
-		Model:    get("model"),
-	}
-	if p.Message == "" {
-		return p, fmt.Errorf("message is required")
-	}
-	return p, nil
-}
-
+// resolveModel picks the model from the user-supplied list, or falls back
+// to the first known model for the provider. The custom-model path lets
+// users type any ID even if it isn't in the cached list.
 func (a *App) resolveModel(p ChatParams) (core.Model, error) {
 	provider := core.KnownProvider(p.Provider)
 	switch provider {
-	case core.ProviderAnthropic:
-		// ok
-	case core.ProviderOpenAI:
+	case core.ProviderAnthropic, core.ProviderOpenAI:
 		// ok
 	default:
 		return core.Model{}, fmt.Errorf("unsupported provider: %s", p.Provider)
@@ -364,6 +310,7 @@ func (a *App) resolveModel(p ChatParams) (core.Model, error) {
 			}
 			return m, nil
 		}
+		// Unknown ID: still allow it, with a conservative default window.
 		return core.Model{
 			ID:            p.Model,
 			Provider:      provider,
@@ -381,7 +328,7 @@ func (a *App) resolveModel(p ChatParams) (core.Model, error) {
 		}
 		return m, nil
 	}
-	return core.Model{}, fmt.Errorf("no model available for provider %s", provider)
+	return core.Model{}, fmt.Errorf("no model available for provider %s", p.Provider)
 }
 
 // -------------------- Agent wiring --------------------
@@ -427,67 +374,83 @@ func (a *App) newAgent(model core.Model, cwd, apiKey string) *agent.Agent {
 	return agt
 }
 
-// wrapWithWorkingDir rewrites file/shell tools so relative paths and shell commands run inside cwd.
+// wrapWithWorkingDir rewrites file/shell tools so relative paths and shell
+// commands resolve inside cwd instead of the process's working dir.
 func wrapWithWorkingDir(t agent.AgentTool, cwd string) agent.AgentTool {
+	if cwd == "" {
+		return t
+	}
 	inner := t.Execute
 	t.Execute = func(ctx context.Context, toolCallID string, params json.RawMessage, onUpdate func(json.RawMessage)) (agent.AgentToolResult, error) {
-		if cwd == "" {
-			return inner(ctx, toolCallID, params, onUpdate)
-		}
-		switch t.Name {
-		case "bash":
-			var args struct {
-				Command string `json:"command"`
-			}
-			if err := json.Unmarshal(params, &args); err == nil && args.Command != "" {
-				args.Command = injectCwd(args.Command, cwd)
-				if newParams, err := json.Marshal(args); err == nil {
-					params = newParams
-				}
-			}
-		case "read_file", "write_file":
-			var args struct {
-				FilePath string `json:"filePath"`
-			}
-			if err := json.Unmarshal(params, &args); err == nil && args.FilePath != "" && !filepath.IsAbs(args.FilePath) {
-				args.FilePath = filepath.Join(cwd, args.FilePath)
-				if newParams, err := json.Marshal(args); err == nil {
-					params = newParams
-				}
-			}
-		case "glob", "grep":
-			var args struct {
-				Path string `json:"path"`
-			}
-			_ = json.Unmarshal(params, &args)
-			if args.Path == "" {
-				args.Path = cwd
-				if newParams, err := json.Marshal(args); err == nil {
-					params = newParams
-				}
-			} else if !filepath.IsAbs(args.Path) {
-				args.Path = filepath.Join(cwd, args.Path)
-				if newParams, err := json.Marshal(args); err == nil {
-					params = newParams
-				}
-			}
+		if rewritten, ok := rewriteToolParams(t.Name, params, cwd); ok {
+			params = rewritten
 		}
 		return inner(ctx, toolCallID, params, onUpdate)
 	}
 	return t
 }
 
-// injectCwd prefixes the shell command with a "cd into cwd" step so relative paths resolve there.
-// Uses the platform-native shell that crux-agent-runtime's bash tool will pick.
+// rewriteToolParams rewrites a tool's parameters so they target cwd.
+// Returns (rewritten, true) on success, (nil, false) if the tool's args
+// aren't recognized or no rewrite is needed.
+func rewriteToolParams(name string, params json.RawMessage, cwd string) (json.RawMessage, bool) {
+	switch name {
+	case "bash":
+		var args struct {
+			Command string `json:"command"`
+		}
+		if err := json.Unmarshal(params, &args); err != nil || args.Command == "" {
+			return nil, false
+		}
+		args.Command = injectCwd(args.Command, cwd)
+		return jsonMarshal(args)
+	case "read_file", "write_file":
+		var args struct {
+			FilePath string `json:"filePath"`
+		}
+		if err := json.Unmarshal(params, &args); err != nil || args.FilePath == "" || filepath.IsAbs(args.FilePath) {
+			return nil, false
+		}
+		args.FilePath = filepath.Join(cwd, args.FilePath)
+		return jsonMarshal(args)
+	case "glob", "grep":
+		var args struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal(params, &args); err != nil {
+			return nil, false
+		}
+		if args.Path == "" {
+			args.Path = cwd
+		} else if !filepath.IsAbs(args.Path) {
+			args.Path = filepath.Join(cwd, args.Path)
+		} else {
+			return nil, false
+		}
+		return jsonMarshal(args)
+	}
+	return nil, false
+}
+
+func jsonMarshal(v interface{}) (json.RawMessage, bool) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
+// injectCwd prefixes the shell command with a "cd into cwd" step so
+// relative paths resolve there. Uses platform-native shell semantics.
 func injectCwd(cmd, cwd string) string {
 	if stdruntime.GOOS == "windows" {
-		// bash tool on Windows uses cmd.exe by default; safe across shells.
 		return fmt.Sprintf("cd /d \"%s\" && %s", cwd, cmd)
 	}
 	return fmt.Sprintf("cd \"%s\" && %s", cwd, cmd)
 }
 
-// forwardAgentEvent converts agent events into Wails runtime events.
+// forwardAgentEvent converts agent events into Wails runtime events so
+// the React frontend can render streaming output.
 func (a *App) forwardAgentEvent(evt agent.AgentEvent) {
 	switch e := evt.(type) {
 	case agent.EventAgentStart:
@@ -495,31 +458,34 @@ func (a *App) forwardAgentEvent(evt agent.AgentEvent) {
 	case agent.EventAgentEnd:
 		wruntime.EventsEmit(a.ctx, "stream-done", "")
 	case agent.EventMessageUpdate:
-		if ae, ok := e.AssistantEvent.(core.EventTextDelta); ok {
-			wruntime.EventsEmit(a.ctx, "stream-text-delta", ae.Delta)
-		}
-		if ae, ok := e.AssistantEvent.(core.EventThinkingDelta); ok {
-			wruntime.EventsEmit(a.ctx, "stream-thinking-delta", ae.Delta)
-		}
-		if ae, ok := e.AssistantEvent.(core.EventToolCallStart); ok {
-			data, _ := json.Marshal(map[string]string{"id": ae.ID, "name": ae.Name})
-			wruntime.EventsEmit(a.ctx, "stream-tool-call-start", string(data))
-		}
-		if ae, ok := e.AssistantEvent.(core.EventToolCallDelta); ok {
-			wruntime.EventsEmit(a.ctx, "stream-tool-call-delta", ae.ArgumentsDelta)
-		}
-		if ae, ok := e.AssistantEvent.(core.EventToolCallEnd); ok {
-			wruntime.EventsEmit(a.ctx, "stream-tool-call-end", string(ae.Arguments))
-		}
+		a.forwardAssistantEvent(e.AssistantEvent)
 	case agent.EventToolExecStart:
 		data, _ := json.Marshal(map[string]string{"id": e.ToolCallID, "name": e.ToolName})
 		wruntime.EventsEmit(a.ctx, "stream-tool-exec-start", string(data))
 	case agent.EventToolExecEnd:
 		text := string(e.Result)
+		event := "stream-tool-exec-end"
 		if e.IsError {
-			wruntime.EventsEmit(a.ctx, "stream-tool-exec-error", text)
-		} else {
-			wruntime.EventsEmit(a.ctx, "stream-tool-exec-end", text)
+			event = "stream-tool-exec-error"
 		}
+		wruntime.EventsEmit(a.ctx, event, text)
+	}
+}
+
+// forwardAssistantEvent emits the right Wails event for each assistant
+// event variant (text / thinking delta, tool call lifecycle).
+func (a *App) forwardAssistantEvent(evt core.AssistantMessageEvent) {
+	switch ae := evt.(type) {
+	case core.EventTextDelta:
+		wruntime.EventsEmit(a.ctx, "stream-text-delta", ae.Delta)
+	case core.EventThinkingDelta:
+		wruntime.EventsEmit(a.ctx, "stream-thinking-delta", ae.Delta)
+	case core.EventToolCallStart:
+		data, _ := json.Marshal(map[string]string{"id": ae.ID, "name": ae.Name})
+		wruntime.EventsEmit(a.ctx, "stream-tool-call-start", string(data))
+	case core.EventToolCallDelta:
+		wruntime.EventsEmit(a.ctx, "stream-tool-call-delta", ae.ArgumentsDelta)
+	case core.EventToolCallEnd:
+		wruntime.EventsEmit(a.ctx, "stream-tool-call-end", string(ae.Arguments))
 	}
 }

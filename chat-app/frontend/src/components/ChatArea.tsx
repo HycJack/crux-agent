@@ -23,6 +23,9 @@ const suggestions = [
   'Search for "TODO" across all .go files',
 ];
 
+// Auto-scroll is throttled via requestAnimationFrame so streaming tokens
+// (which can fire dozens of updates per second) don't trigger a layout
+// flush on every single event.
 export default function ChatArea({
   messages,
   isLoading,
@@ -34,9 +37,24 @@ export default function ChatArea({
 }: ChatAreaProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const scrollPendingRef = useRef(false);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (scrollPendingRef.current) return;
+    scrollPendingRef.current = true;
+    requestAnimationFrame(() => {
+      scrollPendingRef.current = false;
+      const el = messagesEndRef.current;
+      const container = containerRef.current;
+      if (!el || !container) return;
+      // Only auto-scroll if the user is near the bottom; otherwise they
+      // are reading older messages and forcing a scroll is jarring.
+      const distanceFromBottom =
+        container.scrollHeight - container.scrollTop - container.clientHeight;
+      if (distanceFromBottom < 120) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'end' });
+      }
+    });
   }, [messages, isLoading]);
 
   if (messages.length === 0) {
