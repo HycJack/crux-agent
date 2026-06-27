@@ -16,8 +16,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/hycjack/crux-ai/core"
@@ -49,7 +47,11 @@ type demoState struct {
 }
 
 func main() {
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	// Root context is plain; signal handling for Ctrl+C happens inside the
+	// REPL via the raw-mode terminal reader (see repl.go). This lets us
+	// distinguish "cancel current turn" (Ctrl+C while agent is running)
+	// from "exit program" (Ctrl+C at the idle prompt).
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	loadEnv(".env")
