@@ -19,8 +19,8 @@ import (
 
 	contextpkg "crux-agent-runtime/context"
 
+	"github.com/hycjack/crux-ai/ai"
 	core "github.com/hycjack/crux-ai/core"
-	"github.com/hycjack/crux-ai/llm"
 )
 
 // AgentEventStream is the type alias for the agent event stream.
@@ -390,7 +390,7 @@ func invokeStreamFn(ctx context.Context, config AgentLoopConfig, llmCtx core.Con
 	if config.StreamFn != nil {
 		return config.StreamFn(ctx, config.Model, llmCtx, opts)
 	}
-	return llm.StreamSimpleWithContext(ctx, config.Model, llmCtx, opts)
+	return ai.StreamSimpleWithContext(ctx, config.Model, llmCtx, opts)
 }
 
 func consumeStreamEvents(ctx context.Context, llmStream *core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], stream *AgentEventStream) (core.AssistantMessage, error) {
