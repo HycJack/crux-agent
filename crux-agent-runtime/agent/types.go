@@ -1,8 +1,10 @@
 package agent
 
 import (
-	"context"
+	stdctx "context"
 	"encoding/json"
+
+	ctxpkg "crux-agent-runtime/context"
 
 	core "github.com/hycjack/crux-ai/core"
 )
@@ -107,7 +109,7 @@ type AgentTool struct {
 }
 
 // ToolExecuteFunc is the function signature for tool execution.
-type ToolExecuteFunc func(ctx context.Context, toolCallID string, params json.RawMessage, onUpdate func(json.RawMessage)) (AgentToolResult, error)
+type ToolExecuteFunc func(ctx stdctx.Context, toolCallID string, params json.RawMessage, onUpdate func(json.RawMessage)) (AgentToolResult, error)
 
 // AgentToolResult is the result of a tool execution.
 type AgentToolResult struct {
@@ -150,7 +152,40 @@ type ToolCallOverride struct {
 }
 
 // StreamFn is the type for custom streaming functions.
-type StreamFn func(context.Context, core.Model, core.Context, core.SimpleStreamOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error)
+type StreamFn func(stdctx.Context, core.Model, core.Context, core.SimpleStreamOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error)
+
+// CompactionConfig configures automatic context-window compaction.
+//
+// The agent loop applies compaction in two places:
+//  1. Before every LLM call: if estimated tokens exceed MaxTokens, the
+//     Compactor runs and replaces messages in place.
+//  2. After a context-overflow error from the LLM: force-compact and
+//     retry the call up to OverflowRetries times.
+type CompactionConfig struct {
+	// Compactor performs the actual compaction. Required.
+	Compactor ctxpkg.Compactor
+
+	// TokenCounter estimates token usage. If nil, context.DefaultTokenCounter is used.
+	TokenCounter ctxpkg.TokenCounter
+
+	// MaxTokens is the soft budget for tokens. When the estimated count
+	// exceeds this, compaction is triggered before the LLM call.
+	// Default: 100000.
+	MaxTokens int
+
+	// ReserveTokens is reserved for the LLM's response and is NOT counted
+	// against the budget. Default: 4096.
+	ReserveTokens int
+
+	// OverflowRetries is the number of times to retry after a
+	// context-overflow error from the LLM. Each retry force-compacts
+	// before the call. Default: 1.
+	OverflowRetries int
+
+	// OnCompact is called after each compaction, for telemetry / logging.
+	// (prevTokens, newTokens, prevMsgs, newMsgs)
+	OnCompact func(prevTokens, newTokens, prevMsgs, newMsgs int)
+}
 
 // AgentLoopConfig configures the agent loop.
 type AgentLoopConfig struct {
@@ -193,8 +228,9 @@ type AgentLoopConfig struct {
 	// StreamFn is a custom streaming function. If nil, crux-ai StreamSimple is used.
 	StreamFn StreamFn
 
-	// Compaction configures automatic context compaction.
-	// Compactor is the compaction strategy.
+	// Compaction, if set, enables automatic context-window compaction.
+	// See CompactionConfig for details.
+	Compaction CompactionConfig
 }
 
 // findTool looks up a tool by name.

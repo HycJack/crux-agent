@@ -1,8 +1,8 @@
 // Package agent provides the runtime for executing autonomous LLM
 // agents. It implements a two-level event loop:
 //
-//   outer loop  — checks for follow-up user messages between runs
-//   inner loop  — processes tool calls and steering messages
+//	outer loop  — checks for follow-up user messages between runs
+//	inner loop  — processes tool calls and steering messages
 //
 // All agent state is passed in as values; the package has no
 // process-wide mutable state. Use AgentLoop / AgentLoopContinue to
@@ -16,6 +16,8 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	contextpkg "crux-agent-runtime/context"
 
 	core "github.com/hycjack/crux-ai/core"
 	"github.com/hycjack/crux-ai/llm"
@@ -80,7 +82,8 @@ func runLoop(ctx context.Context, config AgentLoopConfig, messages []core.Messag
 			return
 		}
 
-		hasMoreTurns := runInnerLoop(ctx, config, messages, stream)
+		hasMoreTurns, updatedMsgs := runInnerLoop(ctx, config, messages, stream)
+		messages = updatedMsgs
 		if !hasMoreTurns {
 			stream.End(messages)
 			return
@@ -96,10 +99,10 @@ func runLoop(ctx context.Context, config AgentLoopConfig, messages []core.Messag
 }
 
 // runInnerLoop runs model turns until the LLM stops calling tools.
-func runInnerLoop(ctx context.Context, config AgentLoopConfig, messages []core.Message, stream *AgentEventStream) bool {
+func runInnerLoop(ctx context.Context, config AgentLoopConfig, messages []core.Message, stream *AgentEventStream) (bool, []core.Message) {
 	for round := 0; round < MaxAgentRounds; round++ {
 		if err := ctx.Err(); err != nil {
-			return false
+			return false, messages
 		}
 
 		hasSteering := injectSteeringMessages(&config, messages)
@@ -114,7 +117,7 @@ func runInnerLoop(ctx context.Context, config AgentLoopConfig, messages []core.M
 
 		if isTerminalStop(assistantMsg.StopReason) {
 			stream.Push(EventTurnEnd{Message: assistantMsg})
-			return false
+			return false, messages
 		}
 
 		toolCalls := extractToolCalls(assistantMsg)
@@ -128,24 +131,24 @@ func runInnerLoop(ctx context.Context, config AgentLoopConfig, messages []core.M
 		stream.Push(EventTurnEnd{Message: assistantMsg, ToolResults: toolResults})
 
 		if shouldTerminate {
-			return false
+			return false, messages
 		}
 		if config.PrepareNextTurn != nil {
 			config.PrepareNextTurn(&config, assistantMsg, toolResults, messages)
 		}
 		if config.ShouldStopAfterTurn != nil && config.ShouldStopAfterTurn(assistantMsg, toolResults) {
-			return false
+			return false, messages
 		}
 
 		if len(toolCalls) == 0 && !hasSteering {
-			return true
+			return true, messages
 		}
 	}
 	log.Printf("agent: inner loop hit MaxAgentRounds=%d", MaxAgentRounds)
-	return true
+	return true, messages
 }
 
-func handleStreamError(err error, messages []core.Message, stream *AgentEventStream) bool {
+func handleStreamError(err error, messages []core.Message, stream *AgentEventStream) (bool, []core.Message) {
 	log.Printf("agent: streamAssistantResponse error: %v", err)
 	errMsg := core.AssistantMessage{
 		Role:         core.MessageRoleAssistant,
@@ -154,7 +157,7 @@ func handleStreamError(err error, messages []core.Message, stream *AgentEventStr
 	}
 	messages = append(messages, errMsg)
 	stream.Push(EventTurnEnd{Message: errMsg})
-	return false
+	return false, messages
 }
 
 func isTerminalStop(reason core.StopReason) bool {
@@ -187,22 +190,176 @@ func injectFollowUpMessages(config *AgentLoopConfig, messages []core.Message) bo
 
 func streamAssistantResponse(ctx context.Context, config AgentLoopConfig, messages []core.Message, stream *AgentEventStream) (core.AssistantMessage, []core.Message, error) {
 	trimmedMessages := transformContext(ctx, config, messages)
+
+	// Pre-call compaction: if the compactor is configured and estimated
+	// tokens exceed MaxTokens, run compaction before sending.
+	trimmedMessages = maybeCompactPreCall(ctx, config, trimmedMessages)
+
 	llmMessages := convertToLLM(config, trimmedMessages)
 	opts := resolveStreamOptions(&config)
 	llmCtx := toContextMessages(llmMessages, config.SystemPrompt, config.Tools)
 
 	llmStream, err := invokeStreamFn(ctx, config, llmCtx, opts)
 	if err != nil {
+		// Overflow retry: if the LLM rejected the call for being too long,
+		// force-compact and retry up to OverflowRetries times.
+		if core.IsContextOverflow(err) {
+			retried, retryErr := retryWithCompaction(ctx, config, &trimmedMessages, stream)
+			if retryErr == nil {
+				partialMsg := retried
+				stream.Push(EventMessageEnd{Message: partialMsg})
+				return partialMsg, trimmedMessages, nil
+			}
+			return core.AssistantMessage{}, trimmedMessages, retryErr
+		}
 		return core.AssistantMessage{}, trimmedMessages, err
 	}
 
 	partialMsg, err := consumeStreamEvents(ctx, llmStream, stream)
 	if err != nil {
+		// Same overflow detection: also surface mid-stream overflow errors.
+		if core.IsContextOverflow(err) {
+			retried, retryErr := retryWithCompaction(ctx, config, &trimmedMessages, stream)
+			if retryErr == nil {
+				stream.Push(EventMessageEnd{Message: retried})
+				return retried, trimmedMessages, nil
+			}
+			return core.AssistantMessage{}, trimmedMessages, retryErr
+		}
 		return core.AssistantMessage{}, trimmedMessages, err
 	}
 
 	stream.Push(EventMessageEnd{Message: partialMsg})
 	return partialMsg, trimmedMessages, nil
+}
+
+// maybeCompactPreCall runs the compactor if the configured budget is exceeded.
+// Always returns the (possibly shortened) messages slice.
+func maybeCompactPreCall(ctx context.Context, config AgentLoopConfig, messages []core.Message) []core.Message {
+	comp := config.Compaction.Compactor
+	if comp == nil {
+		return messages
+	}
+	maxTokens := config.Compaction.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 100000
+	}
+	reserveTokens := config.Compaction.ReserveTokens
+	if reserveTokens < 0 {
+		reserveTokens = 0
+	}
+
+	counter := config.Compaction.TokenCounter
+	if counter == nil {
+		counter = contextpkg.DefaultTokenCounter
+	}
+
+	tokens := counter(config.SystemPrompt, messages, toCoreTools(config.Tools))
+	if tokens <= maxTokens-reserveTokens {
+		return messages
+	}
+
+	prevTokens := tokens
+	prevCount := len(messages)
+	newMsgs, changed, err := comp.Compact(ctx, messages)
+	if err != nil || !changed {
+		return messages
+	}
+	if config.Compaction.OnCompact != nil {
+		newTokens := counter(config.SystemPrompt, newMsgs, toCoreTools(config.Tools))
+		config.Compaction.OnCompact(prevTokens, newTokens, prevCount, len(newMsgs))
+	}
+	log.Printf("agent: pre-call compaction: %d tokens → ? tokens, %d msgs → %d msgs",
+		prevTokens, prevCount, len(newMsgs))
+	return newMsgs
+}
+
+// retryWithCompaction is the overflow-error fallback: force-compact and
+// retry the LLM call. Returns the resulting AssistantMessage or the last
+// error.
+func retryWithCompaction(ctx context.Context, config AgentLoopConfig, messages *[]core.Message, stream *AgentEventStream) (core.AssistantMessage, error) {
+	comp := config.Compaction.Compactor
+	if comp == nil {
+		return core.AssistantMessage{}, &core.OverflowError{Message: "compaction not configured"}
+	}
+	retries := config.Compaction.OverflowRetries
+	if retries <= 0 {
+		retries = 1
+	}
+
+	var lastErr error
+	for i := 0; i < retries; i++ {
+		// Force-compact: try to compact even if token estimate says we're fine.
+		counter := config.Compaction.TokenCounter
+		if counter == nil {
+			counter = contextpkg.DefaultTokenCounter
+		}
+
+		prevTokens := counter(config.SystemPrompt, *messages, toCoreTools(config.Tools))
+		prevCount := len(*messages)
+
+		newMsgs, changed, err := comp.Compact(ctx, *messages)
+		if err != nil {
+			lastErr = err
+			break
+		}
+		if !changed || len(newMsgs) >= len(*messages) {
+			// Compactor didn't help — bail to avoid infinite retry.
+			lastErr = &core.OverflowError{Message: "compactor made no progress"}
+			break
+		}
+		*messages = newMsgs
+		log.Printf("agent: overflow retry %d/%d — compacted %d tokens, %d → %d msgs",
+			i+1, retries, prevTokens, prevCount, len(newMsgs))
+		if config.Compaction.OnCompact != nil {
+			newTokens := counter(config.SystemPrompt, *messages, toCoreTools(config.Tools))
+			config.Compaction.OnCompact(prevTokens, newTokens, prevCount, len(newMsgs))
+		}
+
+		// Retry the call.
+		llmMessages := convertToLLM(config, *messages)
+		opts := resolveStreamOptions(&config)
+		llmCtx := toContextMessages(llmMessages, config.SystemPrompt, config.Tools)
+
+		llmStream, err := invokeStreamFn(ctx, config, llmCtx, opts)
+		if err != nil {
+			if !core.IsContextOverflow(err) {
+				return core.AssistantMessage{}, err
+			}
+			lastErr = err
+			continue
+		}
+
+		partialMsg, err := consumeStreamEvents(ctx, llmStream, stream)
+		if err != nil {
+			if !core.IsContextOverflow(err) {
+				return core.AssistantMessage{}, err
+			}
+			lastErr = err
+			continue
+		}
+		return partialMsg, nil
+	}
+	if lastErr == nil {
+		lastErr = &core.OverflowError{Message: "exhausted overflow retries"}
+	}
+	return core.AssistantMessage{}, lastErr
+}
+
+// toCoreTools converts AgentTool slice to core.Tool slice for the token counter.
+func toCoreTools(tools []AgentTool) []core.Tool {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]core.Tool, len(tools))
+	for i, t := range tools {
+		out[i] = core.Tool{
+			Name:        t.Name,
+			Description: t.Description,
+			Parameters:  t.Parameters,
+		}
+	}
+	return out
 }
 
 func transformContext(ctx context.Context, config AgentLoopConfig, messages []core.Message) []core.Message {

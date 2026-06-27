@@ -34,12 +34,19 @@ type AgentState struct {
 // AgentOptions configures a new Agent.
 type AgentOptions struct {
 	InitialState *AgentState
+
+	// Compaction configures automatic context-window compaction. If set,
+	// the agent will run pre-call compaction whenever estimated tokens
+	// exceed Compaction.MaxTokens, and will retry-with-compaction when
+	// the LLM returns a context-overflow error.
+	Compaction CompactionConfig
 }
 
 // Agent is a stateful wrapper around the agent loop.
 type Agent struct {
 	mu          sync.RWMutex
 	state       AgentState
+	compaction  CompactionConfig
 	subscribers []func(AgentEvent)
 	steering    []core.Message
 	followUp    []core.Message
@@ -56,7 +63,23 @@ func New(opts AgentOptions) *Agent {
 	if a.state.Messages == nil {
 		a.state.Messages = make([]core.Message, 0)
 	}
+	a.compaction = opts.Compaction
 	return a
+}
+
+// SetCompaction overrides the compaction config at runtime. Useful for
+// turning compaction on/off without recreating the agent.
+func (a *Agent) SetCompaction(c CompactionConfig) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.compaction = c
+}
+
+// Compaction returns the current compaction config (copy).
+func (a *Agent) Compaction() CompactionConfig {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.compaction
 }
 
 // State returns a copy of the agent's current state.
@@ -85,6 +108,14 @@ func (a *Agent) SetSystemPrompt(prompt string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.state.SystemPrompt = prompt
+}
+
+// Reset clears the message history so the next run starts fresh.
+// System prompt, model, and tools are preserved.
+func (a *Agent) Reset() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.state.Messages = make([]core.Message, 0)
 }
 
 // Messages returns the current message history.
@@ -258,6 +289,7 @@ func (a *Agent) buildConfig() AgentLoopConfig {
 		AfterToolCall:       a.state.AfterToolCall,
 		StreamFn:            a.state.StreamFn,
 		GetFollowUpMessages: a.state.GetFollowUpMessages,
+		Compaction:          a.compaction,
 	}
 }
 
