@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/hycjack/crux-ai/llm"
+	"github.com/hycjack/crux-ai/ai"
 	core "github.com/hycjack/crux-ai/core"
 )
 
@@ -19,7 +19,7 @@ type Compactor interface {
 
 // LLMCompactor uses an LLM to generate a summary of older messages.
 type LLMCompactor struct {
-	Model        core.Model
+	Model         core.Model
 	SummaryPrompt string
 }
 
@@ -48,7 +48,7 @@ func (c *LLMCompactor) Compact(ctx context.Context, req CompactionRequest, opts 
 		streamOpts = opts
 	}
 
-	msg, err := llm.CompleteSimple(ctx, c.Model, []core.Message{
+	msg, err := ai.CompleteSimple(ctx, c.Model, []core.Message{
 		core.UserMessage{Content: prompt},
 	}, streamOpts...)
 	if err != nil {
