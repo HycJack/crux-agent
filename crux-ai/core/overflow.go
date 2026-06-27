@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"errors"
 	"regexp"
 	"strings"
 )
@@ -118,22 +119,17 @@ func IsContextOverflowError(errStr string) bool {
 }
 
 // IsContextOverflow returns true if the error indicates context overflow.
-// It inspects ProviderError messages, plain error messages, and embedded
+// It inspects *OverflowError, plain error messages, and embedded
 // HTTP response bodies.
 func IsContextOverflow(err error) bool {
 	if err == nil {
 		return false
 	}
 
-	// Inspect ProviderError first to extract a clean message.
-	var pe *ProviderError
-	if errorsAs(err, &pe) {
-		if pe.Kind == ErrorKindContextLength {
-			return true
-		}
-		if pe.Message != "" {
-			return IsContextOverflowError(pe.Message)
-		}
+	// Typed *OverflowError match — the new active error path.
+	var oe *OverflowError
+	if errors.As(err, &oe) {
+		return true
 	}
 
 	// Inspect embedded JSON body if present (some providers embed JSON
@@ -190,24 +186,6 @@ func IsContextOverflowMessage(msg *AssistantMessage, contextWindow int) bool {
 		}
 	}
 
-	return false
-}
-
-// errorsAs is a tiny error.As wrapper that keeps the import graph clean
-// and lets us add ProviderError unwrap logic in one place.
-func errorsAs(err error, target **ProviderError) bool {
-	for err != nil {
-		if pe, ok := err.(*ProviderError); ok {
-			*target = pe
-			return true
-		}
-		type unwrapper interface{ Unwrap() error }
-		u, ok := err.(unwrapper)
-		if !ok {
-			return false
-		}
-		err = u.Unwrap()
-	}
 	return false
 }
 

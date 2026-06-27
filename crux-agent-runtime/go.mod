@@ -5,6 +5,6 @@ go 1.23.0
 
 require github.com/hycjack/crux-ai v0.0.1
 
-require github.com/mattn/go-sqlite3 v1.14.45 // indirect
+require github.com/mattn/go-sqlite3 v1.14.45
 
 replace github.com/hycjack/crux-ai => ../crux-ai

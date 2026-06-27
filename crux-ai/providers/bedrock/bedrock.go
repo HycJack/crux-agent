@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"crux-ai/internal/conv"
+	"github.com/hycjack/crux-ai/internal/conv"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 const defaultRegion = "us-east-1"
@@ -324,7 +324,7 @@ func doBedrockStream(ctx context.Context, region, apiKey string, model core.Mode
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	for k, v := range model.Headers {
+	for k, v := range core.ProviderHeadersToRecord(core.MergeProviderHeaders(model.Headers, opts.Headers)) {
 		req.Header.Set(k, v)
 	}
 

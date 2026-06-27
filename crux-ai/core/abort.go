@@ -77,3 +77,29 @@ func filterNonNil(parents []context.Context) []context.Context {
 	}
 	return out
 }
+
+// SignalToContext converts a `<-chan struct{}` cancellation signal into a
+// cancellable context. Returns context.Background() when sig is nil, so the
+// caller can always WithCancel on the result. Calling cancel stops the
+// internal watcher goroutine.
+//
+// Use this instead of the standard "context.WithCancel + goroutine + select"
+// boilerplate when bridging a callback-style signal into a context-aware
+// HTTP request.
+//
+// Source: pi-mono packages/ai/src/utils/abort-signals.ts pattern (transposed).
+// || 把 <-chan struct{} 信号转为可取消的 context。
+func SignalToContext(sig <-chan struct{}) context.Context {
+	if sig == nil {
+		return context.Background()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-sig:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx
+}

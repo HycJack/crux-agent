@@ -18,15 +18,15 @@ import (
 type EntryType string
 
 const (
-	EntryUserMessage     EntryType = "user_message"
+	EntryUserMessage      EntryType = "user_message"
 	EntryAssistantMessage EntryType = "assistant_message"
-	EntryToolResult      EntryType = "tool_result"
-	EntrySystemPrompt    EntryType = "system_prompt"
-	EntryModelChange     EntryType = "model_change"
-	EntryCompaction      EntryType = "compaction"
-	EntrySessionInfo     EntryType = "session_info"
-	EntryThinkingChange  EntryType = "thinking_change"
-	EntryMetadata        EntryType = "metadata"
+	EntryToolResult       EntryType = "tool_result"
+	EntrySystemPrompt     EntryType = "system_prompt"
+	EntryModelChange      EntryType = "model_change"
+	EntryCompaction       EntryType = "compaction"
+	EntrySessionInfo      EntryType = "session_info"
+	EntryThinkingChange   EntryType = "thinking_change"
+	EntryMetadata         EntryType = "metadata"
 )
 
 // SessionTreeEntry is a single node in the session tree.

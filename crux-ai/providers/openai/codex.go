@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // CodexOptions holds OpenAI Codex-specific options.

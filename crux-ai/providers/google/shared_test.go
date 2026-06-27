@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // TestConvertToolResultPartsValidJSON 测试有效 JSON 直接返回

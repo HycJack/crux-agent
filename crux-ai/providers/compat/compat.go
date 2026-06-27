@@ -21,9 +21,9 @@ import (
 	"sync"
 	"time"
 
-	core "crux-ai/core"
-	"crux-ai/internal/sse"
-	"crux-ai/providers/openai/convert"
+	core "github.com/hycjack/crux-ai/core"
+	"github.com/hycjack/crux-ai/internal/sse"
+	"github.com/hycjack/crux-ai/providers/openai/convert"
 )
 
 // Config describes a single OpenAI-compatible provider.
@@ -131,6 +131,9 @@ func buildBody(_ Config, model core.Model, c core.Context, opts core.StreamOptio
 	if len(c.Tools) > 0 {
 		body["tools"] = convert.Tools(c.Tools)
 	}
+	if opts.PromptCacheKey != nil {
+		body["prompt_cache_key"] = core.ClampOpenAIPromptCacheKey(opts.PromptCacheKey)
+	}
 	return body
 }
 
@@ -148,6 +151,11 @@ func runStream(ctx context.Context, cfg Config, model core.Model, c core.Context
 		opts.OnPayload(body)
 	}
 
+	// Merge opts.Signal into the request context so cancellation propagates
+	// to the HTTP round-trip. Without this the signal is silently ignored.
+	// Source: pi-mono packages/ai/src/utils/abort-signals.ts pattern.
+	merged := core.CombineAbortSignals(ctx, core.SignalToContext(opts.Signal))
+
 	stream := core.NewEventStream[core.AssistantMessageEvent, core.AssistantMessage]()
 	go func() {
 		defer func() {
@@ -155,7 +163,7 @@ func runStream(ctx context.Context, cfg Config, model core.Model, c core.Context
 				stream.Error(fmt.Errorf("%s: panic: %v", cfg.Provider, r))
 			}
 		}()
-		msg, err := doRequest(ctx, cfg, model, body, apiKey, stream, opts)
+		msg, err := doRequest(merged.Ctx, cfg, model, body, apiKey, stream, opts)
 		if err != nil {
 			stream.Error(err)
 			return
@@ -190,17 +198,18 @@ func doRequest(
 	for k, v := range cfg.ExtraHeaders {
 		req.Header.Set(k, v)
 	}
-	for k, v := range model.Headers {
-		req.Header.Set(k, v)
-	}
-	for k, v := range opts.Headers {
+	for k, v := range core.ProviderHeadersToRecord(core.MergeProviderHeaders(model.Headers, opts.Headers)) {
 		req.Header.Set(k, v)
 	}
 
 	resp, err := core.SSEClient.Do(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			return core.AssistantMessage{}, core.WrapHTTPTimeout(model.Provider, 5*time.Minute, err)
+			d := time.Duration(opts.TimeoutMs) * time.Millisecond
+			if d <= 0 {
+				d = 5 * time.Minute // matches SSEClient default
+			}
+			return core.AssistantMessage{}, core.WrapHTTPTimeout(model.Provider, d, err)
 		}
 		return core.AssistantMessage{}, err
 	}
@@ -330,7 +339,14 @@ func processSSE(
 		msg.Content = append(msg.Content, core.TextContent{Type: "text", Text: textBuf.String()})
 		stream.Push(core.EventTextEnd{Type: "text_end"})
 	}
+	// Deduplicate indices: some providers re-emit the same tool_call delta,
+	// which would otherwise produce duplicate toolcall_end events.
+	seen := make(map[int]struct{}, len(toolIndices))
 	for _, index := range toolIndices {
+		if _, ok := seen[index]; ok {
+			continue
+		}
+		seen[index] = struct{}{}
 		if tc, ok := toolCalls[index]; ok {
 			stream.Push(core.EventToolCallEnd{Type: "toolcall_end", ID: tc.ID, Arguments: tc.Arguments})
 			msg.Content = append(msg.Content, *tc)

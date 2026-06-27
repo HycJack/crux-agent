@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // TestStreamAnthropicNoAPIKey 测试无 API Key

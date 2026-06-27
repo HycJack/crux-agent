@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 const defaultOpenRouterBaseURL = "https://openrouter.ai/api/v1"
@@ -65,16 +65,9 @@ func (p *OpenRouterProvider) GenerateImages(model core.ImagesModel, c core.Conte
 	}
 	url := baseURL + "/chat/completions"
 
-	ctx, cancel := context.WithCancel(context.Background())
-	if opts.Signal != nil {
-		go func() {
-			select {
-			case <-opts.Signal:
-				cancel()
-			case <-ctx.Done():
-			}
-		}()
-	}
+	// Merge opts.Signal (<-chan struct{}) into a cancellable context.
+	sigCtx := core.SignalToContext(opts.Signal)
+	ctx, cancel := context.WithCancel(sigCtx)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
@@ -83,10 +76,7 @@ func (p *OpenRouterProvider) GenerateImages(model core.ImagesModel, c core.Conte
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	for k, v := range model.Headers {
-		req.Header.Set(k, v)
-	}
-	for k, v := range opts.Headers {
+	for k, v := range core.ProviderHeadersToRecord(core.MergeProviderHeaders(model.Headers, opts.Headers)) {
 		req.Header.Set(k, v)
 	}
 

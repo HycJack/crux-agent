@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // runResponsesSSE feeds SSE-formatted data to processResponsesSSE and

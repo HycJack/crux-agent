@@ -79,14 +79,13 @@ func TestIsContextOverflow_ErrorWithEmbeddedJSON(t *testing.T) {
 }
 
 func TestIsContextOverflow_ProviderErrorKind(t *testing.T) {
-	pe := NewProviderError(400, "Bad Request", errors.New("bad"))
-	pe.Kind = ErrorKindContextLength
-	if !IsContextOverflow(pe) {
-		t.Errorf("ProviderError with Kind=ContextLength should be overflow")
+	oe := &OverflowError{Provider: ProviderOpenAI, Message: "context window exceeded"}
+	if !IsContextOverflow(oe) {
+		t.Errorf("*OverflowError should be detected as overflow")
 	}
 
-	pe2 := NewProviderError(401, "Unauthorized", nil)
-	if IsContextOverflow(pe2) {
+	auth := &AuthError{Provider: ProviderOpenAI}
+	if IsContextOverflow(auth) {
 		t.Errorf("auth error should not be overflow")
 	}
 }

@@ -11,9 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"crux-ai/internal/conv"
+	"github.com/hycjack/crux-ai/internal/conv"
+	"github.com/hycjack/crux-ai/providers/compat"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // CompletionsOptions holds OpenAI Completions-specific options.
@@ -27,6 +28,19 @@ type CompletionsProvider struct{}
 
 // NewCompletions creates a new OpenAI Completions provider.
 func NewCompletions() *CompletionsProvider { return &CompletionsProvider{} }
+
+// NewCompat returns an OpenAI direct config suitable for compat.Router.
+//
+// All OpenAI-protocol providers (OpenAI, Xiaomi, GLM, DeepSeek, Kimi, ...)
+// share the same compat engine and are dispatched by model.Provider at
+// request time. Register this alongside the third-party configs to cover
+// OpenAI's own /v1/chat/completions endpoint.
+func NewCompat() compat.Config {
+	return compat.Config{
+		Provider:       core.ProviderOpenAI,
+		DefaultBaseURL: "https://api.openai.com/v1",
+	}
+}
 
 func (p *CompletionsProvider) Stream(ctx context.Context, model core.Model, llmCtx core.Context, opts core.StreamOptions) (*core.AssistantMessageEventStream, error) {
 	return streamCompletions(ctx, model, llmCtx, opts, CompletionsOptions{})
@@ -127,10 +141,7 @@ func doCompletionsStream(ctx context.Context, baseURL, apiKey string, model core
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	for k, v := range model.Headers {
-		req.Header.Set(k, v)
-	}
-	for k, v := range opts.Headers {
+	for k, v := range core.ProviderHeadersToRecord(core.MergeProviderHeaders(model.Headers, opts.Headers)) {
 		req.Header.Set(k, v)
 	}
 

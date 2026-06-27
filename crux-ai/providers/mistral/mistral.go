@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	core "crux-ai/core"
-	"crux-ai/internal/conv"
+	core "github.com/hycjack/crux-ai/core"
+	"github.com/hycjack/crux-ai/internal/conv"
 )
 
 const defaultBaseURL = "https://api.mistral.ai/v1"
@@ -271,7 +271,7 @@ func doMistralStream(ctx context.Context, baseURL, apiKey string, model core.Mod
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	for k, v := range model.Headers {
+	for k, v := range core.ProviderHeadersToRecord(core.MergeProviderHeaders(model.Headers, opts.Headers)) {
 		req.Header.Set(k, v)
 	}
 

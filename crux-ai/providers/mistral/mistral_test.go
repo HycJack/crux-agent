@@ -9,7 +9,7 @@ import (
 	"os"
 	"testing"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // TestNormalizeToolCallIDValid 测试有效的 9 位 ID 直接返回

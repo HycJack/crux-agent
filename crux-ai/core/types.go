@@ -42,6 +42,8 @@ const (
 	ProviderGroq          KnownProvider = "groq"
 	ProviderXAI           KnownProvider = "xai"
 	ProviderDeepSeek      KnownProvider = "deepseek"
+	ProviderKimi          KnownProvider = "kimi"
+	ProviderGLM           KnownProvider = "glm"
 	ProviderCerebras      KnownProvider = "cerebras"
 	ProviderCloudflare    KnownProvider = "cloudflare"
 	ProviderHuggingFace   KnownProvider = "huggingface"
@@ -184,6 +186,16 @@ type ToolCall struct {
 
 func (ToolCall) contentTag() {}
 
+// MessageRole represents the role of a message sender.
+type MessageRole string
+
+const (
+	MessageRoleUser      MessageRole = "user"      // 用户
+	MessageRoleAssistant MessageRole = "assistant" // 助手
+	MessageRoleTool      MessageRole = "tool"      // 工具
+	MessageRoleSystem    MessageRole = "system"    // 系统
+)
+
 // Message is the interface for all message types.
 type Message interface {
 	messageTag()
@@ -192,9 +204,9 @@ type Message interface {
 
 // UserMessage represents a user message.
 type UserMessage struct {
-	Role      string    `json:"role"`
-	Content   any       `json:"content"`
-	Timestamp time.Time `json:"timestamp"`
+	Role      MessageRole `json:"role"`
+	Content   any         `json:"content"`
+	Timestamp time.Time   `json:"timestamp"`
 }
 
 func (UserMessage) messageTag()               {}
@@ -202,7 +214,7 @@ func (m UserMessage) GetTimestamp() time.Time { return m.Timestamp }
 
 // AssistantMessage represents a model response.
 type AssistantMessage struct {
-	Role          string         `json:"role"`
+	Role          MessageRole    `json:"role"`
 	Content       []ContentBlock `json:"content"`
 	API           KnownAPI       `json:"api"`
 	Provider      KnownProvider  `json:"provider"`
@@ -221,7 +233,7 @@ func (m AssistantMessage) GetTimestamp() time.Time { return m.Timestamp }
 
 // ToolResultMessage represents a tool execution result.
 type ToolResultMessage struct {
-	Role       string         `json:"role"`
+	Role       MessageRole    `json:"role"`
 	ToolCallID string         `json:"toolCallId"`
 	ToolName   string         `json:"toolName"`
 	Content    []ContentBlock `json:"content"`
@@ -284,6 +296,10 @@ type StreamOptions struct {
 	MaxRetries      int               `json:"maxRetries,omitempty"`
 	MaxRetryDelayMs int               `json:"maxRetryDelayMs,omitempty"`
 	Metadata        map[string]any    `json:"metadata,omitempty"`
+	// PromptCacheKey, if set, is emitted as prompt_cache_key on providers
+	// that support OpenAI-style prompt caching. The value is clamped to
+	// 64 runes by ClampOpenAIPromptCacheKey to avoid silent truncation.
+	PromptCacheKey *string `json:"promptCacheKey,omitempty"`
 }
 
 // SimpleStreamOptions extends StreamOptions with unified reasoning controls.

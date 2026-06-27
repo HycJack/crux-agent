@@ -68,3 +68,31 @@ func ResolveBaseURL(model Model, defaultURL string) string {
 	}
 	return strings.TrimRight(defaultURL, "/")
 }
+
+// GetEnvBaseURL resolves the base URL for a provider from environment variables.
+// The env var name is derived from the provider name: e.g. XIAOMI_BASE_URL.
+func GetEnvBaseURL(provider KnownProvider, defaultURL string) string {
+	envVar := strings.ToUpper(string(provider)) + "_BASE_URL"
+	if envURL := os.Getenv(envVar); envURL != "" {
+		return envURL
+	}
+	return defaultURL
+}
+
+// ResolveCacheRetention resolves the cache-retention policy:
+//
+//  1. explicit param wins (treat CacheNone as "unspecified" and fall through)
+//  2. env PI_CACHE_RETENTION == "long" → CacheLong
+//  3. default → CacheShort
+//
+// Source: pi-mono packages/ai/src/api/simple-options.ts:resolveCacheRetention.
+// || 解析 cache retention 策略：显式参数 > PI_CACHE_RETENTION 环境变量 > short 默认。
+func ResolveCacheRetention(explicit CacheRetention) CacheRetention {
+	if explicit != "" && explicit != CacheNone {
+		return explicit
+	}
+	if os.Getenv("PI_CACHE_RETENTION") == "long" {
+		return CacheLong
+	}
+	return CacheShort
+}

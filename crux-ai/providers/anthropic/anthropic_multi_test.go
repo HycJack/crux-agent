@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // runAnthropicSSE drives processSSEStream with the supplied SSE payload and

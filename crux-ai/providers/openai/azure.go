@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // AzureOptions holds Azure-specific options.

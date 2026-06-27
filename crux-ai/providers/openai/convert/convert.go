@@ -7,7 +7,7 @@ package convert
 import (
 	"encoding/json"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // Messages converts internal messages to OpenAI Chat Completions format.

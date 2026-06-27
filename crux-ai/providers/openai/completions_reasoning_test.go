@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 func runCompletionsSSE(t *testing.T, sseData string) ([]core.AssistantMessageEvent, core.AssistantMessage) {

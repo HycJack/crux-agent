@@ -4,8 +4,8 @@ package openai
 import (
 	"encoding/json"
 
-	core "crux-ai/core"
-	"crux-ai/internal/conv"
+	core "github.com/hycjack/crux-ai/core"
+	"github.com/hycjack/crux-ai/internal/conv"
 )
 
 const defaultCompletionsURL = "https://api.openai.com/v1"

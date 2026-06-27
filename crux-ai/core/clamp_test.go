@@ -84,29 +84,3 @@ func TestAdjustMaxTokensForThinking(t *testing.T) {
 		t.Errorf("custom budget: got %d", budget)
 	}
 }
-
-func TestClampOpenAIPromptCacheKey(t *testing.T) {
-	if ClampOpenAIPromptCacheKey(nil) != nil {
-		t.Errorf("nil -> nil")
-	}
-	empty := ""
-	if ClampOpenAIPromptCacheKey(&empty) != nil {
-		t.Errorf("empty -> nil")
-	}
-	short := "abc"
-	if got := ClampOpenAIPromptCacheKey(&short); got == nil || *got != "abc" {
-		t.Errorf("short passthrough: got %v", got)
-	}
-	// 100-rune key truncates to 64 runes (not bytes).
-	long := strings.Repeat("x", 100)
-	got := ClampOpenAIPromptCacheKey(&long)
-	if got == nil || len([]rune(*got)) != 64 {
-		t.Errorf("long clamp: got %v", got)
-	}
-	// Multi-byte chars count as runes.
-	emoji := strings.Repeat("🐱", 100) // 100 cats = 100 runes, 400 bytes
-	got = ClampOpenAIPromptCacheKey(&emoji)
-	if got == nil || len([]rune(*got)) != 64 {
-		t.Errorf("emoji clamp: got %v", got)
-	}
-}

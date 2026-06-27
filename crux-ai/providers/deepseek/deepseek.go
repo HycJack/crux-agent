@@ -13,8 +13,8 @@ package deepseek
 import (
 	"strings"
 
-	core "crux-ai/core"
-	"crux-ai/providers/compat"
+	core "github.com/hycjack/crux-ai/core"
+	"github.com/hycjack/crux-ai/providers/compat"
 )
 
 const defaultBaseURL = "https://api.deepseek.com/v1"

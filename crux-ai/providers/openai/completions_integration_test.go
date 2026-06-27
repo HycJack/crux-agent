@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"crux-ai/core"
-	"crux-ai/testenv"
+	"github.com/hycjack/crux-ai/core"
+	"github.com/hycjack/crux-ai/testenv"
 )
 
 // TestIntegrationWithEnvConfig 集成测试 - 使用 .env 中的 base_url 和 model

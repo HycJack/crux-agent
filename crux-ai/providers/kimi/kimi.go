@@ -8,8 +8,8 @@
 package kimi
 
 import (
-	core "crux-ai/core"
-	"crux-ai/providers/compat"
+	core "github.com/hycjack/crux-ai/core"
+	"github.com/hycjack/crux-ai/providers/compat"
 )
 
 const defaultBaseURL = "https://api.moonshot.ai/v1"

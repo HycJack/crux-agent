@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // Provider is a mock provider that generates deterministic responses.

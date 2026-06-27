@@ -11,8 +11,8 @@ package cruxai
 import (
 	"context"
 
-	"crux-ai/ai"
-	"crux-ai/core"
+	"github.com/hycjack/crux-ai/ai"
+	"github.com/hycjack/crux-ai/core"
 )
 
 // ============================================================

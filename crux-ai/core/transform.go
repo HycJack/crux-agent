@@ -157,94 +157,30 @@ func TransformMessages(messages []Message, model Model, normalizeID ToolCallIDNo
 		normalizeID = DefaultToolCallIDNormalizer
 	}
 
-	// First pass: image downgrade + ID normalization + thinking handling.
-	type pending struct {
-		originalID string
-		normalized string
-	}
-	idMap := make(map[string]string)
-
 	imageAware := downgradeUnsupportedImages(messages, model)
 
-	transformed := make([]Message, len(imageAware))
-	for i, msg := range imageAware {
+	// Pass 1: build the complete idMap from ALL AssistantMessages before any
+	// ToolResultMessage is rewritten. This makes the rewrite correct even when
+	// a tool result appears before the assistant turn that created it.
+	idMap := make(map[string]string)
+	for _, msg := range imageAware {
 		am, ok := msg.(AssistantMessage)
-		if !ok {
-			// UserMessage / ToolResultMessage pass through, but toolResult
-			// needs an id rewrite if we mapped its toolCallId earlier.
-			if tr, ok := msg.(ToolResultMessage); ok {
-				if mapped, ok := idMap[tr.ToolCallID]; ok && mapped != tr.ToolCallID {
-					tr.ToolCallID = mapped
-				}
-				transformed[i] = tr
-				continue
-			}
-			transformed[i] = msg
+		if !ok || am.StopReason == "error" || am.StopReason == "aborted" {
 			continue
 		}
-
-		// Skip errored/aborted messages entirely.
-		if am.StopReason == "error" || am.StopReason == "aborted" {
-			// Use a placeholder that the second pass filters out.
-			transformed[i] = nilMessage{}
-			continue
-		}
-
 		same := isSameModel(am, model)
-		newContent := make([]ContentBlock, 0, len(am.Content))
 		for _, b := range am.Content {
-			switch bb := b.(type) {
-			case ThinkingContent:
-				if bb.Redacted {
-					if same {
-						newContent = append(newContent, bb)
-					}
-					// else: drop, redacted is opaque
-					continue
+			if tc, ok := b.(ToolCall); ok && !same {
+				normalized := normalizeID(tc.ID, model)
+				if normalized != tc.ID {
+					idMap[tc.ID] = normalized
 				}
-				if same && bb.ThinkingSignature != "" {
-					newContent = append(newContent, bb)
-					continue
-				}
-				if strings.TrimSpace(bb.Thinking) == "" {
-					continue
-				}
-				if same {
-					newContent = append(newContent, bb)
-					continue
-				}
-				// Cross-model: downgrade to text.
-				newContent = append(newContent, TextContent{Type: "text", Text: bb.Thinking})
-			case TextContent:
-				if same {
-					newContent = append(newContent, bb)
-				} else {
-					newContent = append(newContent, TextContent{Type: "text", Text: bb.Text})
-				}
-			case ToolCall:
-				tc := bb
-				if !same && tc.ThoughtSignature != "" {
-					tc.ThoughtSignature = ""
-				}
-				if !same {
-					normalized := normalizeID(tc.ID, model)
-					if normalized != tc.ID {
-						idMap[tc.ID] = normalized
-						tc.ID = normalized
-					}
-				}
-				newContent = append(newContent, tc)
-			default:
-				newContent = append(newContent, b)
 			}
 		}
-		am.Content = newContent
-		transformed[i] = am
 	}
 
-	// Second pass: insert synthetic tool results for orphaned tool calls
-	// and drop nilMessage placeholders.
-	result := make([]Message, 0, len(transformed))
+	// Pass 2: apply all transformations using the complete idMap.
+	transformed := make([]Message, 0, len(imageAware))
 	var pendingTCs []ToolCall
 	existingResults := make(map[string]bool)
 	flushPending := func() {
@@ -252,7 +188,7 @@ func TransformMessages(messages []Message, model Model, normalizeID ToolCallIDNo
 			if existingResults[tc.ID] {
 				continue
 			}
-			result = append(result, ToolResultMessage{
+			transformed = append(transformed, ToolResultMessage{
 				Role:       "toolResult",
 				ToolCallID: tc.ID,
 				ToolName:   tc.Name,
@@ -265,12 +201,60 @@ func TransformMessages(messages []Message, model Model, normalizeID ToolCallIDNo
 		existingResults = make(map[string]bool)
 	}
 
-	for _, msg := range transformed {
+	for _, msg := range imageAware {
 		if _, skip := msg.(nilMessage); skip {
 			continue
 		}
 		if am, ok := msg.(AssistantMessage); ok {
+			if am.StopReason == "error" || am.StopReason == "aborted" {
+				continue
+			}
 			flushPending()
+			same := isSameModel(am, model)
+			newContent := make([]ContentBlock, 0, len(am.Content))
+			for _, b := range am.Content {
+				switch bb := b.(type) {
+				case ThinkingContent:
+					if bb.Redacted {
+						if same {
+							newContent = append(newContent, bb)
+						}
+						continue
+					}
+					if same && bb.ThinkingSignature != "" {
+						newContent = append(newContent, bb)
+						continue
+					}
+					if strings.TrimSpace(bb.Thinking) == "" {
+						continue
+					}
+					if same {
+						newContent = append(newContent, bb)
+						continue
+					}
+					newContent = append(newContent, TextContent{Type: "text", Text: bb.Thinking})
+				case TextContent:
+					if same {
+						newContent = append(newContent, bb)
+					} else {
+						newContent = append(newContent, TextContent{Type: "text", Text: bb.Text})
+					}
+				case ToolCall:
+					tc := bb
+					if !same && tc.ThoughtSignature != "" {
+						tc.ThoughtSignature = ""
+					}
+					if !same {
+						if mapped, ok := idMap[tc.ID]; ok {
+							tc.ID = mapped
+						}
+					}
+					newContent = append(newContent, tc)
+				default:
+					newContent = append(newContent, b)
+				}
+			}
+			am.Content = newContent
 			tcs := make([]ToolCall, 0)
 			for _, b := range am.Content {
 				if tc, ok := b.(ToolCall); ok {
@@ -280,17 +264,22 @@ func TransformMessages(messages []Message, model Model, normalizeID ToolCallIDNo
 			if len(tcs) > 0 {
 				pendingTCs = tcs
 			}
-			result = append(result, am)
+			transformed = append(transformed, am)
 			continue
 		}
 		if tr, ok := msg.(ToolResultMessage); ok {
+			if mapped, ok := idMap[tr.ToolCallID]; ok {
+				tr.ToolCallID = mapped
+			}
 			existingResults[tr.ToolCallID] = true
+			transformed = append(transformed, tr)
+			continue
 		}
-		result = append(result, msg)
+		transformed = append(transformed, msg)
 	}
 	flushPending()
 
-	return result
+	return transformed
 }
 
 // nilMessage is an internal marker that the second pass strips out.
@@ -298,3 +287,44 @@ type nilMessage struct{}
 
 func (nilMessage) messageTag()             {}
 func (nilMessage) GetTimestamp() time.Time { return time.Time{} }
+
+// PruneThinking truncates ThinkingContent blocks in msg to at most maxChars
+// runes, preserving the signature (so the model can still replay its own
+// reasoning). Returns msg unchanged if maxChars <= 0 or no ThinkingContent
+// is present.
+//
+// Source: pi-mono packages/ai/src/api/transform-messages.ts (thinking
+// truncation pattern).
+// || 把 ThinkingContent 截断到 maxChars 个 rune（保留签名）。
+func PruneThinking(msg AssistantMessage, maxChars int) AssistantMessage {
+	if maxChars <= 0 {
+		return msg
+	}
+	out := msg
+	out.Content = make([]ContentBlock, 0, len(msg.Content))
+	for _, b := range msg.Content {
+		t, ok := b.(ThinkingContent)
+		if !ok {
+			out.Content = append(out.Content, b)
+			continue
+		}
+		if utf8RuneCount(t.Thinking) <= maxChars {
+			out.Content = append(out.Content, t)
+			continue
+		}
+		runes := []rune(t.Thinking)
+		t.Thinking = string(runes[:maxChars]) + "…"
+		out.Content = append(out.Content, t)
+	}
+	return out
+}
+
+// utf8RuneCount returns the rune count of s without allocating a full
+// []rune. Cheap and adequate for size comparisons.
+func utf8RuneCount(s string) int {
+	n := 0
+	for range s {
+		n++
+	}
+	return n
+}

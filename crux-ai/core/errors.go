@@ -1,399 +1,338 @@
-// // Package core provides AI provider abstractions.
-// package core
+// Package core provides typed errors and HTTP classification for AI provider
+// responses.
+//
+// Errors follow a two-layer model:
+//
+//   - Sentinel values (ErrOverflow, ErrAuth, ...) for cheap equality checks
+//     via errors.Is.
+//   - Typed structs (OverflowError, AuthError, ...) carrying rich context
+//     (provider, HTTP status, retry-after hint, ...). All types implement
+//     Is/Unwrap so they match the corresponding sentinel.
+//
+// Reference: pi-mono packages/ai/src/utils/errors.ts.
+package core
 
-// import (
-// 	"context"
-// 	"errors"
-// 	"fmt"
-// 	"net/http"
-// 	"regexp"
-// 	"strings"
-// 	"time"
-// )
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+)
 
-// // ============================================================================
-// // Error Classification System
-// //
-// // Reference: oh-my-pi (packages/ai/src/utils/retry.ts) design:
-// //   - Errors are classified by source type, not per-provider retry logic
-// //   - Retry decisions are decoupled from provider implementations via interfaces
-// // ============================================================================
+// Sentinel error reasons used by classification helpers. They are exposed as
+// plain error values so callers can use errors.Is.
+var (
+	// ErrOverflow is a generic context-overflow marker. Prefer *OverflowError
+	// for richer context.
+	ErrOverflow = errors.New("context overflow")
 
-// // ErrorKind represents a classified error category.
-// type ErrorKind int
+	// ErrAborted indicates the caller cancelled the operation.
+	ErrAborted = errors.New("operation aborted")
 
-// const (
-// 	ErrorKindUnknown       ErrorKind = iota
-// 	ErrorKindRateLimit               // 429 - rate limiting
-// 	ErrorKindOverloaded              // 500/503 - server overloaded
-// 	ErrorKindAuth                    // 401/403 - authentication/authorization failure
-// 	ErrorKindModelNotFound           // 404 - model not found
-// 	ErrorKindContextLength           // context length exceeded (400+ special codes)
-// 	ErrorKindTimeout                 // request timeout
-// 	ErrorKindBadRequest              // 400 (non-retryable)
-// 	ErrorKindServerError             // 500 (non-overloaded, non-retryable)
-// )
+	// ErrAuth indicates an authentication / authorization failure.
+	ErrAuth = errors.New("authentication failed")
 
-// // String returns the string representation of the error kind.
-// func (k ErrorKind) String() string {
-// 	switch k {
-// 	case ErrorKindRateLimit:
-// 		return "rate_limit"
-// 	case ErrorKindOverloaded:
-// 		return "overloaded"
-// 	case ErrorKindAuth:
-// 		return "auth"
-// 	case ErrorKindModelNotFound:
-// 		return "model_not_found"
-// 	case ErrorKindContextLength:
-// 		return "context_length"
-// 	case ErrorKindTimeout:
-// 		return "timeout"
-// 	case ErrorKindBadRequest:
-// 		return "bad_request"
-// 	case ErrorKindServerError:
-// 		return "server_error"
-// 	default:
-// 		return "unknown"
-// 	}
-// }
+	// ErrRateLimit indicates the provider rate-limited the request.
+	ErrRateLimit = errors.New("rate limited")
 
-// // IsRetryable returns whether this error kind can be retried.
-// func (k ErrorKind) IsRetryable() bool {
-// 	switch k {
-// 	case ErrorKindRateLimit, ErrorKindOverloaded, ErrorKindTimeout:
-// 		return true
-// 	default:
-// 		return false
-// 	}
-// }
+	// ErrServer indicates a transient server-side failure.
+	ErrServer = errors.New("server error")
 
-// // ProviderError carries classified error information.
-// type ProviderError struct {
-// 	Kind     ErrorKind
-// 	Message  string
-// 	HTTPCode int
-// 	Wrapped  error
-// }
+	// ErrNetwork indicates a transport / connection failure.
+	ErrNetwork = errors.New("network error")
 
-// func (e *ProviderError) Error() string {
-// 	if e.Wrapped != nil {
-// 		return fmt.Sprintf("[%s] %s: %v", e.Kind, e.Message, e.Wrapped)
-// 	}
-// 	return fmt.Sprintf("[%s] %s", e.Kind, e.Message)
-// }
+	// ErrTimeout indicates a timeout occurred. Use *HTTPTimeoutError for
+	// richer context about the timeout source.
+	ErrTimeout = errors.New("timeout")
+)
 
-// func (e *ProviderError) Unwrap() error {
-// 	return e.Wrapped
-// }
+// OverflowError is raised when a request exceeds the provider's context
+// window. Detected via errors.As(err, &oe) and inspectable for the numeric
+// context.
+type OverflowError struct {
+	Provider      KnownProvider
+	Message       string
+	ContextWindow int
+	Usage         int
+}
 
-// // NewProviderError creates a classified provider error.
-// func NewProviderError(httpCode int, message string, wrapped error) *ProviderError {
-// 	kind := classifyHTTPCode(httpCode)
-// 	return &ProviderError{
-// 		Kind:     kind,
-// 		Message:  message,
-// 		HTTPCode: httpCode,
-// 		Wrapped:  wrapped,
-// 	}
-// }
+func (e *OverflowError) Error() string {
+	switch {
+	case e.Message != "":
+		return fmt.Sprintf("%s: context overflow: %s", e.Provider, e.Message)
+	case e.ContextWindow > 0 && e.Usage > 0:
+		return fmt.Sprintf("%s: context overflow: usage %d > window %d", e.Provider, e.Usage, e.ContextWindow)
+	default:
+		return fmt.Sprintf("%s: context overflow", e.Provider)
+	}
+}
 
-// // IsRetryableProviderError checks if an error is a classified retryable error.
-// func IsRetryableProviderError(err error) bool {
-// 	var pe *ProviderError
-// 	if errors.As(err, &pe) {
-// 		return pe.Kind.IsRetryable()
-// 	}
-// 	return false
-// }
+// Is allows errors.Is to match ErrOverflow.
+func (e *OverflowError) Is(target error) bool { return target == ErrOverflow }
 
-// // ExtractErrorKind extracts the error kind from an error.
-// func ExtractErrorKind(err error) ErrorKind {
-// 	var pe *ProviderError
-// 	if errors.As(err, &pe) {
-// 		return pe.Kind
-// 	}
-// 	return ErrorKindUnknown
-// }
+// Unwrap allows errors.Is to recognize *OverflowError.
+func (e *OverflowError) Unwrap() error { return ErrOverflow }
 
-// // classifyHTTPCode returns an ErrorKind based on the HTTP status code.
-// func classifyHTTPCode(code int) ErrorKind {
-// 	switch {
-// 	case code == http.StatusTooManyRequests:
-// 		return ErrorKindRateLimit
-// 	case code == http.StatusUnauthorized, code == http.StatusForbidden:
-// 		return ErrorKindAuth
-// 	case code == http.StatusNotFound:
-// 		return ErrorKindModelNotFound
-// 	case code == http.StatusBadRequest:
-// 		return ErrorKindBadRequest
-// 	case code == http.StatusServiceUnavailable || code == http.StatusBadGateway || code == http.StatusGatewayTimeout:
-// 		return ErrorKindOverloaded
-// 	case code >= 500:
-// 		return ErrorKindServerError
-// 	default:
-// 		return ErrorKindUnknown
-// 	}
-// }
+// CompactionCancelledError signals an explicit compaction abort. Callers can
+// discriminate cancellation from other failures via errors.As rather than
+// string matching.
+type CompactionCancelledError struct {
+	Reason string
+}
 
-// // Retryable is an interface that marks an error as retryable.
-// type Retryable interface {
-// 	Retryable() bool
-// }
+func (e *CompactionCancelledError) Error() string {
+	if e.Reason == "" {
+		return "compaction cancelled"
+	}
+	return "compaction cancelled: " + e.Reason
+}
 
-// // ============================================================================
-// // Composable Retry Decorator
-// //
-// // Reference: oh-my-pi's callWithCopilotModelRetry() design:
-// //   - WrapRetry does not intrude into provider code
-// //   - Supports layered retry strategies
-// // ============================================================================
+// AbortError signals the consumer cancelled the in-flight operation.
+type AbortError struct {
+	Cause error
+}
 
-// // RetryPolicy defines the retry strategy.
-// type RetryPolicy struct {
-// 	MaxAttempts    int
-// 	InitialBackoff time.Duration
-// 	MaxBackoff     time.Duration
-// 	BackoffFactor  float64
-// 	// RateLimitBaseBackoff is the starting backoff for HTTP 429 responses.
-// 	// Unlike regular backoff (which scales with BackoffFactor), the rate-limit
-// 	// wait is fixed (subject to MaxBackoff) so we don't exponentially drift
-// 	// past a server's Retry-After window. Default: 5s.
-// 	RateLimitBaseBackoff time.Duration
-// 	ShouldRetry          func(error) bool
-// 	OnRetry              func(attempt int, err error)
-// 	// RetryAfter returns the wait duration for a given error, when the
-// 	// underlying provider supplied a Retry-After header or equivalent.
-// 	// When non-zero it overrides RateLimitBaseBackoff for that error.
-// 	RetryAfter func(error) time.Duration
-// }
+func (e *AbortError) Error() string {
+	if e.Cause == nil {
+		return "operation aborted"
+	}
+	return "operation aborted: " + e.Cause.Error()
+}
 
-// // DefaultRetryPolicy returns the default retry policy.
-// func DefaultRetryPolicy() RetryPolicy {
-// 	return RetryPolicy{
-// 		MaxAttempts:          3,
-// 		InitialBackoff:       1 * time.Second,
-// 		MaxBackoff:           30 * time.Second,
-// 		BackoffFactor:        2.0,
-// 		RateLimitBaseBackoff: 5 * time.Second,
-// 		ShouldRetry:          IsRetryableProviderError,
-// 	}
-// }
+// Unwrap returns the underlying cause.
+func (e *AbortError) Unwrap() error { return e.Cause }
 
-// // WrapRetry wraps a function with automatic retry according to the RetryPolicy.
-// func WrapRetry[T any](ctx context.Context, policy RetryPolicy, fn func(context.Context) (T, error)) (T, error) {
-// 	if policy.MaxAttempts <= 0 {
-// 		policy.MaxAttempts = 3
-// 	}
-// 	if policy.InitialBackoff <= 0 {
-// 		policy.InitialBackoff = 1 * time.Second
-// 	}
-// 	if policy.MaxBackoff <= 0 {
-// 		policy.MaxBackoff = 30 * time.Second
-// 	}
-// 	if policy.BackoffFactor <= 0 {
-// 		policy.BackoffFactor = 2.0
-// 	}
-// 	if policy.RateLimitBaseBackoff <= 0 {
-// 		policy.RateLimitBaseBackoff = 5 * time.Second
-// 	}
-// 	if policy.ShouldRetry == nil {
-// 		policy.ShouldRetry = IsRetryableProviderError
-// 	}
+// Is allows errors.Is to match ErrAborted or context.Canceled.
+func (e *AbortError) Is(t error) bool {
+	return t == ErrAborted || t == context.Canceled
+}
 
-// 	var lastErr error
-// 	backoff := policy.InitialBackoff
+// AuthError wraps a 401/403 from the provider.
+type AuthError struct {
+	Provider KnownProvider
+	Cause    error
+}
 
-// 	for attempt := 0; attempt < policy.MaxAttempts; attempt++ {
-// 		if ctx.Err() != nil {
-// 			var zero T
-// 			return zero, ctx.Err()
-// 		}
+func (e *AuthError) Error() string {
+	if e.Cause == nil {
+		return fmt.Sprintf("%s: authentication failed", e.Provider)
+	}
+	return fmt.Sprintf("%s: authentication failed: %v", e.Provider, e.Cause)
+}
 
-// 		result, err := fn(ctx)
-// 		if err == nil {
-// 			return result, nil
-// 		}
-// 		lastErr = err
+func (e *AuthError) Unwrap() error { return e.Cause }
 
-// 		if !policy.ShouldRetry(err) {
-// 			break
-// 		}
-// 		if attempt == policy.MaxAttempts-1 {
-// 			break
-// 		}
-// 		if policy.OnRetry != nil {
-// 			policy.OnRetry(attempt+1, err)
-// 		}
+// Is allows errors.Is to match ErrAuth.
+func (e *AuthError) Is(t error) bool { return t == ErrAuth }
 
-// 		waitTime := backoff
-// 		isRateLimit := ExtractErrorKind(err) == ErrorKindRateLimit
-// 		if isRateLimit {
-// 			// Honor a server-supplied Retry-After hint when available,
-// 			// otherwise fall back to the rate-limit base (capped by MaxBackoff).
-// 			if policy.RetryAfter != nil {
-// 				if hint := policy.RetryAfter(err); hint > 0 {
-// 					waitTime = hint
-// 				} else {
-// 					waitTime = policy.RateLimitBaseBackoff
-// 				}
-// 			} else {
-// 				waitTime = policy.RateLimitBaseBackoff
-// 			}
-// 			if waitTime > policy.MaxBackoff {
-// 				waitTime = policy.MaxBackoff
-// 			}
-// 		}
+// RateLimitError wraps a 429 with optional retry-after hint.
+type RateLimitError struct {
+	Provider   KnownProvider
+	RetryAfter time.Duration
+	Cause      error
+}
 
-// 		select {
-// 		case <-ctx.Done():
-// 			var zero T
-// 			return zero, ctx.Err()
-// 		case <-time.After(waitTime):
-// 		}
+func (e *RateLimitError) Error() string {
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("%s: rate limited (retry after %s)", e.Provider, e.RetryAfter)
+	}
+	if e.Cause == nil {
+		return fmt.Sprintf("%s: rate limited", e.Provider)
+	}
+	return fmt.Sprintf("%s: rate limited: %v", e.Provider, e.Cause)
+}
 
-// 		// Regular (non-rate-limit) backoff is exponential.
-// 		// Rate-limit waits stay fixed at RateLimitBaseBackoff to avoid
-// 		// runaway delays when MaxBackoff is large.
-// 		if !isRateLimit {
-// 			backoff = time.Duration(float64(backoff) * policy.BackoffFactor)
-// 			if backoff > policy.MaxBackoff {
-// 				backoff = policy.MaxBackoff
-// 			}
-// 		}
-// 	}
+func (e *RateLimitError) Unwrap() error { return e.Cause }
 
-// 	var zero T
-// 	return zero, lastErr
-// }
+// Is allows errors.Is to match ErrRateLimit.
+func (e *RateLimitError) Is(t error) bool { return t == ErrRateLimit }
 
-// // ============================================================================
-// // Provider-Specific Error Helpers
-// // ============================================================================
+// ServerError wraps a 5xx response.
+type ServerError struct {
+	Provider   KnownProvider
+	StatusCode int
+	Cause      error
+}
 
-// // IsHTTPCodeError checks if an error originates from a specific HTTP status code.
-// func IsHTTPCodeError(err error, code int) bool {
-// 	var pe *ProviderError
-// 	if errors.As(err, &pe) {
-// 		return pe.HTTPCode == code
-// 	}
-// 	return false
-// }
+func (e *ServerError) Error() string {
+	if e.Cause == nil {
+		return fmt.Sprintf("%s: server error %d", e.Provider, e.StatusCode)
+	}
+	return fmt.Sprintf("%s: server error %d: %v", e.Provider, e.StatusCode, e.Cause)
+}
 
-// // IsTransient400Error checks if an error is a specific transient "400" error from an API.
-// func IsTransient400Error(err error, transientCodes ...string) bool {
-// 	if !IsHTTPCodeError(err, http.StatusBadRequest) {
-// 		return false
-// 	}
-// 	if len(transientCodes) == 0 {
-// 		return false
-// 	}
-// 	msg := err.Error()
-// 	for _, code := range transientCodes {
-// 		if strings.Contains(msg, code) {
-// 			return true
-// 		}
-// 	}
-// 	return false
-// }
+func (e *ServerError) Unwrap() error { return e.Cause }
 
-// // NewContextError constructs a context-length error carrying classification.
-// func NewContextError(message string, wrapped error) *ProviderError {
-// 	return &ProviderError{
-// 		Kind:    ErrorKindContextLength,
-// 		Message: message,
-// 		Wrapped: wrapped,
-// 	}
-// }
+// Is allows errors.Is to match ErrServer.
+func (e *ServerError) Is(t error) bool { return t == ErrServer }
 
-// // ============================================================================
-// // Retryable Error Classifier (regex-based)
-// //
-// // Reference: pi-mono packages/ai/src/utils/retry.ts (isRetryableAssistantError).
-// // Some errors look transient on the wire but are actually non-retryable
-// // (subscription/usage limits, billing). We classify BEFORE retry so callers
-// // don't burn their budget on quota exhaustion.
-// // ============================================================================
+// NetworkError wraps a transport-level failure (DNS, connect, EOF, etc.).
+type NetworkError struct {
+	Provider KnownProvider
+	Cause    error
+}
 
-// // nonRetryableLimitPatterns matches non-retryable usage-limit / billing errors.
-// // These are explicit account/subscription limits, not transient throttles.
-// var nonRetryableLimitPatterns = []*regexp.Regexp{
-// 	regexp.MustCompile(`GoUsageLimitError`),
-// 	regexp.MustCompile(`FreeUsageLimitError`),
-// 	regexp.MustCompile(`Monthly usage limit reached`),
-// 	regexp.MustCompile(`available balance`),
-// 	regexp.MustCompile(`insufficient_quota`),
-// 	regexp.MustCompile(`out of budget`),
-// 	regexp.MustCompile(`quota exceeded`),
-// 	regexp.MustCompile(`(?i)billing`),
-// }
+func (e *NetworkError) Error() string {
+	if e.Cause == nil {
+		return fmt.Sprintf("%s: network error", e.Provider)
+	}
+	return fmt.Sprintf("%s: network error: %v", e.Provider, e.Cause)
+}
 
-// // retryableProviderPatterns matches transient retryable failures.
-// // Curated from pi-mono's RETRYABLE_PROVIDER_ERROR_PATTERN.
-// var retryableProviderPatterns = []*regexp.Regexp{
-// 	// Generic load / status / server-side failures
-// 	regexp.MustCompile(`(?i)overloaded`),
-// 	regexp.MustCompile(`(?i)rate.?limit`),
-// 	regexp.MustCompile(`(?i)too many requests`),
-// 	regexp.MustCompile(`(?i)429`),
-// 	regexp.MustCompile(`(?i)500`),
-// 	regexp.MustCompile(`(?i)502`),
-// 	regexp.MustCompile(`(?i)503`),
-// 	regexp.MustCompile(`(?i)504`),
-// 	regexp.MustCompile(`(?i)service.?unavailable`),
-// 	regexp.MustCompile(`(?i)server.?error`),
-// 	regexp.MustCompile(`(?i)internal.?error`),
-// 	regexp.MustCompile(`(?i)provider.?returned.?error`),
-// 	// Network / transport
-// 	regexp.MustCompile(`(?i)network.?error`),
-// 	regexp.MustCompile(`(?i)connection.?error`),
-// 	regexp.MustCompile(`(?i)connection.?refused`),
-// 	regexp.MustCompile(`(?i)connection.?lost`),
-// 	regexp.MustCompile(`(?i)other side closed`),
-// 	regexp.MustCompile(`(?i)fetch failed`),
-// 	regexp.MustCompile(`(?i)upstream.?connect`),
-// 	regexp.MustCompile(`(?i)reset before headers`),
-// 	regexp.MustCompile(`(?i)socket hang up`),
-// 	regexp.MustCompile(`(?i)timed? out`),
-// 	regexp.MustCompile(`(?i)timeout`),
-// 	regexp.MustCompile(`(?i)terminated`),
-// 	// WebSocket transports
-// 	regexp.MustCompile(`(?i)websocket.?closed`),
-// 	regexp.MustCompile(`(?i)websocket.?error`),
-// 	// Stream-ended-without-message events
-// 	regexp.MustCompile(`(?i)ended without`),
-// 	regexp.MustCompile(`(?i)stream ended before message_stop`),
-// 	regexp.MustCompile(`(?i)http2 request did not get a response`),
-// 	// Retry guidance emitted mid-stream
-// 	regexp.MustCompile(`(?i)retry delay`),
-// 	regexp.MustCompile(`(?i)you can retry your request`),
-// 	regexp.MustCompile(`(?i)try your request again`),
-// 	regexp.MustCompile(`(?i)please retry your request`),
-// }
+func (e *NetworkError) Unwrap() error { return e.Cause }
 
-// // IsRetryableAssistantError reports whether a failed assistant message
-// // looks like a transient provider/transport error suitable for restart.
-// //
-// // This is a classifier, not a retry policy. Callers should still apply
-// // their own budget, backoff, and reporting before restarting the turn.
-// // Use IsContextOverflowMessage first to avoid retrying context overflow.
-// func IsRetryableAssistantError(msg *AssistantMessage) bool {
-// 	if msg == nil {
-// 		return false
-// 	}
-// 	if msg.StopReason != StopError || msg.ErrorMessage == "" {
-// 		return false
-// 	}
-// 	// Non-retryable limit/billing errors short-circuit.
-// 	for _, p := range nonRetryableLimitPatterns {
-// 		if p.MatchString(msg.ErrorMessage) {
-// 			return false
-// 		}
-// 	}
-// 	for _, p := range retryableProviderPatterns {
-// 		if p.MatchString(msg.ErrorMessage) {
-// 			return true
-// 		}
-// 	}
-// 	return false
-// }
+// Is allows errors.Is to match ErrNetwork.
+func (e *NetworkError) Is(t error) bool { return t == ErrNetwork }
+
+// TimeoutSource identifies where a timeout originated.
+type TimeoutSource string
+
+const (
+	// TimeoutSourceAgent indicates the entire agent run exceeded its timeout.
+	TimeoutSourceAgent TimeoutSource = "agent"
+
+	// TimeoutSourceHTTP indicates an HTTP request to the LLM provider timed out.
+	TimeoutSourceHTTP TimeoutSource = "http"
+
+	// TimeoutSourceTool indicates a tool execution (e.g., bash) timed out.
+	TimeoutSourceTool TimeoutSource = "tool"
+)
+
+// HTTPTimeoutError wraps a context.DeadlineExceeded with source information.
+//
+// Named HTTPTimeoutError (not TimeoutError) to avoid clashing with the
+// stream-idle TimeoutError in timeouts.go.
+type HTTPTimeoutError struct {
+	Source   TimeoutSource
+	Duration time.Duration
+	Provider KnownProvider
+	ToolName string
+	Cause    error
+}
+
+func (e *HTTPTimeoutError) Error() string {
+	var parts []string
+	parts = append(parts, string(e.Source))
+
+	if e.Duration > 0 {
+		parts = append(parts, fmt.Sprintf("after %s", e.Duration))
+	}
+	if e.Provider != "" {
+		parts = append(parts, fmt.Sprintf("provider=%s", e.Provider))
+	}
+	if e.ToolName != "" {
+		parts = append(parts, fmt.Sprintf("tool=%s", e.ToolName))
+	}
+	if e.Cause != nil && e.Cause != context.DeadlineExceeded {
+		parts = append(parts, fmt.Sprintf("cause=%v", e.Cause))
+	}
+
+	return fmt.Sprintf("timeout: %s", strings.Join(parts, " "))
+}
+
+// Unwrap returns the underlying cause.
+func (e *HTTPTimeoutError) Unwrap() error {
+	if e.Cause != nil {
+		return e.Cause
+	}
+	return ErrTimeout
+}
+
+// Is allows errors.Is to match ErrTimeout or context.DeadlineExceeded.
+func (e *HTTPTimeoutError) Is(t error) bool {
+	return t == ErrTimeout || t == context.DeadlineExceeded
+}
+
+// --- Error predicates (B2: typed-error shorthand) ------------------------------
+//
+// These are thin wrappers over errors.Is(err, ErrXxx) for sites that
+// branch on error category. They exist for readability and for symmetry
+// with pi-mono's `isRetryableProviderError` / similar helpers.
+// IsAuthError lives in retry.go to keep retry-specific predicates grouped.
+
+// IsRateLimitError reports whether err is a rate-limit / quota response
+// (HTTP 408/429). Auto-retry may apply with Retry-After honoring.
+func IsRateLimitError(err error) bool {
+	return errors.Is(err, ErrRateLimit)
+}
+
+// IsServerError reports whether err is a 5xx server-side failure.
+// Auto-retry applies with exponential backoff.
+func IsServerError(err error) bool {
+	return errors.Is(err, ErrServer)
+}
+
+// IsAbortedError reports whether err indicates the caller cancelled the
+// in-flight operation. Auto-retry MUST NOT apply.
+func IsAbortedError(err error) bool {
+	return errors.Is(err, ErrAborted)
+}
+
+// ClassifyHTTPError maps an HTTP error response to a typed error. The body
+// is the error payload returned by the provider. If no classification
+// applies, nil is returned and the caller is expected to surface the raw
+// error.
+func ClassifyHTTPError(provider KnownProvider, status int, body string) error {
+	switch {
+	case status == http.StatusRequestTimeout, status == http.StatusTooManyRequests:
+		return &RateLimitError{Provider: provider, Cause: fmt.Errorf("status %d: %s", status, trimBody(body))}
+	case status == http.StatusUnauthorized, status == http.StatusForbidden:
+		return &AuthError{Provider: provider, Cause: fmt.Errorf("status %d: %s", status, trimBody(body))}
+	case status >= 500 && status <= 599:
+		return &ServerError{Provider: provider, StatusCode: status, Cause: fmt.Errorf("%s", trimBody(body))}
+	case status == http.StatusRequestEntityTooLarge:
+		return &OverflowError{Provider: provider, Message: trimBody(body)}
+	default:
+		return nil
+	}
+}
+
+// trimBody truncates the response body for error messages.
+func trimBody(body string) string {
+	body = strings.TrimSpace(body)
+	const max = 500
+	if len(body) > max {
+		return body[:max] + "..."
+	}
+	return body
+}
+
+// WrapTimeout wraps a context.DeadlineExceeded error with source information.
+func WrapTimeout(source TimeoutSource, duration time.Duration, cause error) error {
+	if cause == nil {
+		cause = context.DeadlineExceeded
+	}
+	return &HTTPTimeoutError{
+		Source:   source,
+		Duration: duration,
+		Cause:    cause,
+	}
+}
+
+// WrapHTTPTimeout wraps an HTTP request timeout with provider information.
+func WrapHTTPTimeout(provider KnownProvider, duration time.Duration, cause error) error {
+	if cause == nil {
+		cause = context.DeadlineExceeded
+	}
+	return &HTTPTimeoutError{
+		Source:   TimeoutSourceHTTP,
+		Duration: duration,
+		Provider: provider,
+		Cause:    cause,
+	}
+}
+
+// WrapToolTimeout wraps a tool execution timeout with tool name.
+func WrapToolTimeout(toolName string, duration time.Duration, cause error) error {
+	if cause == nil {
+		cause = context.DeadlineExceeded
+	}
+	return &HTTPTimeoutError{
+		Source:   TimeoutSourceTool,
+		Duration: duration,
+		ToolName: toolName,
+		Cause:    cause,
+	}
+}

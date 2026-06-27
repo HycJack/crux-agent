@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sync"
 
-	"crux-ai/core"
+	"github.com/hycjack/crux-ai/core"
 )
 
 var (

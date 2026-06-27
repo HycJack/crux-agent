@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"os"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // VertexOptions holds Google Vertex AI-specific options.
@@ -112,10 +112,7 @@ func doVertexStream(ctx context.Context, baseURL, apiKey, project, location stri
 	if apiKey != "" {
 		req.Header.Set("x-goog-api-key", apiKey)
 	}
-	for k, v := range model.Headers {
-		req.Header.Set(k, v)
-	}
-	for k, v := range opts.Headers {
+	for k, v := range core.ProviderHeadersToRecord(core.MergeProviderHeaders(model.Headers, opts.Headers)) {
 		req.Header.Set(k, v)
 	}
 

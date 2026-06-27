@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 const defaultBaseURL = "https://generativelanguage.googleapis.com"

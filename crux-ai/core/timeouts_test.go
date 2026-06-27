@@ -138,7 +138,8 @@ func TestStreamWithTimeout_IdleTimeout(t *testing.T) {
 	)
 
 	config := DefaultStreamTimeoutConfig()
-	config.FirstEventTimeout = 5 * time.Second // 首帧不超�?	config.IdleTimeout = 100 * time.Millisecond // �?idle 很快超时
+	config.FirstEventTimeout = 5 * time.Second  // 首帧不超时
+	config.IdleTimeout = 100 * time.Millisecond // idle 很快超时
 
 	wrapped := NewEventStreamWithTimeout(stream, config)
 	var received []string

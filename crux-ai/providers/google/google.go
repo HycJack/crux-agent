@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"crux-ai/internal/conv"
+	"github.com/hycjack/crux-ai/internal/conv"
 
-	core "crux-ai/core"
+	core "github.com/hycjack/crux-ai/core"
 )
 
 // Options holds Google-specific options.
@@ -159,10 +159,7 @@ func doGoogleStream(ctx context.Context, baseURL, apiKey string, model core.Mode
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-goog-api-key", apiKey)
-	for k, v := range model.Headers {
-		req.Header.Set(k, v)
-	}
-	for k, v := range opts.Headers {
+	for k, v := range core.ProviderHeadersToRecord(core.MergeProviderHeaders(model.Headers, opts.Headers)) {
 		req.Header.Set(k, v)
 	}
 

@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	core "crux-ai/core"
-	"crux-ai/internal/conv"
+	core "github.com/hycjack/crux-ai/core"
+	"github.com/hycjack/crux-ai/internal/conv"
 )
 
 // ResponsesOptions holds OpenAI Responses-specific options.
@@ -118,6 +118,9 @@ func buildResponsesBody(model core.Model, c core.Context, opts core.StreamOption
 	if responsesOpts.ServiceTier != "" {
 		body["service_tier"] = responsesOpts.ServiceTier
 	}
+	if opts.PromptCacheKey != nil {
+		body["prompt_cache_key"] = core.ClampOpenAIPromptCacheKey(opts.PromptCacheKey)
+	}
 	return body, nil
 }
 
@@ -132,17 +135,25 @@ func convertResponsesMessages(messages []core.Message) ([]map[string]any, error)
 			}
 			result = append(result, map[string]any{"role": "user", "content": content})
 		case core.AssistantMessage:
+			// Merge all text/thinking blocks into a single message item.
+			// Tool calls stay as separate function_call items.
+			var textContent []any
 			for _, block := range m.Content {
-				switch b := block.(type) {
-				case core.TextContent:
+				if text, ok := block.(core.TextContent); ok {
+					textContent = append(textContent, map[string]any{"type": "output_text", "text": text.Text})
+				}
+			}
+			if len(textContent) > 0 {
+				result = append(result, map[string]any{
+					"type": "message", "role": "assistant",
+					"content": textContent,
+				})
+			}
+			for _, block := range m.Content {
+				if tc, ok := block.(core.ToolCall); ok {
 					result = append(result, map[string]any{
-						"type": "message", "role": "assistant",
-						"content": []any{map[string]any{"type": "output_text", "text": b.Text}},
-					})
-				case core.ToolCall:
-					result = append(result, map[string]any{
-						"type": "function_call", "id": b.ID, "name": b.Name,
-						"arguments": string(b.Arguments), "call_id": b.ID,
+						"type": "function_call", "id": tc.ID, "name": tc.Name,
+						"arguments": string(tc.Arguments), "call_id": tc.ID,
 					})
 				}
 			}
@@ -188,10 +199,7 @@ func doResponsesStream(ctx context.Context, baseURL, apiKey string, model core.M
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	for k, v := range model.Headers {
-		req.Header.Set(k, v)
-	}
-	for k, v := range opts.Headers {
+	for k, v := range core.ProviderHeadersToRecord(core.MergeProviderHeaders(model.Headers, opts.Headers)) {
 		req.Header.Set(k, v)
 	}
 

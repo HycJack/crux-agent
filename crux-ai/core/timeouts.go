@@ -1,9 +1,10 @@
-﻿// Package core provides streaming timeout controls.
+// Package core provides streaming timeout controls.
 //
 // Reference: oh-my-pi (packages/ai/src/utils/idle-iterator.ts) design:
-//   Two-phase timeout:
-//     1. firstEventTimeout: time from stream start to first event
-//     2. idleTimeout: maximum interval between events
+//
+//	Two-phase timeout:
+//	  1. firstEventTimeout: time from stream start to first event
+//	  2. idleTimeout: maximum interval between events
 //
 // Heartbeat/keepalive events are distinguished via isProgressItem 鈥?// they do not reset the idle timer, preventing "server sends heartbeats
 // but the model is actually stuck" scenarios.

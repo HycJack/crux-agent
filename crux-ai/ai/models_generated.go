@@ -1,7 +1,7 @@
 // Code generated from model data. DO NOT EDIT.
 package ai
 
-import "crux-ai/core"
+import "github.com/hycjack/crux-ai/core"
 
 // GeneratedModels returns the built-in model database.
 func GeneratedModels() map[core.KnownProvider]map[string]core.Model {

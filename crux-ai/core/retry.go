@@ -1,18 +1,18 @@
 /*
  * 功能说明：自动重试机制
- * 
+ *
  * 解决的问题：
  * 1. LLM API 调用可能因临时错误失败（限流、服务器错误、网络问题）
  * 2. 需要区分可重试错误和不可重试错误
  * 3. 需要指数退避避免加重服务端负担
  * 4. 需要支持 context 取消
- * 
+ *
  * 解决方案：
  * 1. 定义 RetryConfig 配置重试参数（最大次数、基础延迟、最大延迟等）
  * 2. IsRetryableError 判断错误是否可重试
  * 3. Retry 函数实现指数退避重试逻辑
  * 4. 支持 RateLimitError 中的 RetryAfter 提示
- * 
+ *
  * 应用场景：
  * - providers/ 层在发起 HTTP 请求时使用
  * - 限流时自动等待并重试
@@ -130,28 +130,85 @@ var retryablePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)upstream (?:connect|read) (?:timeout|failed)`),
 	regexp.MustCompile(`(?i)retry delay`),
 	regexp.MustCompile(`(?i)retry-after`),
+	// WebSocket transport — providers report close/error text instead of
+	// HTTP/fetch text.
+	// || WebSocket 传输
+	regexp.MustCompile(`(?i)websocket.?closed`),
+	regexp.MustCompile(`(?i)websocket.?error`),
+	// Premature stream endings from SDKs (Anthropic "stream ended without
+	// message_stop", Bedrock/Smithy HTTP/2 no-response).
+	// || 流未正常结束
+	regexp.MustCompile(`(?i)ended without`),
+	regexp.MustCompile(`(?i)stream ended before message_stop`),
+	regexp.MustCompile(`(?i)http2 request did not get a response`),
+	// Wrapper/provider text for transient upstream failures (OpenRouter
+	// "Provider returned error", etc.).
+	// || Wrapper / 提供者返回错误
+	regexp.MustCompile(`(?i)provider.?returned.?error`),
+	// Generic transport / proxy failures.
+	// || 通用传输 / 代理失败
+	regexp.MustCompile(`(?i)network.?error`),
+	regexp.MustCompile(`(?i)connection.?lost`),
+	regexp.MustCompile(`(?i)other side closed`),
+	regexp.MustCompile(`(?i)reset before headers`),
+	regexp.MustCompile(`(?i)terminated`),
 }
 
-// nonRetryablePatterns exclude throttling / rate-limit errors that LOOK
-// like retryable errors from auto-retry. (None today; reserved for future
-// "credentials exhausted" patterns that should NOT auto-retry.)
-// || 不可重试错误的排除模式（当前为空，预留给未来的"凭证耗尽"模式）
-var nonRetryablePatterns = []*regexp.Regexp{}
+// nonRetryablePatterns excludes quota / billing / subscription-limit errors
+// that LOOK like retryable 429s but are actually non-retryable account
+// limits. Without this filter the auto-retry loop would burn budget on
+// errors only the user can resolve.
+//
+// All patterns are case-insensitive (IsRetryableError lowercases the input
+// before matching).
+//
+// Source: pi-mono packages/ai/src/utils/retry.ts
+// (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN).
+// || 不可重试错误的排除模式（quota / billing / 订阅限制）。
+// || 这些错误看起来像可重试的 429，但实际上是用户才能解决的账户限制。
+var nonRetryablePatterns = []*regexp.Regexp{
+	// OpenCode Go / free-tier limits returned as 429 JSON error types.
+	// || OpenCode Go / 免费版限制
+	regexp.MustCompile(`(?i)GoUsageLimitError`),
+	regexp.MustCompile(`(?i)FreeUsageLimitError`),
+	// OpenCode Go subscription-limit text.
+	regexp.MustCompile(`(?i)Monthly usage limit reached`),
+	regexp.MustCompile(`(?i)available balance`),
+	// Generic quota / budget / billing exhaustion.
+	// || 通用配额 / 预算 / 计费耗尽
+	regexp.MustCompile(`(?i)insufficient_quota`),
+	regexp.MustCompile(`(?i)out of budget`),
+	regexp.MustCompile(`(?i)quota exceeded`),
+	regexp.MustCompile(`(?i)billing`),
+}
+
+// buildProviderErrorPattern combines pattern fragments into a single
+// case-insensitive regex (alternation).
+// Source: pi-mono packages/ai/src/utils/retry.ts:buildProviderErrorPattern.
+// || 把若干片段拼成单个大小写无关的正则（分支）。
+func buildProviderErrorPattern(patterns ...string) *regexp.Regexp {
+	return regexp.MustCompile("(?i)(?:" + strings.Join(patterns, "|") + ")")
+}
 
 // IsRetryableError reports whether err is a transient error that Retry
 // should attempt again. Context-overflow errors are NEVER retryable —
 // they must be handed to compaction logic.
 // || 判断错误是否为可重试的临时错误
 // 参数：
-//   err - 错误
+//
+//	err - 错误
+//
 // 返回：
-//   是否可重试
+//
+//	是否可重试
 func IsRetryableError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Context-overflow errors are never retried; route to compaction.
 	// 上下文溢出错误不可重试
-	if IsContextOverflowError(err) {
+	var oe *OverflowError
+	if errors.As(err, &oe) || errors.Is(err, ErrOverflow) {
 		return false
 	}
 	// Typed sentinels.
@@ -180,36 +237,53 @@ func IsRetryableError(err error) bool {
 	return false
 }
 
-// IsContextOverflowError reports whether err is a context-overflow signal.
-// Callers should short-circuit auto-retry and route to compaction.
-// || 判断错误是否为上下文溢出错误
-// 参数：
-//   err - 错误
-// 返回：
-//   是否为上下文溢出错误
-func IsContextOverflowError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var oe *OverflowError
-	if errors.As(err, &oe) {
-		return true
-	}
-	return errors.Is(err, ErrOverflow)
-}
-
 // IsAuthError reports whether err is an authentication / authorization
 // failure (401/403). Such errors must NEVER be retried automatically.
 // || 判断错误是否为认证错误（401/403），此类错误不可自动重试
 // 参数：
-//   err - 错误
+//
+//	err - 错误
+//
 // 返回：
-//   是否为认证错误
+//
+//	是否为认证错误
 func IsAuthError(err error) bool {
 	if err == nil {
 		return false
 	}
 	return errors.Is(err, ErrAuth)
+}
+
+// IsRetryableAssistantError reports whether a failed AssistantMessage
+// looks like a transient provider/transport error suitable for restart.
+//
+// This is a classifier, not a retry policy. Callers should still apply
+// their own budget, backoff, and reporting before restarting the turn.
+// Use IsContextOverflow first to avoid retrying context overflow.
+//
+// Source: pi-mono packages/ai/src/utils/retry.ts:isRetryableAssistantError.
+// || 判断 AssistantMessage 是否是值得重启的临时错误（仅分类，不做重试策略）。
+func IsRetryableAssistantError(msg *AssistantMessage) bool {
+	if msg == nil {
+		return false
+	}
+	if msg.StopReason != StopError || msg.ErrorMessage == "" {
+		return false
+	}
+	lower := strings.ToLower(msg.ErrorMessage)
+	// Non-retryable quota / billing errors short-circuit.
+	// || 配额 / 计费类不可重试错误直接否决
+	for _, p := range nonRetryablePatterns {
+		if p.MatchString(lower) {
+			return false
+		}
+	}
+	for _, p := range retryablePatterns {
+		if p.MatchString(lower) {
+			return true
+		}
+	}
+	return false
 }
 
 // retryKey is a small object used by Retry to coordinate the lifecycle.
@@ -231,11 +305,14 @@ type retryKey struct{}
 // pending attempt is abandoned and ctx.Err() is returned.
 // || Retry 在退避等待期间尊重 ctx 取消；下一个待处理的尝试会被放弃并返回 ctx.Err()
 // 参数：
-//   ctx - 上下文（支持取消）
-//   cfg - 重试配置
-//   op - 要执行的操作
+//
+//	ctx - 上下文（支持取消）
+//	cfg - 重试配置
+//	op - 要执行的操作
+//
 // 返回：
-//   操作返回的错误
+//
+//	操作返回的错误
 func Retry(ctx context.Context, cfg RetryConfig, op func() error) error {
 	if !cfg.Enabled {
 		return op()
@@ -308,11 +385,14 @@ func Retry(ctx context.Context, cfg RetryConfig, op func() error) error {
 // computeDelay calculates the backoff delay for the given attempt.
 // || 计算给定尝试次数的退避延迟
 // 参数：
-//   cfg - 重试配置
-//   attempt - 当前尝试次数（0-based）
-//   err - 错误（可能包含 RetryAfter 提示）
+//
+//	cfg - 重试配置
+//	attempt - 当前尝试次数（0-based）
+//	err - 错误（可能包含 RetryAfter 提示）
+//
 // 返回：
-//   退避延迟
+//
+//	退避延迟
 func computeDelay(cfg RetryConfig, attempt int, err error) time.Duration {
 	base := float64(cfg.BaseDelay)
 	mult := cfg.Multiplier
@@ -346,10 +426,13 @@ func pow(base, exp float64) float64 {
 // retryable flag tells whether Retry should re-issue the request.
 // || 分类 HTTP (状态码, 响应体) 对，判断是否应该重试
 // 参数：
-//   status - HTTP 状态码
-//   body - 响应体
+//
+//	status - HTTP 状态码
+//	body - 响应体
+//
 // 返回：
-//   是否可重试
+//
+//	是否可重试
 func RetryableHTTPCheck(status int, body string) bool {
 	// 408 Request Timeout, 429 Too Many Requests, 5xx -> 可重试
 	if status == 408 || status == 429 || (status >= 500 && status <= 504) {
@@ -372,9 +455,12 @@ func RetryableHTTPCheck(status int, body string) bool {
 // (DNS, connect, EOF, etc.).
 // || 判断错误是否为传输层错误（DNS、连接、EOF 等）
 // 参数：
-//   err - 错误
+//
+//	err - 错误
+//
 // 返回：
-//   是否为网络错误
+//
+//	是否为网络错误
 func IsNetworkError(err error) bool {
 	if err == nil {
 		return false

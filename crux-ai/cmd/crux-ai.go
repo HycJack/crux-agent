@@ -9,11 +9,11 @@ import (
 	"syscall"
 	"time"
 
-	"crux-ai/ai"
-	"crux-ai/core"
+	"github.com/hycjack/crux-ai/ai"
+	"github.com/hycjack/crux-ai/core"
 
 	// Force provider registration via init()
-	_ "crux-ai/providers"
+	_ "github.com/hycjack/crux-ai/providers"
 )
 
 func main() {
