@@ -8,7 +8,15 @@ export function GetModels(arg1:Record<string, any>):Promise<Array<main.ModelInfo
 
 export function GetWorkingDir():Promise<string>;
 
+export function LoadConversations():Promise<Array<main.PersistedConversation>>;
+
+export function LoadSettings():Promise<main.PersistedSettings>;
+
 export function PickWorkingDir():Promise<string>;
+
+export function SaveConversations(arg1:Array<main.PersistedConversation>):Promise<void>;
+
+export function SaveSettings(arg1:main.PersistedSettings):Promise<void>;
 
 export function SetWorkingDir(arg1:string):Promise<void>;
 

@@ -14,8 +14,24 @@ export function GetWorkingDir() {
   return window['go']['main']['App']['GetWorkingDir']();
 }
 
+export function LoadConversations() {
+  return window['go']['main']['App']['LoadConversations']();
+}
+
+export function LoadSettings() {
+  return window['go']['main']['App']['LoadSettings']();
+}
+
 export function PickWorkingDir() {
   return window['go']['main']['App']['PickWorkingDir']();
+}
+
+export function SaveConversations(arg1) {
+  return window['go']['main']['App']['SaveConversations'](arg1);
+}
+
+export function SaveSettings(arg1) {
+  return window['go']['main']['App']['SaveSettings'](arg1);
 }
 
 export function SetWorkingDir(arg1) {

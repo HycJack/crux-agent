@@ -1,12 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { CancelStream, GetWorkingDir, StreamMessage } from '../wailsjs/go/main/App';
+import {
+  CancelStream,
+  GetWorkingDir,
+  LoadConversations,
+  LoadSettings,
+  SaveConversations,
+  SaveSettings,
+  StreamMessage,
+} from '../wailsjs/go/main/App';
 import { EventsOff, EventsOn } from '../wailsjs/runtime/runtime';
 import ChatArea from './components/ChatArea';
 import SettingsPanel from './components/SettingsPanel';
 import Sidebar from './components/Sidebar';
 import type { Conversation, Message, Settings, ToolExecution } from './types';
-
-const SETTINGS_KEY = 'crux-agent-settings';
 
 const defaultSettings: Settings = {
   provider: 'openai',
@@ -19,16 +25,12 @@ const defaultSettings: Settings = {
   ttsVoice: 'zh-CN',
 };
 
-function loadSettings(): Settings {
-  try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
-    if (raw) {
-      return { ...defaultSettings, ...JSON.parse(raw) };
-    }
-  } catch (e) {
-    console.error('Failed to load settings:', e);
-  }
-  return defaultSettings;
+// PersistedSettings is the JSON shape coming back from the Go backend.
+// `provider` arrives as a plain string; narrow it to the union the
+// frontend actually expects so downstream code stays type-safe.
+function settingsFromPersisted(p: Record<string, unknown>): Settings {
+  const provider = p.provider === 'anthropic' ? 'anthropic' : 'openai';
+  return { ...defaultSettings, ...p, provider };
 }
 
 function newConversation(): Conversation {
@@ -68,8 +70,9 @@ function App() {
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [settings, setSettings] = useState<Settings>(loadSettings);
+  const [settings, setSettings] = useState<Settings>(defaultSettings);
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
+  const [hasLoaded, setHasLoaded] = useState(false);
 
   const currentUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const activeIdRef = useRef<string | null>(null);
@@ -96,20 +99,66 @@ function App() {
     setSpeakingMessageId(null);
   }, []);
 
+  // On first mount: load settings + conversations from the OS-conventional
+  // data dir (managed by the Go backend), then reconcile working dir from
+  // the backend's authoritative state. `hasLoaded` gates the persist
+  // effects below so we don't immediately write the defaults back over
+  // what we just read.
   useEffect(() => {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-  }, [settings]);
-
-  // Initialize working dir from backend on startup.
-  useEffect(() => {
-    GetWorkingDir()
-      .then((dir) => {
-        if (dir) {
-          setSettings((prev) => (prev.workingDir ? prev : { ...prev, workingDir: dir }));
-        }
-      })
-      .catch(() => undefined);
+    let cancelled = false;
+    (async () => {
+      const [persisted, backendDir, persistedConvs] = await Promise.all([
+        LoadSettings().catch(() => null),
+        GetWorkingDir().catch(() => ''),
+        LoadConversations().catch(() => null),
+      ]);
+      if (cancelled) return;
+      if (persisted) {
+        setSettings((prev) => ({ ...prev, ...settingsFromPersisted(persisted as unknown as Record<string, unknown>) }));
+      }
+      if (backendDir) {
+        setSettings((prev) => ({ ...prev, workingDir: backendDir }));
+      }
+      if (persistedConvs && persistedConvs.length > 0) {
+        setConversations(persistedConvs as unknown as Conversation[]);
+        const lastActive = (persisted as { lastActiveConv?: string } | null)?.lastActiveConv;
+        const initialId =
+          (lastActive && persistedConvs.find((c) => c.id === lastActive)?.id) ??
+          persistedConvs[0].id;
+        setActiveConversationId(initialId);
+        activeIdRef.current = initialId;
+      }
+      setHasLoaded(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  // Persist settings to the backend whenever they change after the
+  // initial load. Debounced so dragging a slider doesn't thrash disk.
+  useEffect(() => {
+    if (!hasLoaded) return;
+    const t = setTimeout(() => {
+      SaveSettings({
+        ...settings,
+        lastActiveConv: activeConversationId ?? '',
+      }).catch((e) => console.error('SaveSettings:', e));
+    }, 400);
+    return () => clearTimeout(t);
+  }, [hasLoaded, settings, activeConversationId]);
+
+  // Persist conversations to the backend. Slightly longer debounce
+  // because streaming produces many updates per second.
+  useEffect(() => {
+    if (!hasLoaded) return;
+    const t = setTimeout(() => {
+      SaveConversations(conversations as Parameters<typeof SaveConversations>[0]).catch((e) =>
+        console.error('SaveConversations:', e),
+      );
+    }, 800);
+    return () => clearTimeout(t);
+  }, [hasLoaded, conversations]);
 
   const activeConversation = useMemo(
     () => conversations.find((c) => c.id === activeConversationId) ?? null,
