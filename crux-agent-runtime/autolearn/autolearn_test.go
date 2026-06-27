@@ -62,81 +62,199 @@ func TestExtractFromToolResult(t *testing.T) {
 	}
 }
 
-func TestExtractFromNaturalLanguage_AssistantName(t *testing.T) {
+func TestDetectSignals_AssistantName(t *testing.T) {
 	tests := []string{
 		"你叫小七",
 		"你的名字叫小七",
 		"你是小七",
 	}
-
 	for _, input := range tests {
-		triggers := ExtractFromNaturalLanguage(input)
-		found := false
-		for _, tr := range triggers {
-			if tr.Key == "assistant.name" && tr.Value == "小七" {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("input=%q: expected assistant.name=小七", input)
+		sigs := detectSignals(input)
+		if !containsSignal(sigs, SignalName) {
+			t.Errorf("input=%q: expected SignalName, got %v", input, sigs)
 		}
 	}
 }
 
-func TestExtractFromNaturalLanguage_UserName(t *testing.T) {
+func TestDetectSignals_UserName(t *testing.T) {
 	tests := []string{
 		"我叫张三",
 		"我的名字叫张三",
+		"我是李四",
 	}
-
 	for _, input := range tests {
-		triggers := ExtractFromNaturalLanguage(input)
-		found := false
-		for _, tr := range triggers {
-			if tr.Key == "user.name" && tr.Value == "张三" {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("input=%q: expected user.name=张三", input)
+		sigs := detectSignals(input)
+		if !containsSignal(sigs, SignalName) {
+			t.Errorf("input=%q: expected SignalName, got %v", input, sigs)
 		}
 	}
 }
 
-func TestExtractFromNaturalLanguage_Location(t *testing.T) {
-	triggers := ExtractFromNaturalLanguage("我来自杭州")
-	found := false
+func TestDetectSignals_Location(t *testing.T) {
+	sigs := detectSignals("我来自杭州")
+	if !containsSignal(sigs, SignalLocation) {
+		t.Errorf("expected SignalLocation, got %v", sigs)
+	}
+	sigs = detectSignals("我住在北京")
+	if !containsSignal(sigs, SignalLocation) {
+		t.Errorf("expected SignalLocation, got %v", sigs)
+	}
+}
+
+func TestDetectSignals_Language(t *testing.T) {
+	sigs := detectSignals("请用中文回答")
+	if !containsSignal(sigs, SignalLanguage) {
+		t.Errorf("expected SignalLanguage, got %v", sigs)
+	}
+}
+
+func TestDetectSignals_RejectsQuestions(t *testing.T) {
+	tests := []string{
+		"今天天气怎么样？",
+		"你是谁",
+		"什么是 AI",
+		"为什么",
+		"如何在 Go 里处理错误？",
+	}
+	for _, input := range tests {
+		sigs := detectSignals(input)
+		if len(sigs) > 0 {
+			t.Errorf("input=%q: expected no signals, got %v", input, sigs)
+		}
+	}
+}
+
+func TestDetectSignals_NoMatch(t *testing.T) {
+	sigs := detectSignals("今天天气怎么样？")
+	if len(sigs) != 0 {
+		t.Errorf("expected 0 signals, got %v", sigs)
+	}
+}
+
+func containsSignal(sigs []SignalKind, want SignalKind) bool {
+	for _, s := range sigs {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestLLMSignalExtractor_ExtractsFacts(t *testing.T) {
+	ext := &LLMSignalExtractor{
+		SummarizeFunc: func(ctx context.Context, prompt string) (string, error) {
+			// Simulate the LLM responding to a "name + location" prompt.
+			return "user.name=张三\nuser.location=杭州", nil
+		},
+	}
+	triggers, err := ext.ExtractFromText(context.Background(), "我叫张三，来自杭州",
+		[]SignalKind{SignalName, SignalLocation})
+	if err != nil {
+		t.Fatalf("ExtractFromText failed: %v", err)
+	}
+	if len(triggers) != 2 {
+		t.Fatalf("expected 2 triggers, got %d: %v", len(triggers), triggers)
+	}
+	want := map[string]string{"user.name": "张三", "user.location": "杭州"}
 	for _, tr := range triggers {
-		if tr.Key == "user.location" {
-			found = true
-			break
+		if want[tr.Key] != tr.Value {
+			t.Errorf("key=%q value=%q, want %q", tr.Key, tr.Value, want[tr.Key])
 		}
-	}
-	if !found {
-		t.Error("expected user.location trigger")
 	}
 }
 
-func TestExtractFromNaturalLanguage_Language(t *testing.T) {
-	triggers := ExtractFromNaturalLanguage("请用中文回答")
-	found := false
-	for _, tr := range triggers {
-		if tr.Key == "user.preferred_language" && tr.Value == "中文" {
-			found = true
-			break
-		}
+func TestLLMSignalExtractor_RespectsNone(t *testing.T) {
+	ext := &LLMSignalExtractor{
+		SummarizeFunc: func(ctx context.Context, prompt string) (string, error) {
+			return "NONE", nil
+		},
 	}
-	if !found {
-		t.Error("expected user.preferred_language=中文")
+	triggers, err := ext.ExtractFromText(context.Background(), "你是谁",
+		[]SignalKind{SignalName})
+	if err != nil {
+		t.Fatalf("ExtractFromText failed: %v", err)
+	}
+	if len(triggers) != 0 {
+		t.Errorf("expected 0 triggers for NONE, got %d", len(triggers))
 	}
 }
 
-func TestExtractFromNaturalLanguage_NoMatch(t *testing.T) {
-	triggers := ExtractFromNaturalLanguage("今天天气怎么样？")
+func TestLLMSignalExtractor_NoSignals(t *testing.T) {
+	ext := &LLMSignalExtractor{
+		SummarizeFunc: func(ctx context.Context, prompt string) (string, error) {
+			t.Error("SummarizeFunc should not be called when no signals fire")
+			return "", nil
+		},
+	}
+	triggers, err := ext.ExtractFromText(context.Background(), "hello", nil)
+	if err != nil {
+		t.Fatalf("ExtractFromText failed: %v", err)
+	}
 	if len(triggers) != 0 {
 		t.Errorf("expected 0 triggers, got %d", len(triggers))
+	}
+}
+
+func TestProcessUserInput_ExplicitMarkerOnly(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "memory.json")
+
+	mem, _ := memory.New(path)
+	learner := New(mem, DefaultSettings())
+
+	// No signal extractor wired up — only explicit markers should apply.
+	count := learner.ProcessUserInput("请记住：user.name=小明")
+	if count != 1 {
+		t.Errorf("expected 1 trigger, got %d", count)
+	}
+	val, ok := mem.Get("user.name")
+	if !ok || val != "小明" {
+		t.Errorf("expected user.name=小明, got %q (exists=%v)", val, ok)
+	}
+}
+
+func TestProcessUserInput_WithSignalExtractor(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "memory.json")
+
+	mem, _ := memory.New(path)
+	learner := New(mem, DefaultSettings())
+	learner.SetSignalExtractor(&LLMSignalExtractor{
+		SummarizeFunc: func(ctx context.Context, prompt string) (string, error) {
+			return "user.name=小七\nassistant.name=小七", nil
+		},
+	})
+
+	count := learner.ProcessUserInput("你叫小七，我也叫你小七")
+	if count != 2 {
+		t.Errorf("expected 2 triggers, got %d", count)
+	}
+	if v, _ := mem.Get("assistant.name"); v != "小七" {
+		t.Errorf("expected assistant.name=小七, got %q", v)
+	}
+}
+
+func TestProcessUserInput_QuestionDoesNotTrigger(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "memory.json")
+
+	mem, _ := memory.New(path)
+	learner := New(mem, DefaultSettings())
+	called := false
+	learner.SetSignalExtractor(&LLMSignalExtractor{
+		SummarizeFunc: func(ctx context.Context, prompt string) (string, error) {
+			called = true
+			return "NONE", nil
+		},
+	})
+
+	// "你是谁" is a question — signal layer should not even invoke the LLM.
+	count := learner.ProcessUserInput("你是谁")
+	if count != 0 {
+		t.Errorf("expected 0 triggers for question, got %d", count)
+	}
+	if called {
+		t.Error("LLM should not be called for pure questions")
 	}
 }
 
