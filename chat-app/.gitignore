@@ -1,0 +1,10 @@
+node_modules/
+dist/
+build/
+*.log
+*.exe
+*.md5
+build-output.txt
+go-build.log
+go-vet.log
+.DS_Store
