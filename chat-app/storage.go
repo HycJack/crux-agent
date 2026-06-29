@@ -59,6 +59,15 @@ type PersistedConversation struct {
 	Timestamp string             `json:"timestamp"`
 }
 
+// PersistedConversationMeta is the lightweight metadata stored in the
+// conversation index. It contains only the fields needed by the sidebar
+// (id, title, timestamp) but no messages.
+type PersistedConversationMeta struct {
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Timestamp string `json:"timestamp"`
+}
+
 // appDataDir returns the OS-conventional directory where Crux Agent
 // stores its user data (settings, conversations, runtime state).
 //
@@ -137,21 +146,199 @@ func (a *App) SaveSettings(s PersistedSettings) error {
 	return saveJSON("settings.json", s)
 }
 
-// LoadConversations reads the persisted conversation list. Returns
-// (nil, nil) on a clean install so the frontend starts with an empty
-// history rather than an error.
-func (a *App) LoadConversations() ([]PersistedConversation, error) {
-	var convs []PersistedConversation
-	if err := loadJSON("conversations.json", &convs); err != nil {
-		return nil, err
+// conversationDir returns the per-conversation file directory.
+func conversationDir() (string, error) {
+	base, err := appDataDir()
+	if err != nil {
+		return "", err
 	}
-	return convs, nil
+	dir := filepath.Join(base, "conversations")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create conversations dir: %w", err)
+	}
+	return dir, nil
 }
 
-// SaveConversations writes the conversation list to disk atomically.
+// conversationPath returns the file path for a single conversation.
+func conversationPath(id string) (string, error) {
+	dir, err := conversationDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, id+".json"), nil
+}
+
+// indexPath returns the path to the conversation index file.
+func indexPath() (string, error) {
+	dir, err := appDataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "conversations.json"), nil
+}
+
+// LoadConversations reads all persisted conversations. In the current
+// storage layout, this rebuilds the full list by reading the index and
+// then loading each conversation's message file. Returns an empty slice
+// on a clean install.
+func (a *App) LoadConversations() ([]PersistedConversation, error) {
+	// Step 1: read the index (metadata only)
+	idxPath, err := indexPath()
+	if err != nil {
+		return nil, err
+	}
+	var index []PersistedConversationMeta
+	b, errI := os.ReadFile(idxPath)
+	if errors.Is(errI, fs.ErrNotExist) {
+		// No index file — try legacy single-file conversations.json
+		return loadLegacyConversations()
+	}
+	if errI != nil {
+		return nil, errI
+	}
+	if err := json.Unmarshal(b, &index); err != nil {
+		return nil, err
+	}
+	// Step 2: load each conversation's full data from per-conversation files
+	return loadFromIndex(index), nil
+}
+
+// SaveConversations writes the conversation index + per-conversation
+// files to disk. The index file contains only metadata; each conversation's
+// messages go into separate files under conversations/.
 func (a *App) SaveConversations(convs []PersistedConversation) error {
 	if convs == nil {
 		convs = []PersistedConversation{}
 	}
-	return saveJSON("conversations.json", convs)
+
+	// Build and save the index (metadata only).
+	index := make([]PersistedConversationMeta, len(convs))
+	for i, c := range convs {
+		index[i] = PersistedConversationMeta{
+			ID:        c.ID,
+			Title:     c.Title,
+			Timestamp: c.Timestamp,
+		}
+	}
+	if err := saveJSON("conversations.json", index); err != nil {
+		return err
+	}
+
+	// Save each conversation's messages into its own file.
+	for _, c := range convs {
+		if err := saveConversationMessages(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// saveConversationMessages writes just the messages of a single
+// conversation (plus its ID/title/timestamp as context) to its own file.
+func saveConversationMessages(conv PersistedConversation) error {
+	p, err := conversationPath(conv.ID)
+	if err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(conv, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, p)
+}
+
+// loadLegacyConversations handles migration from the old single-file
+// conversations.json format. If found, it migrates to the new format
+// (index + per-conversation files) and returns the full data.
+func loadLegacyConversations() ([]PersistedConversation, error) {
+	dir, err := appDataDir()
+	if err != nil {
+		return nil, err
+	}
+	oldFile := filepath.Join(dir, "conversations.json")
+
+	// Read the raw file to determine its format.
+	raw, err := os.ReadFile(oldFile)
+	if err != nil {
+		// No file at all — clean install
+		return nil, nil
+	}
+
+	// Try to parse as the new index format first.
+	var metaIndex []PersistedConversationMeta
+	if err := json.Unmarshal(raw, &metaIndex); err == nil && len(metaIndex) == 0 {
+		// Valid empty index — no conversations, no need to migrate
+		return nil, nil
+	}
+
+	// If it parsed as meta index but there are entries, check if per-conversation
+	// files exist. If they do, this is already the new format — just load normally.
+	if len(metaIndex) > 0 {
+		firstPath, _ := conversationPath(metaIndex[0].ID)
+		if firstPath != "" {
+			if _, err := os.Stat(firstPath); err == nil {
+				// Already migrated — load using the new approach
+				return loadFromIndex(metaIndex), nil
+			}
+		}
+	}
+
+	// Not parsed as meta index or no per-conversation files: try old format.
+	var convs []PersistedConversation
+	if err := json.Unmarshal(raw, &convs); err != nil {
+		// Also doesn't match old format — corrupt or unknown
+		return nil, nil
+	}
+	if len(convs) == 0 {
+		return convs, nil
+	}
+
+	// Backup old file before migration
+	_ = os.WriteFile(oldFile+".bak.legacy", raw, 0o600)
+
+	index := make([]PersistedConversationMeta, len(convs))
+	for i, c := range convs {
+		index[i] = PersistedConversationMeta{
+			ID:        c.ID,
+			Title:     c.Title,
+			Timestamp: c.Timestamp,
+		}
+		_ = saveConversationMessages(c)
+	}
+
+	// Write the new-style index (overwrites the old monolithic file)
+	if err := saveJSON("conversations.json", index); err != nil {
+		return nil, err
+	}
+
+	return convs, nil
+}
+
+// loadFromIndex loads full conversations from an existing meta index.
+func loadFromIndex(index []PersistedConversationMeta) []PersistedConversation {
+	out := make([]PersistedConversation, 0, len(index))
+	for _, meta := range index {
+		p, errP := conversationPath(meta.ID)
+		if errP != nil {
+			continue
+		}
+		b, errR := os.ReadFile(p)
+		if errR != nil {
+			continue
+		}
+		conv := PersistedConversation{
+			ID:        meta.ID,
+			Title:     meta.Title,
+			Timestamp: meta.Timestamp,
+		}
+		if err := json.Unmarshal(b, &conv); err != nil {
+			continue
+		}
+		out = append(out, conv)
+	}
+	return out
 }

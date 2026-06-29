@@ -15,10 +15,8 @@ package skillutil
 
 import (
 	"context"
-	"embed"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -30,16 +28,8 @@ import (
 	"github.com/hycjack/crux-ai/core"
 )
 
-// bundledFS holds the embedded copy of the always-available example
-// skills. Layout matches the on-disk format exactly: each skill is its
-// own directory containing SKILL.md. A fresh checkout therefore ships
-// with working examples that behave identically to user-authored skills.
-//
-//go:embed bundled/*/SKILL.md
-var bundledFS embed.FS
-
-// bundledDir is the in-memory directory the embedded files live under.
-const bundledDir = "bundled"
+// These skills can be located either in <workingDir>/skills/bundled/<name>/SKILL.md
+// or alongside the executable at <exeDir>/skills/bundled/<name>/SKILL.md.
 
 // Skill represents a loaded skill.
 type Skill struct {
@@ -81,7 +71,7 @@ func (l *Loader) LoadAll(baseDir string) error {
 	l.mu.Unlock()
 
 	// Bundled skills first so user files overwrite them later.
-	bundledLoaded, err := l.loadBundled()
+	bundledLoaded, err := l.loadBundled(baseDir)
 	if err != nil {
 		return fmt.Errorf("load bundled: %w", err)
 	}
@@ -150,44 +140,85 @@ func (l *Loader) loadFromDisk(baseDir string) (int, error) {
 	return loaded, nil
 }
 
-// loadBundled reads skills compiled into the binary. The layout matches
-// the on-disk format exactly: <bundled>/<name>/SKILL.md, so the same
-// directory-walking logic applies to both sources.
-func (l *Loader) loadBundled() (int, error) {
-	entries, err := fs.ReadDir(bundledFS, bundledDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 0, nil
-		}
-		return 0, err
-	}
+// loadBundled reads skills from disk. It looks in two locations:
+//
+//  1. <workingDir>/skills/bundled/<name>/SKILL.md
+//  2. <exeDir>/skills/bundled/<name>/SKILL.md
+//
+// The first location wins when both have a skill with the same name.
+// If neither exists, no bundled skills are loaded (this is not an error).
+func (l *Loader) loadBundled(baseDir string) (int, error) {
+	// Collect candidate base directories in priority order.
+	candidates := l.bundledCandidates(baseDir)
 
 	loaded := 0
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	for _, candidate := range candidates {
+		n, err := l.loadBundledFromDir(candidate)
+		if err != nil {
+			continue
+		}
+		loaded += n
+	}
+	return loaded, nil
+}
+
+// bundledCandidates returns the directories to search for bundled
+// skills, in priority order (first wins).
+func (l *Loader) bundledCandidates(baseDir string) []string {
+	var candidates []string
+	if baseDir != "" {
+		candidates = append(candidates, filepath.Join(baseDir, "skills", "bundled"))
+	}
+	// Also check alongside the executable.
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates, filepath.Join(exeDir, "skills", "bundled"))
+	}
+	return candidates
+}
+
+// loadBundledFromDir scans a single directory for bundled skills.
+func (l *Loader) loadBundledFromDir(dir string) (int, error) {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return 0, err
+	}
+	if !info.IsDir() {
+		return 0, fmt.Errorf("not a directory: %s", dir)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 		name := entry.Name()
-		skillPath := name + "/SKILL.md"
-
-		data, err := fs.ReadFile(bundledFS, filepath.Join(bundledDir, skillPath))
+		skillPath := filepath.Join(dir, name, "SKILL.md")
+		data, err := os.ReadFile(skillPath)
 		if err != nil {
 			continue
 		}
-
+		// User-defined skills take precedence — don't overwrite an
+		// existing entry.
+		if _, exists := l.skills[name]; exists {
+			continue
+		}
 		desc := extractDescription(string(data), name)
 		l.skills[name] = &Skill{
 			Name:        name,
 			Description: desc,
 			Content:     string(data),
-			Path:        "<bundled>/" + skillPath,
+			Path:        skillPath,
 			Source:      "bundled",
 		}
-		loaded++
+		n++
 	}
-	return loaded, nil
+	return n, nil
 }
 
 // Reload rescans the skills directory. Useful for hot-reloading.
