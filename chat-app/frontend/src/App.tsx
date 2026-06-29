@@ -6,6 +6,7 @@ import {
   LoadSettings,
   SaveConversations,
   SaveSettings,
+  SetWorkingDir,
   StreamMessage,
 } from '../wailsjs/go/main/App';
 import { EventsOff, EventsOn } from '../wailsjs/runtime/runtime';
@@ -137,6 +138,13 @@ function App() {
       }
       if (backendDir) {
         setSettings((prev) => ({ ...prev, workingDir: backendDir }));
+      }
+      // Sync the working directory to the Go backend on startup so that
+      // file/shell tools resolve paths relative to the configured working
+      // directory rather than the exe's current directory.
+      const initialWorkingDir = backendDir || ((persisted && (persisted as any).workingDir) as string) || '';
+      if (initialWorkingDir) {
+        SetWorkingDir(initialWorkingDir).catch(() => {});
       }
       if (persistedConvs && persistedConvs.length > 0) {
         setConversations(persistedConvs as unknown as Conversation[]);

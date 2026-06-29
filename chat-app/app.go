@@ -48,10 +48,17 @@ func (a *App) startup(ctx context.Context) {
 // CancelStream cancels the current streaming request.
 func (a *App) CancelStream() {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.cancelFn != nil {
-		a.cancelFn()
-		a.cancelFn = nil
+	cancel := a.cancelFn
+	a.cancelFn = nil
+	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		// Emit stream-done immediately so the frontend can reset its
+		// loading state. Without this, the frontend stays in "loading"
+		// until the agent's goroutine finishes and its deferred
+		// stream-done fires — which could be many seconds later if
+		// a long-running tool (e.g. bash) is still being killed.
+		wruntime.EventsEmit(a.ctx, "stream-done", "")
 	}
 }
 

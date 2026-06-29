@@ -1,19 +1,36 @@
 # Chat App
 
-## About
+> A Wails-based AI chat desktop application with a React frontend,
+> providing a ChatGPT-style interface with streaming responses,
+> markdown rendering, and text-to-speech capabilities.
 
-This is a Wails-based AI chat application with React frontend. It provides a ChatGPT-style interface with streaming responses, markdown rendering, and text-to-speech capabilities.
+![Chat demo](../docs/images/chat_demo.png)
 
 ## Features
 
-- **Streaming Responses**: Real-time streaming output from AI models
-- **Markdown Support**: Full markdown rendering including code blocks with syntax highlighting
-- **LaTeX Support**: Math formula rendering using KaTeX
-- **Text-to-Speech**: Manual play/stop audio playback of AI responses
-- **Tool Calls**: Display tool call information with expandable/collapsible sections
-- **Thinking Content**: Display AI thinking process with expandable/collapsible sections
-- **Settings Panel**: Configure API key, base URL, model selection, and provider type (OpenAI/Anthropic)
-- **Conversation History**: Save and manage multiple conversations
+| | |
+|---|---|
+| **Streaming Responses** | Real-time streaming output from AI models with thinking/tool-call visibility. |
+| **Markdown + LaTeX** | Full markdown rendering including code blocks with syntax highlighting and KaTeX math formulas. |
+| **Text-to-Speech** | Manual play/stop audio playback of AI responses. |
+| **Tool Calls** | Expandable/collapsible tool-call blocks showing arguments and results. |
+| **Conversation History** | Persistent conversation history managed via the sidebar. |
+| **Sidebar** | Collapsible sidebar with conversation list and settings. |
+
+## Screenshots
+
+### Conversation view
+
+![Chat demo](../docs/images/chat_demo.png)
+
+*Agent conversations with streaming responses, tool calls and thinking content.*
+
+### Settings panel
+
+![Settings panel](../docs/images/chat_config.png)
+
+*Configuration panel for API key, provider selection (OpenAI / Anthropic),
+base URL, and model.*
 
 ## Configuration
 
@@ -24,21 +41,38 @@ This is a Wails-based AI chat application with React frontend. It provides a Cha
    - Base URL: The API endpoint URL
    - Model: Select a model from the dropdown or enter manually
 
+Settings are persisted automatically to `%APPDATA%/crux-agent/settings.json`
+on Windows, or the equivalent OS config directory on macOS/Linux.
+
 ## Live Development
 
-To run in live development mode, run `wails dev` in the project directory. This will run a Vite development server that will provide very fast hot reload of your frontend changes. If you want to develop in a browser and have access to your Go methods, there is also a dev server that runs on http://localhost:34115. Connect to this in your browser, and you can call your Go code from devtools.
+```bash
+cd chat-app
+wails dev
+```
+
+This will run a Vite development server with hot reload for frontend changes.
+A browser dev server is also available at http://localhost:34115.
 
 ## Building
 
-To build a redistributable, production mode package, use `wails build`.
+```bash
+cd chat-app
+wails build
+```
+
+Builds a redistributable, production-mode package.
 
 ## Technology Stack
 
-- **Wails**: Cross-platform desktop app framework
-- **React 18**: Frontend UI framework
-- **TypeScript**: Type-safe development
-- **TailwindCSS 3**: CSS framework
-- **Lucide React**: Icon library
-- **React Markdown**: Markdown rendering
-- **react-syntax-highlighter**: Code syntax highlighting
-- **KaTeX**: Math formula rendering
+| Technology | Purpose |
+|---|---|
+| **Wails v2** | Cross-platform desktop app framework |
+| **React 18** | Frontend UI framework |
+| **TypeScript** | Type-safe development |
+| **TailwindCSS 3** | CSS framework |
+| **Lucide React** | Icon library |
+| **React Markdown** | Markdown rendering |
+| **react-syntax-highlighter** | Code syntax highlighting |
+| **KaTeX** | Math formula rendering |
+| **modernc.org/sqlite** | Session storage (pure Go, no CGo) |
