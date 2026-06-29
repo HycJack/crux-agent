@@ -508,11 +508,22 @@ function App() {
       const finalModel = modelOverride || (settings.model === 'custom' ? settings.customModel : settings.model);
 
       // Build conversation history for context restoration
+      // Include tool calls and tool results so the LLM sees the full context
       const targetConv = conversations.find((c) => c.id === targetId);
-      const historyMessages = targetConv?.messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-      })) ?? [];
+      const historyMessages: Record<string, unknown>[] = targetConv?.messages.flatMap((m) => {
+        const base: Record<string, unknown> = { role: m.role, content: m.content };
+        if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
+          const toolResults = (m.toolExecutions || []).map((te) => ({
+            role: 'tool',
+            content: te.result || '',
+            toolCallId: te.id,
+            toolName: te.name,
+            isError: te.isError || false,
+          }));
+          return [{ ...base, toolCalls: m.toolCalls }, ...toolResults];
+        }
+        return [base];
+      }) ?? [];
 
       try {
         await StreamMessage({

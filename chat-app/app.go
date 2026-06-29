@@ -54,16 +54,10 @@ type App struct {
 
 // NewApp creates a new App instance.
 func NewApp() *App {
-	cwd, _ := os.Getwd()
-
 	// Initialize skill loader
 	sl := skillutil.NewLoader()
 
-	// Try loading skills from working directory
-	_ = sl.LoadAll(cwd)
-
 	return &App{
-		workingDir:  cwd,
 		skillLoader: sl,
 	}
 }
@@ -71,6 +65,25 @@ func NewApp() *App {
 // startup is called by Wails when the app is ready.
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+
+	// Restore working directory from persisted settings FIRST so that
+	// all subsequent init (skills, memory, autolearn) uses the correct
+	// working directory from the start.
+	var s PersistedSettings
+	if err := loadJSON("settings.json", &s); err == nil && s.WorkingDir != "" {
+		_ = a.SetWorkingDir(s.WorkingDir)
+	}
+	// If no persisted working dir, default to the executable's current dir.
+	if a.GetWorkingDir() == "" {
+		cwd, _ := os.Getwd()
+		if cwd != "" {
+			a.mu.Lock()
+			a.workingDir = cwd
+			a.mu.Unlock()
+		}
+	}
+	// Load skills using the resolved working directory.
+	_ = a.skillLoader.LoadAll(a.GetWorkingDir())
 
 	// Initialize logging to <appDataDir>/logs/<YYYY-MM-DD>.log
 	if appDir, err := appDataDir(); err == nil {
@@ -92,12 +105,6 @@ func (a *App) startup(ctx context.Context) {
 			a.mem = mem
 			logutil.Infof("Memory loaded (%d entries)", mem.Size())
 		}
-	}
-
-	// Restore working directory from persisted settings
-	var s PersistedSettings
-	if err := loadJSON("settings.json", &s); err == nil && s.WorkingDir != "" {
-		_ = a.SetWorkingDir(s.WorkingDir)
 	}
 
 	logutil.Infof("App startup complete")
@@ -183,6 +190,35 @@ func (a *App) GetSkills() []string {
 		return nil
 	}
 	return sl.List()
+}
+
+// SkillInfo is the rich per-skill metadata returned to the frontend so
+// the Settings panel can badge bundled vs user-authored entries.
+type SkillInfo struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Source      string `json:"source"` // "user" or "bundled"
+}
+
+// ListSkills returns the full skill catalog. Frontends that only need
+// flat names should keep using GetSkills.
+func (a *App) ListSkills() []SkillInfo {
+	a.mu.RLock()
+	sl := a.skillLoader
+	a.mu.RUnlock()
+	if sl == nil {
+		return nil
+	}
+	all := sl.All()
+	out := make([]SkillInfo, 0, len(all))
+	for _, s := range all {
+		out = append(out, SkillInfo{
+			Name:        s.Name,
+			Description: s.Description,
+			Source:      s.Source,
+		})
+	}
+	return out
 }
 
 // GetSkillContent returns the full content of a skill by name.
@@ -344,6 +380,12 @@ func (a *App) GetModels(params map[string]interface{}) ([]ModelInfo, error) {
 		return a.fetchProviderModels(provider, stringParam(params, "baseUrl"), stringParam(params, "apiKey"))
 	case core.ProviderOpenAI:
 		return a.fetchProviderModels(provider, stringParam(params, "baseUrl"), stringParam(params, "apiKey"))
+	case core.ProviderOllama:
+		// Local Ollama: skip /models fetch (the server advertises tags
+		// via /api/tags, not /v1/models) and let the caller fall through
+		// to the static cached list. This keeps things working when the
+		// daemon is offline.
+		return a.cachedModels(provider), nil
 	}
 	return nil, fmt.Errorf("unsupported provider: %s", provider)
 }
@@ -406,6 +448,12 @@ func defaultBaseURL(provider core.KnownProvider) string {
 	switch provider {
 	case core.ProviderAnthropic:
 		return "https://api.anthropic.com/v1"
+	case core.ProviderOllama:
+		// Ollama exposes its OpenAI-compat surface at /v1 on port 11434.
+		// Users running Ollama on a remote host or behind a proxy should
+		// override this via the OLLAMA_BASE_URL env var or the UI's
+		// Base URL field.
+		return "http://localhost:11434/v1"
 	default:
 		return "https://api.openai.com/v1"
 	}
@@ -456,9 +504,18 @@ func stringParam(params map[string]interface{}, key string) string {
 // the agent can process. Assistant messages with empty content are
 // skipped (they represent in-progress streaming placeholders).
 func parseConversationHistory(jsonStr string) []core.Message {
+	type toolCallData struct {
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}
 	type histMsg struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
+		Role       string         `json:"role"`
+		Content    string         `json:"content"`
+		ToolCalls  []toolCallData `json:"toolCalls,omitempty"`
+		ToolCallID string         `json:"toolCallId,omitempty"`
+		ToolName   string         `json:"toolName,omitempty"`
+		IsError    bool           `json:"isError,omitempty"`
 	}
 	var history []histMsg
 	if err := json.Unmarshal([]byte(jsonStr), &history); err != nil {
@@ -466,20 +523,46 @@ func parseConversationHistory(jsonStr string) []core.Message {
 	}
 	msgs := make([]core.Message, 0, len(history))
 	for _, h := range history {
-		if h.Content == "" {
-			continue // skip empty streaming placeholders
-		}
 		switch h.Role {
 		case "user":
+			if h.Content == "" {
+				continue
+			}
 			msgs = append(msgs, core.UserMessage{
 				Role:      core.MessageRoleUser,
 				Content:   h.Content,
 				Timestamp: time.Now(),
 			})
 		case "assistant":
+			var content []core.ContentBlock
+			if h.Content != "" {
+				content = append(content, core.TextContent{Type: "text", Text: h.Content})
+			}
+			for _, tc := range h.ToolCalls {
+				content = append(content, core.ToolCall{
+					Type:      "tool_use",
+					ID:        tc.ID,
+					Name:      tc.Name,
+					Arguments: json.RawMessage(tc.Arguments),
+				})
+			}
+			if len(content) == 0 {
+				continue // skip empty placeholder
+			}
 			msgs = append(msgs, core.AssistantMessage{
 				Role:    core.MessageRoleAssistant,
-				Content: []core.ContentBlock{core.TextContent{Type: "text", Text: h.Content}},
+				Content: content,
+			})
+		case "tool":
+			if h.Content == "" {
+				continue
+			}
+			msgs = append(msgs, core.ToolResultMessage{
+				Role:       core.MessageRoleTool,
+				ToolCallID: h.ToolCallID,
+				ToolName:   h.ToolName,
+				Content:    []core.ContentBlock{core.TextContent{Type: "text", Text: h.Content}},
+				IsError:    h.IsError,
 			})
 		}
 	}
@@ -614,7 +697,7 @@ func (a *App) CancelStream() {
 func (a *App) resolveModel(p ChatParams) (core.Model, error) {
 	provider := core.KnownProvider(p.Provider)
 	switch provider {
-	case core.ProviderAnthropic, core.ProviderOpenAI:
+	case core.ProviderAnthropic, core.ProviderOpenAI, core.ProviderOllama:
 		// ok
 	default:
 		return core.Model{}, fmt.Errorf("unsupported provider: %s", p.Provider)
