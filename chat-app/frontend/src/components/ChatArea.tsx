@@ -4,14 +4,26 @@ import ChatInput from './ChatInput';
 import ChatMessage from './ChatMessage';
 import type { Message } from '../types';
 
+interface ModelInfo {
+  id: string;
+  name: string;
+  reasoning?: boolean;
+  thinkingLevelMap?: Record<string, string>;
+}
+
 interface ChatAreaProps {
   messages: Message[];
   isLoading: boolean;
   workingDir: string;
-  onSendMessage: (message: string) => void;
+  onSendMessage: (message: string, model?: string, thinkingLevel?: string) => void;
   onSpeak: (text: string, messageId: string) => void;
   onStopSpeak: () => void;
   speakingMessageId: string | null;
+  models?: ModelInfo[];
+  currentModel?: string;
+  currentThinkingLevel?: string;
+  onModelChange?: (model: string) => void;
+  onThinkingLevelChange?: (level: string) => void;
 }
 
 const suggestions = [
@@ -34,6 +46,11 @@ export default function ChatArea({
   onSpeak,
   onStopSpeak,
   speakingMessageId,
+  models,
+  currentModel,
+  currentThinkingLevel,
+  onModelChange,
+  onThinkingLevelChange,
 }: ChatAreaProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -82,7 +99,16 @@ export default function ChatArea({
             ))}
           </div>
         </div>
-        <ChatInput onSend={onSendMessage} disabled={isLoading} placeholder="Ask Crux Agent…" />
+        <ChatInput
+          onSend={onSendMessage}
+          disabled={isLoading}
+          placeholder="Ask Crux Agent…"
+          models={models}
+          currentModel={currentModel}
+          currentThinkingLevel={currentThinkingLevel}
+          onModelChange={onModelChange}
+          onThinkingLevelChange={onThinkingLevelChange}
+        />
       </section>
     );
   }
@@ -117,7 +143,16 @@ export default function ChatArea({
           <div ref={messagesEndRef} />
         </div>
       </div>
-      <ChatInput onSend={onSendMessage} disabled={isLoading} placeholder="Ask Crux Agent…" />
+      <ChatInput
+        onSend={onSendMessage}
+        disabled={isLoading}
+        placeholder="Ask Crux Agent…"
+        models={models}
+        currentModel={currentModel}
+        currentThinkingLevel={currentThinkingLevel}
+        onModelChange={onModelChange}
+        onThinkingLevelChange={onThinkingLevelChange}
+      />
     </section>
   );
 }

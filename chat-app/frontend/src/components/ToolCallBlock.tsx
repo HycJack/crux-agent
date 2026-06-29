@@ -8,7 +8,7 @@ interface ToolCallBlockProps {
   defaultExpanded?: boolean;
 }
 
-export default function ToolCallBlock({ toolCalls, toolExecutions, defaultExpanded = true }: ToolCallBlockProps) {
+export default function ToolCallBlock({ toolCalls, toolExecutions, defaultExpanded = false }: ToolCallBlockProps) {
   const [expanded, setExpanded] = useState(defaultExpanded);
   if (!toolCalls || toolCalls.length === 0) return null;
 

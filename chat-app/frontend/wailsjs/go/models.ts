@@ -3,6 +3,8 @@ export namespace main {
 	export class ModelInfo {
 	    id: string;
 	    name: string;
+	    reasoning: boolean;
+	    thinkingLevelMap?: Record<string, string>;
 	
 	    static createFrom(source: any = {}) {
 	        return new ModelInfo(source);
@@ -12,6 +14,8 @@ export namespace main {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
 	        this.name = source["name"];
+	        this.reasoning = source["reasoning"];
+	        this.thinkingLevelMap = source["thinkingLevelMap"];
 	    }
 	}
 	export class PersistedToolExecution {
@@ -133,9 +137,11 @@ export namespace main {
 	    baseUrl: string;
 	    model: string;
 	    customModel: string;
+	    workingDir: string;
 	    ttsEnabled: boolean;
 	    ttsVoice: string;
 	    lastActiveConv?: string;
+	    autoLearn?: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new PersistedSettings(source);
@@ -148,9 +154,11 @@ export namespace main {
 	        this.baseUrl = source["baseUrl"];
 	        this.model = source["model"];
 	        this.customModel = source["customModel"];
+	        this.workingDir = source["workingDir"];
 	        this.ttsEnabled = source["ttsEnabled"];
 	        this.ttsVoice = source["ttsVoice"];
 	        this.lastActiveConv = source["lastActiveConv"];
+	        this.autoLearn = source["autoLearn"];
 	    }
 	}
 	

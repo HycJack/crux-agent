@@ -55,14 +55,38 @@ export default function MarkdownRenderer({ content }: MarkdownRendererProps) {
             components={{
               code({ node, className, children, ...props }: any) {
                 const match = /language-(\w+)/.exec(className || '');
-                const isInline = !match && !node?.tagName;
-                if (isInline) {
+                const text = String(children).replace(/\n$/, '');
+
+                // Determine inline vs block:
+                // - If there's a language tag => block
+                // - If wrapped in <p> (parent element is paragraph) => inline
+                // - If content is short (single word, no newlines) and has no language tag => inline
+                // - Otherwise => block
+                const parentTag = node?.parent?.tagName;
+                const isInParagraph = parentTag === 'p' || parentTag === 'li' || parentTag === 'td' || parentTag === 'th';
+                const isShortNoNewline = !text.includes('\n') && text.length < 80;
+
+                if ((!match && isInParagraph) || (!match && isShortNoNewline)) {
                   return (
                     <code className="md-inline-code" {...props}>
                       {children}
                     </code>
                   );
                 }
+
+                if (!match && !isInParagraph) {
+                  // Block-level code without language — could contain nested backticks.
+                  // Detect nested code fences: if the text contains ``` it's likely
+                  // a code example showing markdown, not real code to highlight.
+                  if (text.includes('```')) {
+                    return (
+                      <pre className="code-block code-block-raw">
+                        <code>{text}</code>
+                      </pre>
+                    );
+                  }
+                }
+
                 const language = match ? match[1] : 'text';
                 return (
                   <div className="code-block">
@@ -82,7 +106,7 @@ export default function MarkdownRenderer({ content }: MarkdownRendererProps) {
                         borderBottomRightRadius: 'var(--radius-md)',
                       }}
                     >
-                      {String(children).replace(/\n$/, '')}
+                      {text}
                     </SyntaxHighlighter>
                   </div>
                 );

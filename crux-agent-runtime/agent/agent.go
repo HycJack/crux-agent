@@ -110,12 +110,27 @@ func (a *Agent) SetSystemPrompt(prompt string) {
 	a.state.SystemPrompt = prompt
 }
 
+// SetSimpleStreamOptions updates the stream options (API key, base URL, etc.).
+func (a *Agent) SetSimpleStreamOptions(opts core.SimpleStreamOptions) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.state.SimpleStreamOptions = opts
+}
+
 // Reset clears the message history so the next run starts fresh.
 // System prompt, model, and tools are preserved.
 func (a *Agent) Reset() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.state.Messages = make([]core.Message, 0)
+}
+
+// SetMessages replaces the agent's message history with the given messages.
+// Used to restore a conversation's context when switching conversations.
+func (a *Agent) SetMessages(msgs []core.Message) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.state.Messages = msgs
 }
 
 // Messages returns the current message history.

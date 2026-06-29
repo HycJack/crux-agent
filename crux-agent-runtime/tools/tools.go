@@ -6,6 +6,7 @@
 //   - bash       - run a shell command
 //   - glob       - list files matching a pattern
 //   - grep       - search file contents
+//   - web_fetch  - fetch a URL and return plain text content
 //
 // All tools accept JSON parameters and return []core.ContentBlock results.
 package tools
@@ -14,8 +15,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/hycjack/crux-ai/core"
 	"crux-agent-runtime/agent"
+
+	"github.com/hycjack/crux-ai/core"
 )
 
 // mustSchema returns a json.RawMessage for the given literal.
@@ -48,5 +50,6 @@ func All() []agent.AgentTool {
 		Bash(),
 		Glob(),
 		Grep(),
+		WebFetch(),
 	}
 }

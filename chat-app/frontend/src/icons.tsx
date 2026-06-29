@@ -24,9 +24,15 @@ import {
   Code as CodeLucide,
   Save as SaveIcon,
   Wrench as WrenchIcon,
+  Settings2 as Settings2Icon,
+  Brain as BrainIcon,
+  Trash2 as TrashIcon,
+  CheckSquare as CheckSquareIcon,
 } from 'lucide-react';
 
 export const EditOutlined = PencilIcon;
+export const DeleteOutlined = TrashIcon;
+export const CheckOutlined2 = CheckSquareIcon;
 export const PlusOutlined = PlusIcon;
 export const MessageOutlined = MessageSquareIcon;
 export const SettingOutlined = SettingsLucide;
@@ -48,3 +54,5 @@ export const EyeInvisibleOutlined = EyeOffIcon;
 export const CodeOutlined = CodeLucide;
 export const SaveOutlined = SaveIcon;
 export const WrenchOutlined = WrenchIcon;
+export const Settings2 = Settings2Icon;
+export const Brain = BrainIcon;

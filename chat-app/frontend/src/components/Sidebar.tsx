@@ -1,4 +1,15 @@
-import { EditOutlined, FolderOpenOutlined, MenuOutlined, MessageOutlined, PlusOutlined, SettingOutlined, UserOutlined } from '../icons';
+import { useState } from 'react';
+import {
+  CheckOutlined2,
+  DeleteOutlined,
+  EditOutlined,
+  FolderOpenOutlined,
+  MenuOutlined,
+  MessageOutlined,
+  PlusOutlined,
+  SettingOutlined,
+  UserOutlined,
+} from '../icons';
 import type { Conversation } from '../types';
 
 interface SidebarProps {
@@ -9,6 +20,7 @@ interface SidebarProps {
   onSelectConversation: (id: string) => void;
   onCreateNewConversation: () => void;
   onDeleteConversation: (id: string) => void;
+  onRenameConversation: (id: string, title: string) => void;
   onOpenSettings: () => void;
 }
 
@@ -20,9 +32,49 @@ export default function Sidebar({
   onSelectConversation,
   onCreateNewConversation,
   onDeleteConversation,
+  onRenameConversation,
   onOpenSettings,
 }: SidebarProps) {
   const dirName = workingDir ? workingDir.split(/[\\/]/).filter(Boolean).slice(-1)[0] : 'No workspace';
+
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = useState('');
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
+  const beginEdit = (conv: Conversation) => {
+    setEditingId(conv.id);
+    setEditingTitle(conv.title);
+    setConfirmDeleteId(null);
+  };
+
+  const commitEdit = () => {
+    if (!editingId) return;
+    const trimmed = editingTitle.trim();
+    if (trimmed) {
+      onRenameConversation(editingId, trimmed);
+    }
+    setEditingId(null);
+    setEditingTitle('');
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setEditingTitle('');
+  };
+
+  const requestDelete = (id: string) => {
+    setConfirmDeleteId(id);
+    setEditingId(null);
+  };
+
+  const confirmDelete = () => {
+    if (confirmDeleteId) {
+      onDeleteConversation(confirmDeleteId);
+      setConfirmDeleteId(null);
+    }
+  };
+
+  const cancelDelete = () => setConfirmDeleteId(null);
 
   if (collapsed) {
     return (
@@ -60,7 +112,7 @@ export default function Sidebar({
       </div>
 
       <button className="primary-cta" onClick={onCreateNewConversation}>
-        <EditOutlined size={16} />
+        <PlusOutlined size={16} />
         <span>New chat</span>
       </button>
 
@@ -83,30 +135,100 @@ export default function Sidebar({
           {conversations.length === 0 && (
             <div className="history-empty">No conversations yet</div>
           )}
-          {conversations.map((conv) => (
-            <div
-              key={conv.id}
-              className={`history-item ${activeConversation === conv.id ? 'active' : ''}`}
-              onClick={() => onSelectConversation(conv.id)}
-            >
-              <span className="history-bullet" />
-              <div className="history-meta">
-                <div className="history-title">{conv.title}</div>
-                <div className="history-timestamp">{conv.timestamp}</div>
-              </div>
-              <button
-                className="history-action"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onDeleteConversation(conv.id);
+          {conversations.map((conv) => {
+            const isActive = activeConversation === conv.id;
+            const isEditing = editingId === conv.id;
+            const isConfirmingDelete = confirmDeleteId === conv.id;
+            return (
+              <div
+                key={conv.id}
+                className={`history-item ${isActive ? 'active' : ''}`}
+                onClick={() => {
+                  if (isEditing || isConfirmingDelete) return;
+                  onSelectConversation(conv.id);
                 }}
-                aria-label="Delete"
-                title="Delete"
+                onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  beginEdit(conv);
+                }}
               >
-                <PlusOutlined size={14} style={{ transform: 'rotate(45deg)' }} />
-              </button>
-            </div>
-          ))}
+                <span className="history-bullet" />
+                <div className="history-meta">
+                  {isEditing ? (
+                    <input
+                      autoFocus
+                      className="history-title-input"
+                      value={editingTitle}
+                      onChange={(e) => setEditingTitle(e.target.value)}
+                      onClick={(e) => e.stopPropagation()}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          commitEdit();
+                        } else if (e.key === 'Escape') {
+                          cancelEdit();
+                        }
+                      }}
+                      onBlur={commitEdit}
+                      maxLength={120}
+                    />
+                  ) : (
+                    <div className="history-title">{conv.title}</div>
+                  )}
+                  {isConfirmingDelete ? (
+                    <div className="history-confirm-row">
+                      <span className="history-confirm-text">Delete this chat?</span>
+                      <button
+                        className="history-confirm-btn danger"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          confirmDelete();
+                        }}
+                      >
+                        Yes
+                      </button>
+                      <button
+                        className="history-confirm-btn"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          cancelDelete();
+                        }}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="history-timestamp">{conv.timestamp}</div>
+                  )}
+                </div>
+                {isEditing ? (
+                  <button
+                    className="history-action"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      commitEdit();
+                    }}
+                    aria-label="Save title"
+                    title="Save"
+                  >
+                    <CheckOutlined2 size={14} />
+                  </button>
+                ) : (
+                  <button
+                    className="history-action"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      requestDelete(conv.id);
+                    }}
+                    aria-label="Delete"
+                    title="Delete"
+                  >
+                    <DeleteOutlined size={14} />
+                  </button>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
 

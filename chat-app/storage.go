@@ -18,9 +18,11 @@ type PersistedSettings struct {
 	BaseURL        string `json:"baseUrl"`
 	Model          string `json:"model"`
 	CustomModel    string `json:"customModel"`
+	WorkingDir     string `json:"workingDir"`
 	TTSEnabled     bool   `json:"ttsEnabled"`
 	TTSVoice       string `json:"ttsVoice"`
 	LastActiveConv string `json:"lastActiveConv,omitempty"`
+	AutoLearn      bool   `json:"autoLearn,omitempty"`
 }
 
 // PersistedToolCall is the on-disk shape of the frontend ToolCall.
@@ -40,12 +42,12 @@ type PersistedToolExecution struct {
 
 // PersistedMessage mirrors the frontend Message type.
 type PersistedMessage struct {
-	ID            string                  `json:"id"`
-	Role          string                  `json:"role"`
-	Content       string                  `json:"content"`
-	Timestamp     string                  `json:"timestamp"`
-	Thinking      string                  `json:"thinking,omitempty"`
-	ToolCalls     []PersistedToolCall     `json:"toolCalls,omitempty"`
+	ID             string                   `json:"id"`
+	Role           string                   `json:"role"`
+	Content        string                   `json:"content"`
+	Timestamp      string                   `json:"timestamp"`
+	Thinking       string                   `json:"thinking,omitempty"`
+	ToolCalls      []PersistedToolCall      `json:"toolCalls,omitempty"`
 	ToolExecutions []PersistedToolExecution `json:"toolExecutions,omitempty"`
 }
 
@@ -128,6 +130,10 @@ func (a *App) LoadSettings() (*PersistedSettings, error) {
 
 // SaveSettings writes the given settings to disk atomically.
 func (a *App) SaveSettings(s PersistedSettings) error {
+	// Apply auto-learn setting
+	if a.learner != nil || s.AutoLearn {
+		a.SetAutoLearnEnabled(s.AutoLearn)
+	}
 	return saveJSON("settings.json", s)
 }
 

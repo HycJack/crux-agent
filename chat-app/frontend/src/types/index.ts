@@ -37,4 +37,6 @@ export interface Settings {
   workingDir: string;
   ttsEnabled: boolean;
   ttsVoice: string;
+  autoLearn?: boolean;
+  thinkingLevel?: string;
 }

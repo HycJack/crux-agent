@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   CancelStream,
+  GetAutoLearnEnabled,
+  GetModels,
   GetWorkingDir,
   LoadConversations,
   LoadSettings,
+  ResetAgent,
   SaveConversations,
   SaveSettings,
+  SetAutoLearnEnabled,
   SetWorkingDir,
   StreamMessage,
 } from '../wailsjs/go/main/App';
@@ -16,6 +20,13 @@ import Sidebar from './components/Sidebar';
 import type { Conversation, Message, Settings, ToolExecution } from './types';
 import { MenuOutlined } from './icons';
 
+interface ModelInfo {
+  id: string;
+  name: string;
+  reasoning?: boolean;
+  thinkingLevelMap?: Record<string, string>;
+}
+
 const defaultSettings: Settings = {
   provider: 'openai',
   apiKey: '',
@@ -25,6 +36,8 @@ const defaultSettings: Settings = {
   workingDir: '',
   ttsEnabled: false,
   ttsVoice: 'zh-CN',
+  autoLearn: false,
+  thinkingLevel: '',
 };
 
 // PersistedSettings is the JSON shape coming back from the Go backend.
@@ -85,6 +98,7 @@ function App() {
   const [settings, setSettings] = useState<Settings>(defaultSettings);
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
   const [hasLoaded, setHasLoaded] = useState(false);
+  const [models, setModels] = useState<ModelInfo[]>([]);
 
   const currentUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const activeIdRef = useRef<string | null>(null);
@@ -146,6 +160,19 @@ function App() {
       if (initialWorkingDir) {
         SetWorkingDir(initialWorkingDir).catch(() => {});
       }
+      // Sync the backend's auto-learn flag with the persisted setting on
+      // startup, then read the backend's authoritative state back so the
+      // UI always reflects reality. The persisted file is the intent;
+      // the backend in-memory flag is the runtime truth. If they diverge
+      // (e.g. an external reload wiped the Go state), the backend wins.
+      const persistedAutoLearn = (persisted && (persisted as any).autoLearn) as boolean | undefined;
+      if (typeof persistedAutoLearn === 'boolean') {
+        await SetAutoLearnEnabled(persistedAutoLearn).catch(() => {});
+      }
+      const backendAutoLearn = await GetAutoLearnEnabled().catch(() => null);
+      if (typeof backendAutoLearn === 'boolean') {
+        setSettings((prev) => ({ ...prev, autoLearn: backendAutoLearn }));
+      }
       if (persistedConvs && persistedConvs.length > 0) {
         setConversations(persistedConvs as unknown as Conversation[]);
         const lastActive = (persisted as { lastActiveConv?: string } | null)?.lastActiveConv;
@@ -169,6 +196,18 @@ function App() {
       cancelled = true;
     };
   }, []);
+
+  // Fetch available models when settings are loaded
+  useEffect(() => {
+    if (!hasLoaded || !settings.apiKey) return;
+    GetModels({
+      provider: settings.provider,
+      baseUrl: settings.baseUrl,
+      apiKey: settings.apiKey,
+    }).then((list) => {
+      if (list) setModels(list);
+    }).catch(() => {});
+  }, [hasLoaded, settings.provider, settings.baseUrl, settings.apiKey]);
 
   // Persist settings to the backend whenever they change after the
   // initial load. Debounced so dragging a slider doesn't thrash disk.
@@ -209,6 +248,7 @@ function App() {
   }, []);
 
   const createNewConversation = useCallback(() => {
+    ResetAgent().catch(() => {});
     const conv = newConversation();
     setConversations((prev) => [conv, ...prev]);
     setActiveConversationId(conv.id);
@@ -216,6 +256,7 @@ function App() {
   }, []);
 
   const selectConversation = useCallback((id: string) => {
+    ResetAgent().catch(() => {});
     setActiveConversationId(id);
     activeIdRef.current = id;
   }, []);
@@ -235,6 +276,12 @@ function App() {
       });
       return remaining;
     });
+  }, []);
+
+  const renameConversation = useCallback((id: string, title: string) => {
+    setConversations((prev) =>
+      prev.map((c) => (c.id === id ? { ...c, title } : c)),
+    );
   }, []);
 
   // ---- Stream event handlers -------------------------------------------
@@ -342,11 +389,7 @@ function App() {
         const updated = [...execs];
         const lastExec = updated[updated.length - 1];
         updated[updated.length - 1] = { ...lastExec, result, isError: true };
-        // Also append the error to the content so it's visible even if
-        // the tool block is collapsed or the stream-done event causes a
-        // re-render that obscures the inline tool execution display.
-        const errorText = `Tool "${lastExec.name}" failed: ${result}`;
-        return { ...m, content: m.content ? m.content + '\n\n---\n\n' + errorText : errorText, toolExecutions: updated };
+        return { ...m, toolExecutions: updated };
       }),
     );
   }, [updateActive]);
@@ -400,7 +443,7 @@ function App() {
   }, []); // intentional: subscriptions live for the app lifetime
 
   const handleSendMessage = useCallback(
-    async (message: string) => {
+    async (message: string, modelOverride?: string, thinkingLevel?: string) => {
       stopSpeaking();
       setIsLoading(true);
 
@@ -442,13 +485,25 @@ function App() {
         }),
       );
 
+      // Use the override model from chat input, or the setting's model
+      const finalModel = modelOverride || (settings.model === 'custom' ? settings.customModel : settings.model);
+
+      // Build conversation history for context restoration
+      const targetConv = conversations.find((c) => c.id === targetId);
+      const historyMessages = targetConv?.messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+      })) ?? [];
+
       try {
         await StreamMessage({
           message,
           provider: settings.provider,
           apiKey: settings.apiKey,
           baseUrl: settings.baseUrl,
-          model: settings.model === 'custom' ? settings.customModel : settings.model,
+          model: finalModel,
+          thinkingLevel: thinkingLevel ?? settings.thinkingLevel ?? '',
+          messages: JSON.stringify(historyMessages),
         });
       } catch (error) {
         console.error('StreamMessage failed:', error);
@@ -472,8 +527,28 @@ function App() {
     [settings, stopSpeaking],
   );
 
+  // Lightweight, self-dismissing toast. Renders into a fixed overlay so
+  // any component can fire one without needing a portal or context.
+  const [toast, setToast] = useState<string | null>(null);
+  const showToast = useCallback((message: string) => {
+    setToast(message);
+    setTimeout(() => setToast((curr) => (curr === message ? null : curr)), 2200);
+  }, []);
+
   const handleSaveSettings = useCallback((newSettings: Settings) => {
     setSettings(newSettings);
+    // Propagate the auto-learn toggle to the backend immediately so
+    // that subsequent StreamMessage calls apply the change.
+    SetAutoLearnEnabled(!!newSettings.autoLearn).catch(() => {});
+    showToast('Settings saved');
+  }, [showToast]);
+
+  const handleModelChange = useCallback((model: string) => {
+    setSettings((prev) => ({ ...prev, model }));
+  }, []);
+
+  const handleThinkingLevelChange = useCallback((level: string) => {
+    setSettings((prev) => ({ ...prev, thinkingLevel: level }));
   }, []);
 
   useEffect(() => {
@@ -496,6 +571,7 @@ function App() {
         onSelectConversation={selectConversation}
         onCreateNewConversation={createNewConversation}
         onDeleteConversation={deleteConversation}
+        onRenameConversation={renameConversation}
         onOpenSettings={() => setIsSettingsOpen(true)}
       />
 
@@ -519,7 +595,10 @@ function App() {
               <span>{isLoading ? 'Agent working…' : 'Ready'}</span>
             </div>
             {isLoading && (
-              <button className="btn-danger" onClick={() => CancelStream().catch(() => undefined)}>
+              <button className="btn-danger" onClick={() => {
+                CancelStream().catch(() => undefined);
+                setIsLoading(false);
+              }}>
                 Stop
               </button>
             )}
@@ -534,6 +613,11 @@ function App() {
           onStopSpeak={stopSpeaking}
           speakingMessageId={speakingMessageId}
           workingDir={settings.workingDir}
+          models={models}
+          currentModel={settings.model === 'custom' ? settings.customModel : settings.model}
+          currentThinkingLevel={settings.thinkingLevel ?? ''}
+          onModelChange={handleModelChange}
+          onThinkingLevelChange={handleThinkingLevelChange}
         />
       </main>
 
@@ -543,6 +627,12 @@ function App() {
         currentSettings={settings}
         onSave={handleSaveSettings}
       />
+
+      {toast && (
+        <div className="app-toast" role="status" aria-live="polite">
+          {toast}
+        </div>
+      )}
     </div>
   );
 }
