@@ -411,10 +411,35 @@
 }
 .stage-empty { justify-content: center; }
 .stage-scroll {
+  position: relative;
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   padding: 24px 0;
+}
+.scroll-to-bottom-pill {
+  position: absolute;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--n-hairline);
+  background: var(--n-surface);
+  color: var(--n-charcoal);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  transition: background 120ms ease, color 120ms ease;
+}
+.scroll-to-bottom-pill:hover {
+  background: var(--n-primary);
+  color: #fff;
+  border-color: var(--n-primary);
 }
 .stage-inner {
   width: 100%;

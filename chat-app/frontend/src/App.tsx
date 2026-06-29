@@ -103,6 +103,13 @@ function App() {
   const currentUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const activeIdRef = useRef<string | null>(null);
 
+  // streamingIdRef points at the conversation whose stream the backend is
+  // currently driving. While it is set, all stream event handlers MUST
+  // target this id — not activeIdRef — so that switching the visible
+  // conversation in the middle of a stream does not leak deltas into the
+  // newly selected conversation.
+  const streamingIdRef = useRef<string | null>(null);
+
   const speakText = useCallback(
     (text: string, messageId: string) => {
       if (!window.speechSynthesis) return;
@@ -240,7 +247,12 @@ function App() {
   );
 
   const updateActive = useCallback((updater: (conv: Conversation) => Conversation) => {
-    const id = activeIdRef.current;
+    // While a stream is in flight the deltas MUST go to the conversation
+    // that initiated it, even if the user has since switched to another
+    // conversation in the sidebar. Falls back to activeIdRef when no
+    // stream is running so non-stream updates (title rename, etc.)
+    // still target the visible conversation.
+    const id = streamingIdRef.current ?? activeIdRef.current;
     if (!id) return;
     setConversations((prev) =>
       prev.map((c) => (c.id === id ? updater(c) : c)),
@@ -401,6 +413,7 @@ function App() {
       ),
     );
     setIsLoading(false);
+    streamingIdRef.current = null;
   }, [updateActive]);
 
   const handleStreamError = useCallback((error: string) => {
@@ -411,6 +424,7 @@ function App() {
       ),
     );
     setIsLoading(false);
+    streamingIdRef.current = null;
   }, [updateActive]);
 
   // Register all stream listeners exactly once. Each handler reads its
@@ -455,6 +469,11 @@ function App() {
         activeIdRef.current = conv.id;
         targetId = conv.id;
       }
+
+      // Pin the stream target BEFORE issuing StreamMessage so any event
+      // that fires while we're awaiting the IPC roundtrip still targets
+      // the correct conversation.
+      streamingIdRef.current = targetId;
 
       const now = Date.now();
       const userMessage: Message = {
@@ -522,6 +541,7 @@ function App() {
           }),
         );
         setIsLoading(false);
+        streamingIdRef.current = null;
       }
     },
     [settings, stopSpeaking],
@@ -598,6 +618,7 @@ function App() {
               <button className="btn-danger" onClick={() => {
                 CancelStream().catch(() => undefined);
                 setIsLoading(false);
+                streamingIdRef.current = null;
               }}>
                 Stop
               </button>

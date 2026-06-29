@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { memo, useState } from 'react';
 import { Bot, CheckOutlined, CloseOutlined, CopyOutlined, UserOutlined } from '../icons';
 import MarkdownRenderer from './MarkdownRenderer';
 import ThinkingBlock from './ThinkingBlock';
@@ -18,7 +18,7 @@ interface ChatMessageProps {
   isSpeaking?: boolean;
 }
 
-export default function ChatMessage({
+function ChatMessageInner({
   role,
   content,
   timestamp,
@@ -111,3 +111,9 @@ export default function ChatMessage({
     </div>
   );
 }
+
+// React.memo skips re-renders for messages whose props did not change
+// reference identity. During streaming the only message whose props
+// change every delta is the active assistant one, so this prevents the
+// entire history from being re-evaluated on every token.
+export default memo(ChatMessageInner);

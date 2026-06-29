@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { InlineMath, BlockMath } from 'react-katex';
@@ -40,7 +41,15 @@ function extractMathContent(text: string): { content: string; isMath: boolean }[
   return result;
 }
 
-export default function MarkdownRenderer({ content }: MarkdownRendererProps) {
+// Wrapped with React.memo so completed messages do not re-parse their
+// markdown on every stream delta. The active streaming message keeps
+// re-rendering (content changes every token), but the rest of the
+// conversation is stable.
+export default memo(function MarkdownRenderer({ content }: MarkdownRendererProps) {
+  return <MarkdownRendererInner content={content} />;
+});
+
+function MarkdownRendererInner({ content }: MarkdownRendererProps) {
   const parts = extractMathContent(content);
 
   return (
