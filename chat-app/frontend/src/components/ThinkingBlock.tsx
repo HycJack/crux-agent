@@ -18,7 +18,7 @@ export default function ThinkingBlock({ content, defaultExpanded = true }: Think
           <span className="think-dot" />
           Thinking
         </span>
-        {expanded ? <ChevronUpOutlined /> : <ChevronDownOutlined />}
+        {expanded ? <ChevronUpOutlined size={14} /> : <ChevronDownOutlined size={14} />}
       </button>
       {expanded && (
         <div className="think-body">

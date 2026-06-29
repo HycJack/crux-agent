@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Bot, CheckOutlined, CloseOutlined, UserOutlined } from '../icons';
+import { Bot, CheckOutlined, CloseOutlined, CopyOutlined, UserOutlined } from '../icons';
 import MarkdownRenderer from './MarkdownRenderer';
 import ThinkingBlock from './ThinkingBlock';
 import ToolCallBlock from './ToolCallBlock';
@@ -55,7 +55,7 @@ export default function ChatMessage({
           </div>
           <div className="msg-actions">
             <button className="ghost-action" onClick={handleCopy}>
-              {copied ? <CheckOutlined size={12} /> : <CloseOutlined size={12} style={{ transform: 'rotate(45deg)' }} />}
+              {copied ? <CheckOutlined size={12} /> : <CopyOutlined size={12} />}
               <span>{copied ? 'Copied' : 'Copy'}</span>
             </button>
           </div>
@@ -96,7 +96,7 @@ export default function ChatMessage({
         {!isLoading && (content || toolCalls) && (
           <div className="msg-actions">
             <button className="ghost-action" onClick={handleCopy}>
-              {copied ? <CheckOutlined size={12} /> : <CloseOutlined size={12} style={{ transform: 'rotate(45deg)' }} />}
+              {copied ? <CheckOutlined size={12} /> : <CopyOutlined size={12} />}
               <span>{copied ? 'Copied' : 'Copy'}</span>
             </button>
             {content && (onSpeak || onStopSpeak) && (

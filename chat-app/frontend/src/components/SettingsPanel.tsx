@@ -40,6 +40,20 @@ export default function SettingsPanel({ isOpen, onClose, currentSettings, onSave
     setWorkingDirError('');
   }, [currentSettings, isOpen]);
 
+  // Auto-save when the panel is closed, so that in-flight edits are
+  // not silently discarded if the user clicks outside / presses Escape
+  // without explicitly hitting the Save button.
+  useEffect(() => {
+    if (isOpen) return;
+    // Only persist if the local draft differs from the current settings.
+    if (JSON.stringify(settings) === JSON.stringify(currentSettings)) return;
+    const final: Settings = {
+      ...settings,
+      model: settings.model === 'custom' ? settings.customModel : settings.model,
+    };
+    onSave(final);
+  }, [isOpen]);
+
   useEffect(() => {
     if (!isOpen) return;
     SetWorkingDir(currentSettings.workingDir || '').catch(() => undefined);
@@ -120,7 +134,7 @@ export default function SettingsPanel({ isOpen, onClose, currentSettings, onSave
         <div className="modal-header">
           <h2 className="modal-title">Settings</h2>
           <button className="icon-btn" onClick={onClose} aria-label="Close">
-            <CloseOutlined />
+            <CloseOutlined size={16} />
           </button>
         </div>
 
@@ -158,7 +172,7 @@ export default function SettingsPanel({ isOpen, onClose, currentSettings, onSave
                 onClick={() => setShowApiKey((v) => !v)}
                 aria-label={showApiKey ? 'Hide' : 'Show'}
               >
-                {showApiKey ? <EyeInvisibleOutlined /> : <EyeOutlined />}
+                {showApiKey ? <EyeInvisibleOutlined size={16} /> : <EyeOutlined size={16} />}
               </button>
             </div>
             <p className="settings-hint">
@@ -208,7 +222,7 @@ export default function SettingsPanel({ isOpen, onClose, currentSettings, onSave
                 aria-label="Refresh models"
                 title="Refresh models"
               >
-                <RefreshOutlined style={{ animation: isLoading ? 'status-spin 900ms linear infinite' : undefined }} />
+                <RefreshOutlined size={16} style={{ animation: isLoading ? 'status-spin 900ms linear infinite' : undefined }} />
               </button>
             </div>
             {showCustomModel && (
@@ -244,7 +258,7 @@ export default function SettingsPanel({ isOpen, onClose, currentSettings, onSave
                 aria-label="Browse"
                 title="Browse"
               >
-                <FolderIcon />
+                <FolderIcon size={16} />
               </button>
             </div>
             {workingDirError && <div className="settings-error">{workingDirError}</div>}
@@ -285,7 +299,7 @@ export default function SettingsPanel({ isOpen, onClose, currentSettings, onSave
             Cancel
           </button>
           <button className={`btn-primary ${saved ? 'is-success' : ''}`} onClick={handleSave}>
-            <SaveOutlined />
+            <SaveOutlined size={16} />
             <span>{saved ? 'Saved' : 'Save changes'}</span>
           </button>
         </div>

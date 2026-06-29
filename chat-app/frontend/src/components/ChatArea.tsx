@@ -75,7 +75,7 @@ export default function ChatArea({
             {suggestions.map((title) => (
               <button key={title} className="suggestion-card" onClick={() => onSendMessage(title)}>
                 <span className="suggestion-icon">
-                  {title.toLowerCase().includes('run') ? <CodeOutlined /> : <WrenchOutlined />}
+                  {title.toLowerCase().includes('run') ? <CodeOutlined size={16} /> : <WrenchOutlined size={16} />}
                 </span>
                 <span className="suggestion-text">{title}</span>
               </button>

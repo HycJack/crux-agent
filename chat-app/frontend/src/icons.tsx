@@ -15,8 +15,10 @@ import {
   ChevronDown as ChevronDownIcon,
   ChevronUp as ChevronUpIcon,
   Bot as BotIcon,
+  Menu as MenuIcon,
   Folder as FolderLucide,
   Check as CheckIcon,
+  Copy as CopyIcon,
   Eye as EyeIcon,
   EyeOff as EyeOffIcon,
   Code as CodeLucide,
@@ -37,8 +39,10 @@ export const RefreshOutlined = RefreshCwIcon;
 export const ChevronDownOutlined = ChevronDownIcon;
 export const ChevronUpOutlined = ChevronUpIcon;
 export const Bot = BotIcon;
+export const MenuOutlined = MenuIcon;
 export const FolderIcon = FolderLucide;
 export const CheckOutlined = CheckIcon;
+export const CopyOutlined = CopyIcon;
 export const EyeOutlined = EyeIcon;
 export const EyeInvisibleOutlined = EyeOffIcon;
 export const CodeOutlined = CodeLucide;

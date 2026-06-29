@@ -276,6 +276,12 @@ func (a *App) StreamMessage(params map[string]interface{}) error {
 			a.mu.Lock()
 			a.cancelFn = nil
 			a.mu.Unlock()
+			// Always emit stream-done when the agent run finishes, regardless
+			// of how it ended (context cancellation via CancelStream, error,
+			// or natural completion). Without this, the frontend isLoading
+			// flag never gets reset after CancelStream because the agent
+			// loop exits via stream.End() without pushing EventAgentEnd.
+			wruntime.EventsEmit(a.ctx, "stream-done", "")
 		}()
 		_, _ = agt.Run(runCtx, core.UserMessage{
 			Role:      core.MessageRoleUser,
@@ -444,7 +450,7 @@ func jsonMarshal(v interface{}) (json.RawMessage, bool) {
 // relative paths resolve there. Uses platform-native shell semantics.
 func injectCwd(cmd, cwd string) string {
 	if stdruntime.GOOS == "windows" {
-		return fmt.Sprintf("cd /d \"%s\" && %s", cwd, cmd)
+		return fmt.Sprintf("cd /d \"%s\" & %s", cwd, cmd)
 	}
 	return fmt.Sprintf("cd \"%s\" && %s", cwd, cmd)
 }

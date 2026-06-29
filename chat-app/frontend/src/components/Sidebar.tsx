@@ -1,10 +1,11 @@
-import { EditOutlined, FolderOpenOutlined, MessageOutlined, PlusOutlined, SettingOutlined, UserOutlined } from '../icons';
+import { EditOutlined, FolderOpenOutlined, MenuOutlined, MessageOutlined, PlusOutlined, SettingOutlined, UserOutlined } from '../icons';
 import type { Conversation } from '../types';
 
 interface SidebarProps {
   conversations: Conversation[];
   activeConversation: string | null;
   workingDir: string;
+  collapsed: boolean;
   onSelectConversation: (id: string) => void;
   onCreateNewConversation: () => void;
   onDeleteConversation: (id: string) => void;
@@ -15,12 +16,33 @@ export default function Sidebar({
   conversations,
   activeConversation,
   workingDir,
+  collapsed,
   onSelectConversation,
   onCreateNewConversation,
   onDeleteConversation,
   onOpenSettings,
 }: SidebarProps) {
   const dirName = workingDir ? workingDir.split(/[\\/]/).filter(Boolean).slice(-1)[0] : 'No workspace';
+
+  if (collapsed) {
+    return (
+      <aside className="app-sidebar collapsed">
+        <button className="icon-btn sidebar-toggle" onClick={() => {}} aria-label="Expand sidebar">
+          <MenuOutlined size={18} />
+        </button>
+        <button className="nav-icon-btn" onClick={onCreateNewConversation} title="New chat">
+          <EditOutlined size={18} />
+        </button>
+        <button className="nav-icon-btn" onClick={onOpenSettings} title="Settings">
+          <SettingOutlined size={18} />
+        </button>
+        <div className="sidebar-spacer" />
+        <button className="nav-icon-btn profile-link" title="Crux Agent">
+          <UserOutlined size={18} />
+        </button>
+      </aside>
+    );
+  }
 
   return (
     <aside className="app-sidebar">
@@ -38,12 +60,12 @@ export default function Sidebar({
       </div>
 
       <button className="primary-cta" onClick={onCreateNewConversation}>
-        <EditOutlined />
+        <EditOutlined size={16} />
         <span>New chat</span>
       </button>
 
       <div className="workspace-card" title={workingDir}>
-        <FolderOpenOutlined />
+        <FolderOpenOutlined size={18} />
         <div className="workspace-meta">
           <div className="workspace-label">Working directory</div>
           <div className="workspace-path">{dirName || 'Not set'}</div>
@@ -53,7 +75,7 @@ export default function Sidebar({
       <div className="history-list">
         <div className="history-list-header">
           <span className="history-list-title">
-            <MessageOutlined />
+            <MessageOutlined size={16} />
             <span>History</span>
           </span>
         </div>
@@ -81,7 +103,7 @@ export default function Sidebar({
                 aria-label="Delete"
                 title="Delete"
               >
-                <PlusOutlined style={{ transform: 'rotate(45deg)' }} />
+                <PlusOutlined size={14} style={{ transform: 'rotate(45deg)' }} />
               </button>
             </div>
           ))}
@@ -90,11 +112,11 @@ export default function Sidebar({
 
       <div className="sidebar-footer">
         <button className="nav-item" onClick={onOpenSettings}>
-          <SettingOutlined />
+          <SettingOutlined size={16} />
           <span>Settings</span>
         </button>
         <button className="nav-item profile-link">
-          <UserOutlined />
+          <UserOutlined size={16} />
           <span>Crux Agent</span>
         </button>
       </div>

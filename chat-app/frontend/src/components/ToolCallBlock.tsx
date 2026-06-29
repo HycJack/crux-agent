@@ -16,10 +16,10 @@ export default function ToolCallBlock({ toolCalls, toolExecutions, defaultExpand
     <div className="tools-block">
       <button className="tools-header" onClick={() => setExpanded(!expanded)}>
         <span className="tools-title">
-          <WrenchOutlined />
+          <WrenchOutlined size={14} />
           <span>Tools ({toolCalls.length})</span>
         </span>
-        {expanded ? <ChevronUpOutlined /> : <ChevronDownOutlined />}
+        {expanded ? <ChevronUpOutlined size={14} /> : <ChevronDownOutlined size={14} />}
       </button>
       {expanded && (
         <div className="tools-body">
@@ -35,7 +35,7 @@ export default function ToolCallBlock({ toolCalls, toolExecutions, defaultExpand
             return (
               <div key={tc.id || idx} className="tool-row">
                 <div className="tool-row-header">
-                  <CodeOutlined />
+                  <CodeOutlined size={14} />
                   <span className="tool-name">{tc.name}</span>
                   {exec?.isError && <span className="tool-badge error">error</span>}
                   {exec && !exec.isError && exec.result && <span className="tool-badge ok">done</span>}

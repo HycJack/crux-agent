@@ -13,6 +13,7 @@ import ChatArea from './components/ChatArea';
 import SettingsPanel from './components/SettingsPanel';
 import Sidebar from './components/Sidebar';
 import type { Conversation, Message, Settings, ToolExecution } from './types';
+import { MenuOutlined } from './icons';
 
 const defaultSettings: Settings = {
   provider: 'openai',
@@ -30,7 +31,16 @@ const defaultSettings: Settings = {
 // frontend actually expects so downstream code stays type-safe.
 function settingsFromPersisted(p: Record<string, unknown>): Settings {
   const provider = p.provider === 'anthropic' ? 'anthropic' : 'openai';
-  return { ...defaultSettings, ...p, provider };
+  // Only override defaults with non-empty values from the persisted data,
+  // so that a zero-value field (e.g. empty apiKey on a clean install)
+  // does NOT overwrite a user-provided default.
+  const out: Settings = { ...defaultSettings, provider };
+  for (const [k, v] of Object.entries(p)) {
+    if (v !== '' && v !== null && v !== undefined) {
+      (out as any)[k] = v;
+    }
+  }
+  return out;
 }
 
 function newConversation(): Conversation {
@@ -70,6 +80,7 @@ function App() {
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [settings, setSettings] = useState<Settings>(defaultSettings);
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
   const [hasLoaded, setHasLoaded] = useState(false);
@@ -104,15 +115,23 @@ function App() {
   // the backend's authoritative state. `hasLoaded` gates the persist
   // effects below so we don't immediately write the defaults back over
   // what we just read.
+  //
+  // If LoadConversations returns an empty result on the first attempt,
+  // retry once after a short delay — the Wails IPC or file system may
+  // not be ready immediately on some Windows configurations.
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+    let attempts = 0;
+
+    async function load() {
+      attempts++;
       const [persisted, backendDir, persistedConvs] = await Promise.all([
         LoadSettings().catch(() => null),
         GetWorkingDir().catch(() => ''),
         LoadConversations().catch(() => null),
       ]);
       if (cancelled) return;
+
       if (persisted) {
         setSettings((prev) => ({ ...prev, ...settingsFromPersisted(persisted as unknown as Record<string, unknown>) }));
       }
@@ -127,9 +146,17 @@ function App() {
           persistedConvs[0].id;
         setActiveConversationId(initialId);
         activeIdRef.current = initialId;
+        setHasLoaded(true);
+      } else if (attempts < 2) {
+        // First attempt returned empty — retry once after 500ms.
+        await new Promise((r) => setTimeout(r, 500));
+        if (!cancelled) await load();
+      } else {
+        setHasLoaded(true);
       }
-      setHasLoaded(true);
-    })();
+    }
+
+    load();
     return () => {
       cancelled = true;
     };
@@ -305,8 +332,13 @@ function App() {
         const execs = m.toolExecutions;
         if (!execs || execs.length === 0) return m;
         const updated = [...execs];
-        updated[updated.length - 1] = { ...updated[updated.length - 1], result, isError: true };
-        return { ...m, toolExecutions: updated };
+        const lastExec = updated[updated.length - 1];
+        updated[updated.length - 1] = { ...lastExec, result, isError: true };
+        // Also append the error to the content so it's visible even if
+        // the tool block is collapsed or the stream-done event causes a
+        // re-render that obscures the inline tool execution display.
+        const errorText = `Tool "${lastExec.name}" failed: ${result}`;
+        return { ...m, content: m.content ? m.content + '\n\n---\n\n' + errorText : errorText, toolExecutions: updated };
       }),
     );
   }, [updateActive]);
@@ -447,11 +479,12 @@ function App() {
   }, []);
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell${sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
       <Sidebar
         conversations={conversations}
         activeConversation={activeConversationId}
         workingDir={settings.workingDir}
+        collapsed={sidebarCollapsed}
         onSelectConversation={selectConversation}
         onCreateNewConversation={createNewConversation}
         onDeleteConversation={deleteConversation}
@@ -460,12 +493,17 @@ function App() {
 
       <main className="main-frame">
         <header className="topbar">
-          <div className="breadcrumb">
-            <span className="crumb-root">Crux Agent</span>
-            <span className="crumb-sep">/</span>
-            <strong className="crumb-current">
-              {activeConversation ? activeConversation.title : 'Workspace'}
-            </strong>
+          <div className="topbar-left">
+            <button className="icon-btn sidebar-toggle" onClick={() => setSidebarCollapsed((p) => !p)} aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
+              <MenuOutlined size={18} />
+            </button>
+            <div className="breadcrumb">
+              <span className="crumb-root">Crux Agent</span>
+              <span className="crumb-sep">/</span>
+              <strong className="crumb-current">
+                {activeConversation ? activeConversation.title : 'Workspace'}
+              </strong>
+            </div>
           </div>
           <div className="topbar-right">
             <div className={`bridge-status ${isLoading ? 'busy' : 'idle'}`}>

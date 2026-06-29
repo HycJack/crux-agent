@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 // SQLiteStorage is a SQLite-based session storage backend.
@@ -18,7 +18,7 @@ type SQLiteStorage struct {
 
 // NewSQLiteStorage creates a new SQLite storage backend.
 func NewSQLiteStorage(dbPath string) (*SQLiteStorage, error) {
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL")
+	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL")
 	if err != nil {
 		return nil, &SessionError{Code: ErrStorage, Message: "failed to open database", Err: err}
 	}
