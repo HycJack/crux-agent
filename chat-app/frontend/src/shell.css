@@ -1015,6 +1015,27 @@
 }
 .skills-item-btn:hover { background: var(--n-surface-soft); border-color: var(--n-slate); }
 .skills-item-btn.active { background: var(--n-primary); color: #fff; border-color: var(--n-primary); }
+.skills-item-badge {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.06);
+  color: var(--n-slate);
+  margin-left: auto;
+}
+.skills-item-btn.active .skills-item-badge {
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+}
+.skills-item-desc {
+  font-size: 11px;
+  color: var(--n-slate);
+  padding: 6px 12px 8px;
+  line-height: 1.4;
+}
 .skill-preview {
   border: 1px solid var(--n-hairline);
   border-radius: var(--radius-md);

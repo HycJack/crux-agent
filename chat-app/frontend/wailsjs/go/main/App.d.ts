@@ -26,6 +26,8 @@ export function GetToolList():Promise<Array<string>>;
 
 export function GetWorkingDir():Promise<string>;
 
+export function ListSkills():Promise<Array<main.SkillInfo>>;
+
 export function LoadConversations():Promise<Array<main.PersistedConversation>>;
 
 export function LoadSettings():Promise<main.PersistedSettings>;

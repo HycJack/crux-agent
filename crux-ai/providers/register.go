@@ -1,4 +1,4 @@
-﻿package providers
+package providers
 
 import (
 	"github.com/hycjack/crux-ai/core"
@@ -12,6 +12,7 @@ import (
 	"github.com/hycjack/crux-ai/providers/images"
 	"github.com/hycjack/crux-ai/providers/kimi"
 	"github.com/hycjack/crux-ai/providers/mistral"
+	"github.com/hycjack/crux-ai/providers/ollama"
 	"github.com/hycjack/crux-ai/providers/openai"
 	"github.com/hycjack/crux-ai/providers/xiaomi"
 )
@@ -50,7 +51,8 @@ func RegisterBuiltInProviders() {
 		WithConfig(xiaomi.New()).
 		WithConfig(glm.New()).
 		WithConfig(deepseek.New()).
-		WithConfig(kimi.New())
+		WithConfig(kimi.New()).
+		WithConfig(ollama.New())
 	core.RegisterProvider(core.APIOpenAICompletions, openaiCompat, "builtin")
 
 	// --- Faux (testing) ---

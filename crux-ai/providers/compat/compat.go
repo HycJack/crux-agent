@@ -42,6 +42,10 @@ type Config struct {
 	// FinalizeResponse, if set, post-processes the assistant message before
 	// the EventDone is emitted.
 	FinalizeResponse func(model core.Model, body map[string]any, msg *core.AssistantMessage)
+	// RequireAPIKey, when false, allows requests without an API key.
+	// Local servers (Ollama, LM Studio) typically run unauthenticated; set
+	// this to false for those. Defaults to true.
+	RequireAPIKey *bool
 }
 
 // Router dispatches OpenAI-compatible requests to per-provider configs.
@@ -56,10 +60,14 @@ func NewRouter() *Router {
 }
 
 // Register adds a per-provider config. If cfg.Path is empty it defaults to
-// "/chat/completions".
+// "/chat/completions". If cfg.RequireAPIKey is nil it defaults to true.
 func (r *Router) Register(cfg Config) {
 	if cfg.Path == "" {
 		cfg.Path = "/chat/completions"
+	}
+	if cfg.RequireAPIKey == nil {
+		required := true
+		cfg.RequireAPIKey = &required
 	}
 	r.mu.Lock()
 	r.configs[cfg.Provider] = cfg
@@ -139,7 +147,8 @@ func buildBody(_ Config, model core.Model, c core.Context, opts core.StreamOptio
 
 func runStream(ctx context.Context, cfg Config, model core.Model, c core.Context, opts core.StreamOptions, body map[string]any) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error) {
 	apiKey := core.ResolveAPIKey(cfg.Provider, opts.APIKey)
-	if apiKey == "" {
+	requireKey := cfg.RequireAPIKey == nil || *cfg.RequireAPIKey
+	if apiKey == "" && requireKey {
 		return nil, fmt.Errorf("%s: no API key provided", cfg.Provider)
 	}
 	if cfg.BuildBody != nil {
@@ -194,7 +203,9 @@ func doRequest(
 		return core.AssistantMessage{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 	for k, v := range cfg.ExtraHeaders {
 		req.Header.Set(k, v)
 	}

@@ -51,6 +51,7 @@ var providerEnvVars = map[KnownProvider][]string{
 	ProviderMinimax:       {"MINIMAX_API_KEY"},
 	ProviderMinimaxCN:     {"MINIMAX_API_KEY"},
 	ProviderXiaomi:        {"XIAOMI_API_KEY", "MI_API_KEY"},
+	ProviderOllama:        {}, // local — usually no key; user may still pass one
 }
 
 // ResolveAPIKey resolves an API key from options or environment.

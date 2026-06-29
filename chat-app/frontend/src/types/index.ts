@@ -29,7 +29,7 @@ export interface Conversation {
 }
 
 export interface Settings {
-  provider: 'openai' | 'anthropic';
+  provider: 'openai' | 'anthropic' | 'ollama';
   apiKey: string;
   baseUrl: string;
   model: string;

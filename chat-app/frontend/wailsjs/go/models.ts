@@ -162,6 +162,23 @@ export namespace main {
 	    }
 	}
 	
+	
+	export class SkillInfo {
+	    name: string;
+	    description: string;
+	    source: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new SkillInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.description = source["description"];
+	        this.source = source["source"];
+	    }
+	}
 
 }
 

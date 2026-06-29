@@ -52,6 +52,7 @@ const (
 	ProviderMinimax       KnownProvider = "minimax"
 	ProviderMinimaxCN     KnownProvider = "minimax-cn"
 	ProviderXiaomi        KnownProvider = "xiaomi"
+	ProviderOllama        KnownProvider = "ollama"
 	ProviderVercelGateway KnownProvider = "vercel-ai-gateway"
 	ProviderCloudflareGW  KnownProvider = "cloudflare-ai-gateway"
 )

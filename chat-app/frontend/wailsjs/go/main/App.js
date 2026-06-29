@@ -50,6 +50,10 @@ export function GetWorkingDir() {
   return window['go']['main']['App']['GetWorkingDir']();
 }
 
+export function ListSkills() {
+  return window['go']['main']['App']['ListSkills']();
+}
+
 export function LoadConversations() {
   return window['go']['main']['App']['LoadConversations']();
 }
