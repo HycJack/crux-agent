@@ -630,6 +630,11 @@ function App() {
           messages={activeConversation?.messages ?? []}
           isLoading={isLoading}
           onSendMessage={handleSendMessage}
+          onStop={() => {
+            CancelStream().catch(() => undefined);
+            setIsLoading(false);
+            streamingIdRef.current = null;
+          }}
           onSpeak={speakText}
           onStopSpeak={stopSpeaking}
           speakingMessageId={speakingMessageId}

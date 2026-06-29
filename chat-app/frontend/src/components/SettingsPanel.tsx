@@ -16,7 +16,7 @@ import {
   PickWorkingDir,
   SetWorkingDir,
   SetAutoLearnEnabled,
-  GetSkills,
+  ListSkills,
   GetSkillContent,
   GetMemories,
   SetMemory,
@@ -26,6 +26,7 @@ import {
   GetCompactionStatus,
   ReloadSkills,
 } from '../../wailsjs/go/main/App';
+import { main } from '../../wailsjs/go/models';
 import type { Settings } from '../types';
 
 interface SettingsPanelProps {
@@ -54,11 +55,13 @@ const tabs: { id: TabId; label: string; icon: React.ReactNode }[] = [
 const providerLabel: Record<Settings['provider'], string> = {
   openai: 'OpenAI',
   anthropic: 'Anthropic',
+  ollama: 'Ollama (local)',
 };
 
 const providerBaseUrl: Record<Settings['provider'], string> = {
   openai: 'https://api.openai.com/v1',
   anthropic: 'https://api.anthropic.com/v1',
+  ollama: 'http://localhost:11434/v1',
 };
 
 export default function SettingsPanel({ isOpen, onClose, currentSettings, onSave }: SettingsPanelProps) {
@@ -72,7 +75,7 @@ export default function SettingsPanel({ isOpen, onClose, currentSettings, onSave
   const [workingDirError, setWorkingDirError] = useState<string>('');
 
   // Tab-specific state
-  const [skills, setSkills] = useState<string[]>([]);
+  const [skills, setSkills] = useState<main.SkillInfo[]>([]);
   const [selectedSkill, setSelectedSkill] = useState<string | null>(null);
   const [skillContent, setSkillContent] = useState<string>('');
   const [memories, setMemories] = useState<Record<string, string>>({});
@@ -108,14 +111,14 @@ export default function SettingsPanel({ isOpen, onClose, currentSettings, onSave
     if (!isOpen) return;
     switch (activeTab) {
       case 'skills':
-        GetSkills().then(setSkills).catch(() => {});
+        ListSkills().then(setSkills).catch(() => {});
         break;
       case 'memory':
         GetMemories().then(setMemories).catch(() => {});
         break;
       case 'system':
         Promise.all([
-          GetToolList().then(setTools).catch(() => {}),
+          GetToolList().then((list) => setTools(list || [])).catch(() => setTools([])),
           GetCompactionStatus().then(setCompactionStatus).catch(() => {}),
         ]);
         break;
@@ -202,9 +205,9 @@ export default function SettingsPanel({ isOpen, onClose, currentSettings, onSave
     const dir = settings.workingDir;
     if (dir) {
       await ReloadSkills(dir);
-      const list = await GetSkills();
-      setSkills(list || []);
     }
+    const list = await ListSkills();
+    setSkills(list || []);
   };
 
   const addMemory = async () => {
@@ -281,7 +284,13 @@ export default function SettingsPanel({ isOpen, onClose, currentSettings, onSave
                     type={showApiKey ? 'text' : 'password'}
                     value={settings.apiKey}
                     onChange={(e) => setSettings((prev) => ({ ...prev, apiKey: e.target.value }))}
-                    placeholder={settings.provider === 'openai' ? 'sk-...' : 'sk-ant-...'}
+                    placeholder={
+                      settings.provider === 'openai'
+                        ? 'sk-...'
+                        : settings.provider === 'anthropic'
+                          ? 'sk-ant-...'
+                          : 'optional for local Ollama'
+                    }
                     className="text-input"
                   />
                   <button
@@ -296,7 +305,9 @@ export default function SettingsPanel({ isOpen, onClose, currentSettings, onSave
                 <p className="settings-hint">
                   {settings.provider === 'openai'
                     ? 'Uses OPENAI_API_KEY env var if blank.'
-                    : 'Uses ANTHROPIC_API_KEY env var if blank.'}
+                    : settings.provider === 'anthropic'
+                      ? 'Uses ANTHROPIC_API_KEY env var if blank.'
+                      : 'Optional — only required if your Ollama instance is behind auth.'}
                 </p>
               </section>
 
@@ -443,20 +454,28 @@ export default function SettingsPanel({ isOpen, onClose, currentSettings, onSave
               </div>
               <p className="settings-hint">
                 Skills are loaded from <code>skills/&lt;name&gt;/SKILL.md</code> in the working directory.
+                Built-in examples ({skills.filter((s) => s.source === 'bundled').length}) are always available; user-authored ones
+                ({skills.filter((s) => s.source === 'user').length}) override them when they share a name.
               </p>
 
               {skills.length === 0 ? (
                 <div className="settings-empty">No skills found. Create a <code>skills/&lt;name&gt;/SKILL.md</code> file.</div>
               ) : (
                 <div className="skills-list">
-                  {skills.map((name) => (
-                    <div key={name} className="skills-list-item">
+                  {skills.map((s) => (
+                    <div key={s.name} className="skills-list-item">
                       <button
-                        className={`skills-item-btn ${selectedSkill === name ? 'active' : ''}`}
-                        onClick={() => loadSkillContent(name)}
+                        className={`skills-item-btn ${selectedSkill === s.name ? 'active' : ''}`}
+                        onClick={() => loadSkillContent(s.name)}
                       >
-                        <span className="skills-item-name">{name}</span>
+                        <span className="skills-item-name">{s.name}</span>
+                        {s.source === 'bundled' && (
+                          <span className="skills-item-badge">bundled</span>
+                        )}
                       </button>
+                      {s.description && (
+                        <div className="skills-item-desc">{s.description}</div>
+                      )}
                     </div>
                   ))}
                 </div>

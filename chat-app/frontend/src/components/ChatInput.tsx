@@ -10,6 +10,7 @@ interface ModelInfo {
 
 interface ChatInputProps {
   onSend: (message: string, model?: string, thinkingLevel?: string) => void;
+  onStop?: () => void;
   disabled?: boolean;
   placeholder?: string;
   models?: ModelInfo[];
@@ -28,6 +29,7 @@ const THINKING_LEVELS = [
 
 export default function ChatInput({
   onSend,
+  onStop,
   disabled,
   placeholder,
   models,
@@ -40,8 +42,12 @@ export default function ChatInput({
   const [showModelPicker, setShowModelPicker] = useState(false);
 
   const submit = () => {
+    if (disabled) {
+      onStop?.();
+      return;
+    }
     const text = value.trim();
-    if (!text || disabled) return;
+    if (!text) return;
     setValue('');
     onSend(text, currentModel, currentThinkingLevel);
   };

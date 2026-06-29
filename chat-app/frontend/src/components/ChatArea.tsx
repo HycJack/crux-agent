@@ -16,6 +16,7 @@ interface ChatAreaProps {
   isLoading: boolean;
   workingDir: string;
   onSendMessage: (message: string, model?: string, thinkingLevel?: string) => void;
+  onStop: () => void;
   onSpeak: (text: string, messageId: string) => void;
   onStopSpeak: () => void;
   speakingMessageId: string | null;
@@ -52,6 +53,7 @@ export default function ChatArea({
   isLoading,
   workingDir,
   onSendMessage,
+  onStop,
   onSpeak,
   onStopSpeak,
   speakingMessageId,
@@ -180,6 +182,7 @@ export default function ChatArea({
         </div>
         <ChatInput
           onSend={handleLocalSend}
+          onStop={onStop}
           disabled={isLoading}
           placeholder="Ask Crux Agent…"
           models={models}
@@ -235,6 +238,7 @@ export default function ChatArea({
       </div>
       <ChatInput
         onSend={handleLocalSend}
+        onStop={onStop}
         disabled={isLoading}
         placeholder="Ask Crux Agent…"
         models={models}
