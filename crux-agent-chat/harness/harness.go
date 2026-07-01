@@ -30,7 +30,8 @@ import (
 	"crux-agent-harness/session"
 	"crux-agent-harness/skills"
 
-	agentruntime "github.com/hycjack/crux-agent-runtime/agent"
+	agentruntime "crux-agent-runtime/agent"
+
 	"github.com/hycjack/crux-ai/core"
 )
 
