@@ -145,7 +145,14 @@ func NewCodingAgentWithHarness(opts Options) *agentruntime.Agent {
 		}
 	}
 
-	return agentruntime.New(agentruntime.AgentOptions{InitialState: state})
+	agent := agentruntime.New(agentruntime.AgentOptions{InitialState: state})
+
+	if h != nil {
+		// Subscribe the harness collector to agent events for run statistics.
+		agent.Subscribe(h.NewAgentSubscriber())
+	}
+
+	return agent
 }
 
 // tidyContext trims overly large tool results that the LLM has already

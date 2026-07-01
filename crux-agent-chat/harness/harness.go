@@ -5,6 +5,8 @@
 //   - skill loading (embedded into SystemPrompt)
 //   - session persistence (JSONL)
 //   - token usage tracking (subscribes to assistant messages)
+//   - run statistics (RunCollector via Subscribe)
+//   - message queue (Steer/FollowUp injection)
 //
 // The public surface is a single Harness struct that the agent and
 // the REPL both depend on.
@@ -15,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,8 +26,11 @@ import (
 
 	"crux-agent-harness/approval"
 	hcontext "crux-agent-harness/context"
+	"crux-agent-harness/observe"
 	"crux-agent-harness/session"
 	"crux-agent-harness/skills"
+
+	agentruntime "github.com/hycjack/crux-agent-runtime/agent"
 	"github.com/hycjack/crux-ai/core"
 )
 
@@ -41,6 +47,14 @@ type Harness struct {
 	sessFile string
 	metadata session.SessionMetadata
 	sessMgr  *session.SessionManager
+
+	// RunCollector accumulates per-run statistics. Created by New, reset
+	// on each RunOnce call. Call Snapshot() to retrieve results.
+	collector *observe.RunCollector
+
+	// MessageQueue for steering and follow-up message injection.
+	// Created by New; use Steer/FollowUp methods to enqueue messages.
+	queue *observe.MessageQueue
 }
 
 // TokenTotals tracks token consumption.
@@ -205,6 +219,8 @@ func New(cfg Config) (*Harness, error) {
 		sessFile:   sessFile,
 		metadata:   metadata,
 		sessMgr:    sessMgr,
+		collector:  observe.NewRunCollector(),
+		queue:      observe.NewMessageQueue(),
 	}, nil
 }
 
@@ -549,4 +565,81 @@ func (h *Harness) CompactAndPersist(summary string, tokensBefore int, newMsgs []
 		return err
 	}
 	return h.RecordMessages(newMsgs)
+}
+
+// --- RunCollector ---
+
+// Collector returns the current run collector. The collector is reset
+// before each RunOnce call. Call Snapshot() on the collector to get
+// per-run statistics.
+func (h *Harness) Collector() *observe.RunCollector {
+	return h.collector
+}
+
+// ResetCollector replaces the collector with a fresh one. Call this
+// before starting a new run.
+func (h *Harness) ResetCollector() {
+	h.collector = observe.NewRunCollector()
+}
+
+// NewAgentSubscriber creates a subscriber function that feeds agent
+// events into the harness's RunCollector. Pass the returned function
+// to agent.Subscribe().
+//
+// Usage:
+//
+//	agent.Subscribe(harness.NewAgentSubscriber())
+func (h *Harness) NewAgentSubscriber() func(agentruntime.AgentEvent) {
+	return func(evt agentruntime.AgentEvent) {
+		switch e := evt.(type) {
+		case agentruntime.EventTurnStart:
+			// Turn start: no stats to record yet
+		case agentruntime.EventTurnEnd:
+			// Finished a turn
+		case agentruntime.EventMessageEnd:
+			h.collector.RecordUsage(e.Message.Usage)
+		case agentruntime.EventToolExecEnd:
+			h.collector.RecordToolCall(e.ToolName, e.IsError)
+			// Accumulate token totals for session metadata
+			// h.metadata is updated elsewhere
+		case agentruntime.EventAgentEnd:
+			h.collector.MarkRunEnded()
+			sum, cov := h.collector.Snapshot()
+			log.Printf("harness: run ended — %d steps, %d tools, %d errors, %.4f cost",
+				sum.StepCount, sum.ToolCallCount, sum.ErrorCount, sum.TotalCost)
+			_ = cov // coverage available for higher-level consumers
+		}
+	}
+}
+
+// --- MessageQueue ---
+
+// Queue returns the harness's message queue for steering and follow-up
+// message injection.
+func (h *Harness) Queue() *observe.MessageQueue {
+	return h.queue
+}
+
+// Steer enqueues one or more messages for in-flight steering. These
+// will be injected into the current agent turn at the next yield
+// checkpoint.
+func (h *Harness) Steer(msgs ...core.Message) {
+	h.queue.Steer(msgs...)
+}
+
+// FollowUp enqueues one or more messages to be processed after the
+// current agent turn completes.
+func (h *Harness) FollowUp(msgs ...core.Message) {
+	h.queue.FollowUp(msgs...)
+}
+
+// SetQueueMode sets the active queue mode. See observe.QueueMode for
+// available modes.
+func (h *Harness) SetQueueMode(m observe.QueueMode) {
+	h.queue.SetMode(m)
+}
+
+// QueueMode returns the current queue mode.
+func (h *Harness) QueueMode() observe.QueueMode {
+	return h.queue.Mode()
 }

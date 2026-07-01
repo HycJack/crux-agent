@@ -3,6 +3,7 @@ go 1.25.0
 use (
 	./chat-app
 	./crux-agent-harness
+	./crux-agent-chat
 	./crux-agent-runtime
 	./crux-ai
 )
