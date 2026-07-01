@@ -65,6 +65,11 @@ func (d *ApprovalDialog) ToolID() string {
 	return d.toolID
 }
 
+// ToolName returns the name of the tool being approved.
+func (d *ApprovalDialog) ToolName() string {
+	return d.toolName
+}
+
 // SetSize updates dimensions.
 func (d *ApprovalDialog) SetSize(w, h int) {
 	d.width = w
@@ -105,7 +110,7 @@ func (d *ApprovalDialog) View() string {
 
 	// Tool name
 	b.WriteString(DialogKeyStyle.Render("Tool: "))
-	b.WriteString(ToolNameStyle.Render(d.toolName))
+	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(ColorAccent).Render(d.toolName))
 	b.WriteString("\n")
 
 	// Args

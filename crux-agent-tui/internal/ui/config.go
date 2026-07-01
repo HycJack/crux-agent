@@ -8,13 +8,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hycjack/crux-ai/core"
 	"github.com/joho/godotenv"
 )
 
-// tuiConfig holds the AI provider configuration for the TUI app.
+// ProviderConfig holds the AI provider configuration.
+type ProviderConfig struct {
+	Name      string // provider name (e.g., "openai", "deepseek", "custom")
+	Model     string
+	APIKey    string
+	BaseURL   string
+	MaxTokens int
+}
+
+// tuiConfig holds the configuration for the TUI app.
 type tuiConfig struct {
-	Provider     core.KnownProvider
+	ProviderName string // provider name for display
 	ModelID      string
 	APIKey       string
 	BaseURL      string
@@ -52,9 +60,10 @@ func loadConfig() (*tuiConfig, error) {
 		Temperature: 0.7,
 	}
 
-	cfg.Provider, cfg.APIKey = detectProvider()
-	if cfg.Provider == "" {
-		return nil, fmt.Errorf("no AI API key found. Set one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, DEEPSEEK_API_KEY")
+	// Detect provider and API key
+	cfg.ProviderName, cfg.APIKey = detectProvider()
+	if cfg.ProviderName == "" {
+		return nil, fmt.Errorf("no AI API key found. Set one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, GOOGLE_API_KEY, XAI_API_KEY, GROQ_API_KEY, MISTRAL_API_KEY")
 	}
 
 	cfg.ModelID = os.Getenv("AI_MODEL")
@@ -94,23 +103,24 @@ func loadConfig() (*tuiConfig, error) {
 	return cfg, nil
 }
 
-func detectProvider() (core.KnownProvider, string) {
-	providers := []struct {
-		provider core.KnownProvider
-		envVars  []string
-	}{
-		{core.ProviderAnthropic, []string{"ANTHROPIC_API_KEY"}},
-		{core.ProviderOpenAI, []string{"OPENAI_API_KEY"}},
-		{core.ProviderDeepSeek, []string{"DEEPSEEK_API_KEY"}},
-		{core.ProviderGoogle, []string{"GOOGLE_API_KEY", "GEMINI_API_KEY"}},
-		{core.ProviderXAI, []string{"XAI_API_KEY"}},
-		{core.ProviderGroq, []string{"GROQ_API_KEY"}},
-		{core.ProviderMistral, []string{"MISTRAL_API_KEY"}},
+func detectProvider() (string, string) {
+	type providerEntry struct {
+		name    string
+		envVars []string
+	}
+	providers := []providerEntry{
+		{"openai", []string{"OPENAI_API_KEY"}},
+		{"anthropic", []string{"ANTHROPIC_API_KEY"}},
+		{"deepseek", []string{"DEEPSEEK_API_KEY"}},
+		{"google", []string{"GOOGLE_API_KEY", "GEMINI_API_KEY"}},
+		{"xai", []string{"XAI_API_KEY"}},
+		{"groq", []string{"GROQ_API_KEY"}},
+		{"mistral", []string{"MISTRAL_API_KEY"}},
 	}
 	for _, p := range providers {
 		for _, envVar := range p.envVars {
 			if key := os.Getenv(envVar); key != "" {
-				return p.provider, key
+				return p.name, key
 			}
 		}
 	}
@@ -121,73 +131,40 @@ func setDefaults(cfg *tuiConfig) {
 	if cfg.ModelID != "" {
 		return
 	}
-	switch cfg.Provider {
-	case core.ProviderAnthropic:
+	switch cfg.ProviderName {
+	case "anthropic":
 		cfg.ModelID = "claude-sonnet-4-20250514"
-	case core.ProviderOpenAI:
+	case "openai":
 		cfg.ModelID = "gpt-4o"
-	case core.ProviderDeepSeek:
+	case "deepseek":
 		cfg.ModelID = "deepseek-chat"
 		if cfg.BaseURL == "" {
 			cfg.BaseURL = "https://api.deepseek.com/v1"
 		}
-	case core.ProviderGoogle:
+	case "google":
 		cfg.ModelID = "gemini-2.5-flash-preview-05-20"
-	case core.ProviderXAI:
+	case "xai":
 		cfg.ModelID = "grok-3-mini"
 		if cfg.BaseURL == "" {
 			cfg.BaseURL = "https://api.x.ai/v1"
 		}
-	case core.ProviderGroq:
+	case "groq":
 		cfg.ModelID = "llama-3.3-70b-versatile"
-	case core.ProviderMistral:
+	case "mistral":
 		cfg.ModelID = "mistral-large-latest"
-	}
-}
-
-func (c *tuiConfig) getModel() core.Model {
-	api := c.detectAPI()
-	return core.Model{
-		ID:            c.ModelID,
-		Name:          c.ModelID,
-		API:           api,
-		Provider:      c.Provider,
-		BaseURL:       c.BaseURL,
-		ContextWindow: c.contextWindow(),
-		MaxTokens:     c.MaxTokens,
-	}
-}
-
-func (c *tuiConfig) contextWindow() int {
-	switch c.Provider {
-	case core.ProviderAnthropic:
-		return 200000
-	case core.ProviderGoogle:
-		return 1000000
-	case core.ProviderDeepSeek:
-		return 1000000
-	case core.ProviderXAI:
-		return 128000
-	case core.ProviderGroq:
-		return 128000
-	case core.ProviderMistral:
-		return 128000
 	default:
-		return 128000
+		cfg.ModelID = "gpt-4o"
 	}
 }
 
-func (c *tuiConfig) detectAPI() core.KnownAPI {
-	if c.BaseURL != "" {
-		return core.APIOpenAICompletions
-	}
-	switch c.Provider {
-	case core.ProviderAnthropic:
-		return core.APIAnthropicMessages
-	case core.ProviderGoogle:
-		return core.APIGoogleGenerative
+// mustUseOpenAIProtocol returns true if the provider uses the OpenAI-compatible protocol.
+func (c *tuiConfig) mustUseOpenAIProtocol() bool {
+	// Most providers use OpenAI protocol. Anthropic and Google are the exceptions.
+	switch c.ProviderName {
+	case "anthropic", "google":
+		return false
 	default:
-		return core.APIOpenAICompletions
+		return true
 	}
 }
 
@@ -198,7 +175,7 @@ func (c *tuiConfig) String() string {
 		masked = masked[:4] + "..." + masked[len(masked)-4:]
 	}
 	return strings.Join([]string{
-		fmt.Sprintf("Provider:   %s", c.Provider),
+		fmt.Sprintf("Provider:   %s", c.ProviderName),
 		fmt.Sprintf("Model:      %s", c.ModelID),
 		fmt.Sprintf("API Key:    %s", masked),
 		fmt.Sprintf("Base URL:   %s", orDefault(c.BaseURL, "(default)")),

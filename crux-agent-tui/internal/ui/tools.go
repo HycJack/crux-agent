@@ -12,32 +12,31 @@ import (
 	"sync"
 	"time"
 
-	agentruntime "crux-agent-runtime/agent"
-	"github.com/hycjack/crux-ai/core"
+	"crux-agent-tui/internal/agent"
 )
 
 // toolResult creates a successful tool result.
-func toolResult(text string) agentruntime.AgentToolResult {
-	return agentruntime.AgentToolResult{
-		Content: []core.ContentBlock{core.TextContent{Type: "text", Text: text}},
+func toolResult(text string) agent.AgentToolResult {
+	return agent.AgentToolResult{
+		Content: text,
 	}
 }
 
 // toolError creates an error tool result.
-func toolError(text string) agentruntime.AgentToolResult {
-	return agentruntime.AgentToolResult{
-		Content: []core.ContentBlock{core.TextContent{Type: "text", Text: text}},
+func toolError(text string) agent.AgentToolResult {
+	return agent.AgentToolResult{
+		Content: text,
 		IsError: true,
 	}
 }
 
 // allTools returns all available coding tools.
-func allTools() []agentruntime.AgentTool {
+func allTools() []agent.AgentTool {
 	defs := []struct {
 		name        string
 		description string
 		params      string
-		exec        func(context.Context, string, json.RawMessage, func(json.RawMessage)) (agentruntime.AgentToolResult, error)
+		exec        func(context.Context, string, json.RawMessage, func(json.RawMessage)) (agent.AgentToolResult, error)
 	}{
 		{
 			name:        "bash",
@@ -71,9 +70,9 @@ func allTools() []agentruntime.AgentTool {
 		},
 	}
 
-	tools := make([]agentruntime.AgentTool, len(defs))
+	tools := make([]agent.AgentTool, len(defs))
 	for i, d := range defs {
-		tools[i] = agentruntime.AgentTool{
+		tools[i] = agent.AgentTool{
 			Name:        d.name,
 			Description: d.description,
 			Parameters:  json.RawMessage(d.params),
@@ -85,7 +84,7 @@ func allTools() []agentruntime.AgentTool {
 
 // ── bash ─────────────────────────────────────────────────────────────────────
 
-func executeBash(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (agentruntime.AgentToolResult, error) {
+func executeBash(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (agent.AgentToolResult, error) {
 	var args struct {
 		Command string `json:"command"`
 		Timeout int    `json:"timeout"`
@@ -192,7 +191,7 @@ func findPowerShell() (string, []string) {
 
 // ── read_file ────────────────────────────────────────────────────────────────
 
-func executeReadFile(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (agentruntime.AgentToolResult, error) {
+func executeReadFile(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (agent.AgentToolResult, error) {
 	var args struct {
 		Path   string `json:"path"`
 		Offset int    `json:"offset"`
@@ -240,7 +239,7 @@ func executeReadFile(ctx context.Context, id string, params json.RawMessage, onU
 
 // ── write_file ───────────────────────────────────────────────────────────────
 
-func executeWriteFile(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (agentruntime.AgentToolResult, error) {
+func executeWriteFile(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (agent.AgentToolResult, error) {
 	var args struct {
 		Path    string `json:"path"`
 		Content string `json:"content"`
@@ -261,7 +260,7 @@ func executeWriteFile(ctx context.Context, id string, params json.RawMessage, on
 
 // ── list_files ───────────────────────────────────────────────────────────────
 
-func executeListFiles(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (agentruntime.AgentToolResult, error) {
+func executeListFiles(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (agent.AgentToolResult, error) {
 	var args struct {
 		Path       string `json:"path"`
 		Recursive  bool   `json:"recursive"`
@@ -298,7 +297,7 @@ func executeListFiles(ctx context.Context, id string, params json.RawMessage, on
 
 // ── edit_file ────────────────────────────────────────────────────────────────
 
-func executeEditFile(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (agentruntime.AgentToolResult, error) {
+func executeEditFile(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (agent.AgentToolResult, error) {
 	var args struct {
 		Path    string `json:"path"`
 		OldText string `json:"old_text"`
