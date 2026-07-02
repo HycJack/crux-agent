@@ -5,6 +5,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"crux-agent-tui/internal/provider"
 )
@@ -150,4 +151,44 @@ func (a *Agent) PublishEvent(evt AgentEvent) {
 	for _, fn := range a.subscribers {
 		fn(evt)
 	}
+}
+
+// MessageCount returns the number of messages in the history.
+func (a *Agent) MessageCount() int {
+	return len(a.state.Messages)
+}
+
+// EstimateTokens returns a rough estimate of the total token count.
+func (a *Agent) EstimateTokens() int {
+	const tokensPerChar = 0.25
+	total := 0
+	for _, msg := range a.state.Messages {
+		total += int(float64(len(msg.Content)) * tokensPerChar)
+	}
+	// Add system prompt
+	total += int(float64(len(a.state.SystemPrompt)) * tokensPerChar)
+	return total
+}
+
+// ContextInfo returns a formatted string with context usage information.
+// Returns "" if compaction is not configured.
+func (a *Agent) ContextInfo() string {
+	if a.compaction.MaxTokens <= 0 {
+		return ""
+	}
+	used := a.EstimateTokens()
+	pct := used * 100 / a.compaction.MaxTokens
+	if pct > 100 {
+		pct = 100
+	}
+	return fmt.Sprintf("%d%% ctx", pct)
+}
+
+// CompactRatio returns the compaction headroom ratio (0..1).
+func (a *Agent) CompactRatio() float64 {
+	if a.compaction.MaxTokens <= 0 {
+		return 0
+	}
+	used := a.EstimateTokens()
+	return float64(used) / float64(a.compaction.MaxTokens)
 }

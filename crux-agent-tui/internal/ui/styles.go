@@ -7,8 +7,6 @@ import (
 )
 
 // ── Color Palette (Tokyo Night inspired) ──────────────────────────────────────
-// Each role colour is a pair of (light, dark) hexadecimal values so the terminal
-// can adapt to the user's background automatically via AdaptiveColor.
 
 var (
 	ColorBg        = lipgloss.AdaptiveColor{Light: "#f5f5f5", Dark: "#1a1b26"}
@@ -34,163 +32,259 @@ var (
 	ColorCodeBG    = lipgloss.AdaptiveColor{Light: "#f4f4f5", Dark: "#1e1e2e"}
 )
 
-// ── Mode pill colours ─────────────────────────────────────────────────────────
+// ── Cached styles (rebuilt on theme change) ───────────────────────────────────
+
 var (
-	PillAutoStyle = lipgloss.NewStyle().
-			Background(lipgloss.Color("#f59e0b")).
-			Foreground(lipgloss.Color("#111827")).
-			Bold(true).
-			Padding(0, 1)
+	// Pills
+	PillAutoStyle lipgloss.Style
+	PillPlanStyle lipgloss.Style
+	PillYOLOStyle lipgloss.Style
 
-	PillPlanStyle = lipgloss.NewStyle().
-			Background(lipgloss.Color("#2563eb")).
-			Foreground(lipgloss.Color("#ffffff")).
-			Bold(true).
-			Padding(0, 1)
+	// Title
+	TitleStyle    lipgloss.Style
+	SubtitleStyle lipgloss.Style
 
-	PillYOLOStyle = lipgloss.NewStyle().
-			Background(lipgloss.Color("#e5484d")).
-			Foreground(lipgloss.Color("#ffffff")).
-			Bold(true).
-			Padding(0, 1)
+	// Chat messages
+	UserMsgStyle      lipgloss.Style
+	UserBubbleStyle   lipgloss.Style
+	AssistantMsgStyle lipgloss.Style
+	SystemMsgStyle    lipgloss.Style
+	ErrorMsgStyle     lipgloss.Style
+
+	// Thinking / reasoning
+	ThinkingStyle       lipgloss.Style
+	ReasoningStyle      lipgloss.Style
+	ReasoningBlockStyle lipgloss.Style
+
+	// Tool cards
+	ToolCardHeaderStyle    lipgloss.Style
+	ToolCardConnectorStyle lipgloss.Style
+	ToolCallStyle          lipgloss.Style
+	ToolResultStyle        lipgloss.Style
+
+	// Diff
+	DiffAddStyle    lipgloss.Style
+	DiffDelStyle    lipgloss.Style
+	DiffHeaderStyle lipgloss.Style
+
+	// Input
+	InputPromptStyle  lipgloss.Style
+	InputBoxStyle     lipgloss.Style
+	InputFocusedStyle lipgloss.Style
+
+	// Dialog
+	DialogStyle      lipgloss.Style
+	DialogTitleStyle lipgloss.Style
+	DialogKeyStyle   lipgloss.Style
+	DialogDescStyle  lipgloss.Style
+
+	// Tool info
+	ToolInfoStyle lipgloss.Style
+
+	// Status bar
+	StatusBarStyle lipgloss.Style
+	DataLineStyle  lipgloss.Style
+
+	// Code block
+	CodeBlockStyle lipgloss.Style
+
+	// Selection & scrollbar (from chat.go)
+	selStyle         lipgloss.Style
+	scrollThumbStyle lipgloss.Style
+	scrollTrackStyle lipgloss.Style
+
+	// Todo panel (app.go)
+	todoHeaderStyle lipgloss.Style
+	todoGreenStyle  lipgloss.Style
+	todoYellowStyle lipgloss.Style
+	todoDimStyle    lipgloss.Style
+
+	// Spinner
+	spinnerStyle lipgloss.Style
+
+	// Working line
+	workingStyle lipgloss.Style
+
+	// Separator
+	separatorStyle lipgloss.Style
+
+	// Dim line cache
+	dimLineStyle lipgloss.Style
+
+	// Danger foreground
+	dangerFgStyle lipgloss.Style
+
+	// Mode info styles
+	modePlanInfoStyle lipgloss.Style
+	modeYOLOInfoStyle lipgloss.Style
 )
 
-// ── Title ─────────────────────────────────────────────────────────────────────
-var TitleStyle = lipgloss.NewStyle().
-	Bold(true).
-	Foreground(ColorAccent).
-	PaddingLeft(1)
+// refreshStyles rebuilds all cached styles. Call this once at init and whenever
+// the colour palette changes (e.g. theme switch). All exported style variables
+// are valid after this call.
+func refreshStyles() {
+	PillAutoStyle = lipgloss.NewStyle().
+		Background(lipgloss.Color("#f59e0b")).
+		Foreground(lipgloss.Color("#111827")).
+		Bold(true).
+		Padding(0, 1)
 
-// SubtitleStyle is muted info text.
-var SubtitleStyle = lipgloss.NewStyle().
-	Foreground(ColorMuted).
-	PaddingLeft(1)
+	PillPlanStyle = lipgloss.NewStyle().
+		Background(lipgloss.Color("#2563eb")).
+		Foreground(lipgloss.Color("#ffffff")).
+		Bold(true).
+		Padding(0, 1)
 
-// ── Chat message styles ───────────────────────────────────────────────────────
-var UserMsgStyle = lipgloss.NewStyle().
-	Foreground(ColorGreen).
-	Bold(true).
-	Padding(0, 1)
+	PillYOLOStyle = lipgloss.NewStyle().
+		Background(lipgloss.Color("#e5484d")).
+		Foreground(lipgloss.Color("#ffffff")).
+		Bold(true).
+		Padding(0, 1)
 
-var UserBubbleStyle = lipgloss.NewStyle().
-	Background(ColorUserBG).
-	Padding(0, 2).
-	Margin(0, 1)
+	TitleStyle = lipgloss.NewStyle().
+		Bold(true).
+		Foreground(ColorAccent).
+		PaddingLeft(1)
 
-var AssistantMsgStyle = lipgloss.NewStyle().
-	Foreground(ColorFg).
-	Padding(0, 1)
+	SubtitleStyle = lipgloss.NewStyle().
+		Foreground(ColorMuted).
+		PaddingLeft(1)
 
-// SystemMsgStyle for metadata / notices.
-var SystemMsgStyle = lipgloss.NewStyle().
-	Foreground(ColorMuted).
-	Padding(0, 1)
+	UserMsgStyle = lipgloss.NewStyle().
+		Foreground(ColorGreen).
+		Bold(true).
+		Padding(0, 1)
 
-// ErrorMsgStyle for error messages.
-var ErrorMsgStyle = lipgloss.NewStyle().
-	Foreground(ColorRed).
-	Bold(true).
-	Padding(0, 1)
+	UserBubbleStyle = lipgloss.NewStyle().
+		Background(ColorUserBG).
+		Padding(0, 2).
+		Margin(0, 1)
 
-// ── Thinking / reasoning ─────────────────────────────────────────────────────
-var ThinkingStyle = lipgloss.NewStyle().
-	Foreground(ColorMuted).
-	Italic(true).
-	PaddingLeft(2)
+	AssistantMsgStyle = lipgloss.NewStyle().
+		Foreground(ColorFg).
+		Padding(0, 1)
 
-// ReasoningStyle is the dim "▎ thinking…" marker.
-var ReasoningStyle = lipgloss.NewStyle().
-	Foreground(ColorMuted).
-	PaddingLeft(2)
+	SystemMsgStyle = lipgloss.NewStyle().
+		Foreground(ColorMuted).
+		Padding(0, 1)
 
-// ReasoningBlockStyle is the dim text block under "▎ thinking…".
-var ReasoningBlockStyle = lipgloss.NewStyle().
-	Foreground(ColorMuted).
-	PaddingLeft(6)
+	ErrorMsgStyle = lipgloss.NewStyle().
+		Foreground(ColorRed).
+		Bold(true).
+		Padding(0, 1)
 
-// ── Tool call cards ───────────────────────────────────────────────────────────
-// ToolCardHeaderStyle formats "● Verb(args)" — the card header line.
-var ToolCardHeaderStyle = lipgloss.NewStyle().
-	PaddingLeft(2)
+	ThinkingStyle = lipgloss.NewStyle().
+		Foreground(ColorMuted).
+		Italic(true).
+		PaddingLeft(2)
 
-// ToolCardConnectorStyle formats the "⎿" gutter for continuation blocks.
-var ToolCardConnectorStyle = lipgloss.NewStyle().
-	Foreground(ColorMuted)
+	ReasoningStyle = lipgloss.NewStyle().
+		Foreground(ColorMuted).
+		PaddingLeft(2)
 
-// ToolCallStyle for "🔧 ToolName(args)".
-var ToolCallStyle = lipgloss.NewStyle().
-	Foreground(ColorYellow).
-	PaddingLeft(2)
+	ReasoningBlockStyle = lipgloss.NewStyle().
+		Foreground(ColorMuted).
+		PaddingLeft(6)
 
-// ToolResultStyle for tool result output.
-var ToolResultStyle = lipgloss.NewStyle().
-	Foreground(ColorCyan).
-	PaddingLeft(6)
+	ToolCardHeaderStyle = lipgloss.NewStyle().
+		PaddingLeft(2)
 
-// ── Diff ──────────────────────────────────────────────────────────────────────
-var DiffAddStyle = lipgloss.NewStyle().
-	Foreground(ColorDiffAdd)
+	ToolCardConnectorStyle = lipgloss.NewStyle().
+		Foreground(ColorMuted)
 
-var DiffDelStyle = lipgloss.NewStyle().
-	Foreground(ColorDiffDel)
+	ToolCallStyle = lipgloss.NewStyle().
+		Foreground(ColorYellow).
+		PaddingLeft(2)
 
-var DiffHeaderStyle = lipgloss.NewStyle().
-	Foreground(ColorAccent).
-	Bold(true)
+	ToolResultStyle = lipgloss.NewStyle().
+		Foreground(ColorCyan).
+		PaddingLeft(6)
 
-// ── Input ─────────────────────────────────────────────────────────────────────
-var InputPromptStyle = lipgloss.NewStyle().
-	Foreground(ColorGreen).
-	Bold(true)
+	DiffAddStyle = lipgloss.NewStyle().
+		Foreground(ColorDiffAdd)
 
-var InputBoxStyle = lipgloss.NewStyle().
-	Border(lipgloss.RoundedBorder()).
-	BorderForeground(ColorBorder).
-	Padding(0, 1)
+	DiffDelStyle = lipgloss.NewStyle().
+		Foreground(ColorDiffDel)
 
-var InputFocusedStyle = lipgloss.NewStyle().
-	Border(lipgloss.RoundedBorder()).
-	BorderForeground(ColorAccent).
-	Padding(0, 1)
+	DiffHeaderStyle = lipgloss.NewStyle().
+		Foreground(ColorAccent).
+		Bold(true)
 
-// ── Dialog (tool approval) ────────────────────────────────────────────────────
-var DialogStyle = lipgloss.NewStyle().
-	Border(lipgloss.DoubleBorder()).
-	BorderForeground(ColorYellow).
-	Padding(1, 2).
-	Width(60)
+	InputPromptStyle = lipgloss.NewStyle().
+		Foreground(ColorGreen).
+		Bold(true)
 
-var DialogTitleStyle = lipgloss.NewStyle().
-	Foreground(ColorYellow).
-	Bold(true)
+	InputBoxStyle = lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(ColorBorder).
+		Padding(0, 1)
 
-var DialogKeyStyle = lipgloss.NewStyle().
-	Foreground(ColorAccent).
-	Bold(true)
+	InputFocusedStyle = lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(ColorAccent).
+		Padding(0, 1)
 
-var DialogDescStyle = lipgloss.NewStyle().
-	Foreground(ColorMuted)
+	DialogStyle = lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(ColorYellow).
+		Padding(1, 2).
+		Width(60)
 
-// ── Tool info ─────────────────────────────────────────────────────────────────
-var ToolInfoStyle = lipgloss.NewStyle().
-	Foreground(ColorAccent).
-	Bold(true)
+	DialogTitleStyle = lipgloss.NewStyle().
+		Foreground(ColorYellow).
+		Bold(true)
 
-// ── Status bar ────────────────────────────────────────────────────────────────
-var StatusBarStyle = lipgloss.NewStyle().
-	Foreground(ColorMuted)
+	DialogKeyStyle = lipgloss.NewStyle().
+		Foreground(ColorAccent).
+		Bold(true)
 
-var DataLineStyle = lipgloss.NewStyle().
-	Foreground(ColorMuted)
+	DialogDescStyle = lipgloss.NewStyle().
+		Foreground(ColorMuted)
 
-// ── Code block ────────────────────────────────────────────────────────────────
-var CodeBlockStyle = lipgloss.NewStyle().
-	Background(ColorCodeBG).
-	Foreground(ColorFg).
-	Padding(0, 2)
+	ToolInfoStyle = lipgloss.NewStyle().
+		Foreground(ColorAccent).
+		Bold(true)
+
+	StatusBarStyle = lipgloss.NewStyle().
+		Foreground(ColorMuted)
+
+	DataLineStyle = lipgloss.NewStyle().
+		Foreground(ColorMuted)
+
+	CodeBlockStyle = lipgloss.NewStyle().
+		Background(ColorCodeBG).
+		Foreground(ColorFg).
+		Padding(0, 2)
+
+	selStyle = lipgloss.NewStyle().Reverse(true)
+	scrollThumbStyle = lipgloss.NewStyle().Foreground(ColorMuted)
+	scrollTrackStyle = lipgloss.NewStyle().Foreground(ColorBorder)
+
+	todoHeaderStyle = lipgloss.NewStyle().Foreground(ColorAccent)
+	todoGreenStyle = lipgloss.NewStyle().Foreground(ColorGreen)
+	todoYellowStyle = lipgloss.NewStyle().Foreground(ColorYellow)
+	todoDimStyle = lipgloss.NewStyle().Foreground(ColorMuted)
+
+	spinnerStyle = lipgloss.NewStyle().Foreground(ColorAccent)
+
+	workingStyle = lipgloss.NewStyle().Foreground(ColorMuted).Padding(0, 1)
+
+	separatorStyle = lipgloss.NewStyle().Foreground(ColorBorder)
+
+	dimLineStyle = lipgloss.NewStyle().Foreground(ColorMuted)
+
+	dangerFgStyle = lipgloss.NewStyle().Foreground(ColorDanger)
+
+	modePlanInfoStyle = lipgloss.NewStyle().Foreground(ColorMuted)
+	modeYOLOInfoStyle = lipgloss.NewStyle().Foreground(ColorDanger)
+}
+
+func init() {
+	refreshStyles()
+}
 
 // ── Helper: tool verb colour ──────────────────────────────────────────────────
-// toolDotColor returns the colour for a tool's status dot based on its category.
+
 func toolDotColor(name string) lipgloss.AdaptiveColor {
 	switch name {
 	case "read_file", "glob", "list_files", "grep", "search":
@@ -207,9 +301,9 @@ func toolDotColor(name string) lipgloss.AdaptiveColor {
 }
 
 // ── Helper: connector block ───────────────────────────────────────────────────
+
 const connectorStr = "  ⎿  "
 
-// connectorWidth is the visible width of the connector prefix.
 var connectorWidth = lipgloss.Width(connectorStr)
 
 // ConnectorBlock wraps a list of lines under the "⎿" gutter.

@@ -5,5 +5,6 @@ use (
 	./crux-agent-harness
 	./crux-agent-chat
 	./crux-agent-runtime
+	./crux-agent-tui
 	./crux-ai
 )

@@ -2,9 +2,13 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -14,7 +18,6 @@ import (
 	"crux-agent-tui/internal/provider"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 )
 
 // ── Mode constants ────────────────────────────────────────────────────────────
@@ -27,7 +30,7 @@ const (
 	modeYOLO
 )
 
-// ── Messages for the Bubble Tea event loop ────────────────────────────────────
+// ── Messages ──────────────────────────────────────────────────────────────────
 
 type agentResponseMsg struct {
 	err error
@@ -56,6 +59,10 @@ type agentReasoningMsg struct {
 }
 
 type elapsedTickMsg struct{}
+type clipboardPasteMsg struct {
+	text string
+	err  error
+}
 
 // ── App Model ─────────────────────────────────────────────────────────────────
 
@@ -75,16 +82,29 @@ type App struct {
 	querying bool
 	mode     tuiMode
 
+	// Bubble unsend: the user bubble is echoed immediately on Enter but stays
+	// "pending" until the first response packet arrives. Esc before then pops
+	// it back off the transcript and restores the input text.
+	bubblePending bool
+	bubbleRestore string // text to restore on unsend
+
 	// Reasoning tracking
 	reasoningAccum strings.Builder
+	reasoningOpen  bool // true while we have a "▎ thinking…" marker in chat
 
 	// Tool streaming
 	activeToolID string
 
+	// Todo panel state: the latest todo_write tool's args, parsed as JSON.
+	todoArgs string
+
+	// Paste support: folded long text pastes
+	pastedBlocks []pastedBlock
+	nextPasteID  int
+
 	// Esc state machine
-	// States: idle -> pending (unsent turn running) -> canceled (turn done, input restores)
-	// Esc on empty idle with double-press triggers rewind (future)
-	lastEscAt time.Time
+	lastEscAt   time.Time
+	lastCtrlCAt time.Time
 
 	// Tick for elapsed time during run
 	runStart   time.Time
@@ -94,7 +114,7 @@ type App struct {
 	mu      sync.Mutex
 }
 
-// SetProgram stores the tea.Program reference for sending messages from goroutines.
+// SetProgram stores the tea.Program reference.
 func (a *App) SetProgram(p *tea.Program) {
 	a.program = p
 }
@@ -108,8 +128,7 @@ func NewApp() (*App, error) {
 
 	var llmProvider provider.LLMProvider
 	if !cfg.mustUseOpenAIProtocol() {
-		return nil, fmt.Errorf("provider %q currently not supported. Use an OpenAI-compatible base URL instead.\n"+
-			"Set AI_BASE_URL and use OPENAI_API_KEY for the API key.", cfg.ProviderName)
+		return nil, fmt.Errorf("provider %q not supported. Use AI_BASE_URL + OPENAI_API_KEY instead.\n", cfg.ProviderName)
 	}
 	llmProvider = openai.New()
 
@@ -128,7 +147,6 @@ func NewApp() (*App, error) {
 		app.handleAgentEvent(evt)
 	})
 
-	// Welcome message
 	app.chat.AddMessage(ChatMessage{
 		Role:    "system",
 		Content: fmt.Sprintf("Crux Agent TUI — %s / %s\nType a message to chat. Commands: /help", cfg.ProviderName, cfg.ModelID),
@@ -137,7 +155,6 @@ func NewApp() (*App, error) {
 	return app, nil
 }
 
-// newAgent creates a fresh coding agent from config.
 func newAgent(cfg *tuiConfig, llmProvider provider.LLMProvider) *agent.Agent {
 	systemPrompt := cfg.SystemPrompt
 	if systemPrompt == "" {
@@ -157,38 +174,27 @@ func newAgent(cfg *tuiConfig, llmProvider provider.LLMProvider) *agent.Agent {
 		MaxTokens:    cfg.MaxTokens,
 		Headers:      make(map[string]string),
 	}
-	compaction := agent.CompactionConfig{
-		MaxTokens:   100000,
-		TokenBudget: 50,
-	}
-	return agent.New(state, llmProvider, compaction)
+	return agent.New(state, llmProvider, agent.CompactionConfig{MaxTokens: 100000, TokenBudget: 50})
 }
 
-// handleAgentEvent processes agent events and sends them as Bubble Tea messages.
+// handleAgentEvent routes agent events to the event loop.
 func (a *App) handleAgentEvent(evt agent.AgentEvent) {
 	switch e := evt.(type) {
 	case agent.EventMessageUpdate:
 		if e.Type == "reasoning" || e.Type == "thinking" {
+			// First response packet → confirm the bubble as sent
+			a.confirmBubbleSent()
 			a.publish(agentReasoningMsg{delta: e.Delta})
 		} else {
+			a.confirmBubbleSent()
 			a.publish(agentStreamMsg{text: e.Delta})
 		}
 	case agent.EventToolExecStart:
-		// Extract a human-readable primary arg
+		a.confirmBubbleSent()
 		args := extractPrimaryArg(e.ToolName, e.Args)
-		a.publish(agentToolStartMsg{
-			name:    e.ToolName,
-			args:    args,
-			rawArgs: e.Args,
-			toolID:  e.ToolID,
-		})
+		a.publish(agentToolStartMsg{name: e.ToolName, args: args, rawArgs: e.Args, toolID: e.ToolID})
 	case agent.EventToolExecEnd:
-		a.publish(agentToolEndMsg{
-			name:   e.ToolName,
-			result: e.Result,
-			isErr:  e.IsError,
-			toolID: e.ToolID,
-		})
+		a.publish(agentToolEndMsg{name: e.ToolName, result: e.Result, isErr: e.IsError, toolID: e.ToolID})
 	case agent.EventTurnEnd:
 		if e.ErrorMessage != "" {
 			a.publish(agentStreamMsg{text: "\n\nError: " + e.ErrorMessage})
@@ -203,42 +209,46 @@ func (a *App) publish(msg tea.Msg) {
 	}
 }
 
-// ── Bubble Tea Model Interface ────────────────────────────────────────────────
+// confirmBubbleSent marks the pending user bubble as confirmed once the first
+// response packet arrives, so Esc no longer un-sends it.
+func (a *App) confirmBubbleSent() {
+	if a.bubblePending {
+		a.bubblePending = false
+	}
+}
 
-func (a *App) Init() tea.Cmd { return nil }
+// ── Bubble Tea Interface ──────────────────────────────────────────────────────
+
+func (a *App) Init() tea.Cmd {
+	return tea.Batch(
+		enableMouse(),
+	)
+}
+
+func enableMouse() tea.Cmd {
+	return tea.EnableMouseCellMotion
+}
 
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		return a.handleWindowSize(msg)
-
 	case tea.KeyMsg:
 		return a.handleKeyMsg(msg)
-
-	// Agent events
+	case tea.MouseMsg:
+		return a.handleMouseMsg(msg)
 	case agentStreamMsg:
 		return a.handleStreamMsg(msg)
-
 	case agentReasoningMsg:
 		return a.handleReasoningMsg(msg)
-
 	case agentToolStartMsg:
 		return a.handleToolStartMsg(msg)
-
 	case agentToolEndMsg:
 		return a.handleToolEndMsg(msg)
-
 	case agentResponseMsg:
-		a.querying = false
-		a.runElapsed = 0
-		a.input.Enable()
-		a.reasoningAccum.Reset()
-		a.activeToolID = ""
-		if msg.err != nil {
-			a.chat.AddMessage(ChatMessage{Role: "error", Content: msg.err.Error()})
-		}
-		return a, nil
-
+		return a.handleResponseMsg(msg)
+	case clipboardPasteMsg:
+		return a.handlePasteMsg(msg)
 	case elapsedTickMsg:
 		if a.querying {
 			a.runElapsed = int(time.Since(a.runStart).Seconds())
@@ -246,43 +256,59 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return a, nil
 	}
-
 	return a, nil
 }
 
-// ── Message handlers ──────────────────────────────────────────────────────────
+// ── Window Size ───────────────────────────────────────────────────────────────
 
 func (a *App) handleWindowSize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 	a.width = msg.Width
 	a.height = msg.Height
 	a.ready = true
 
-	// Layout: chat area takes most, input + status + mode rows at the bottom
-	bottomRows := a.bottomRows()
-	chatHeight := msg.Height - bottomRows
-	if chatHeight < 5 {
-		chatHeight = 5
-	}
-	a.chat.SetSize(msg.Width, chatHeight)
 	a.input.SetSize(msg.Width)
 	a.dialog.SetSize(msg.Width, msg.Height)
+	a.chat.SetSize(msg.Width, msg.Height) // will be recalculated in View()
 	return a, nil
 }
 
-// bottomRows returns the number of terminal rows occupied by the bottom region:
-//   - status line (1)
-//   - data line (1)
-//   - working spinner line when running (1 or 0)
-//   - input box with border (1) = 3 rows total, or 4 when running
-func (a *App) bottomRows() int {
-	rows := 3 // status line + data line + input box
+// ── Message Handlers ──────────────────────────────────────────────────────────
+
+// handleMouseMsg forwards mouse events to the ChatView for scrolling and selection.
+func (a *App) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if a.querying {
-		rows++ // working spinner line
+		// During query, only allow scrolling, not selection
+		switch msg.Type {
+		case tea.MouseWheelUp:
+			a.chat.ScrollUp(3)
+		case tea.MouseWheelDown:
+			a.chat.ScrollDown(3)
+		}
+		return a, nil
 	}
-	return rows
+
+	// Handle right-click: copy selected text
+	if msg.Type == tea.MouseRight && msg.Action == tea.MouseActionPress {
+		if a.chat.HasSelection() {
+			text := a.chat.SelectedText()
+			if text != "" {
+				a.chat.clearSelection()
+				return a, copyToClipboard(text)
+			}
+		}
+		return a, nil
+	}
+
+	// Forward to ChatView for selection handling
+	if a.chat.Update(msg) {
+		return a, nil
+	}
+	return a, nil
 }
 
 func (a *App) handleStreamMsg(msg agentStreamMsg) (tea.Model, tea.Cmd) {
+	a.closeReasoning()
+
 	if len(a.chat.messages) == 0 || a.chat.messages[len(a.chat.messages)-1].Role != "assistant" {
 		a.chat.AddMessage(ChatMessage{Role: "assistant", Content: msg.text})
 	} else {
@@ -294,29 +320,26 @@ func (a *App) handleStreamMsg(msg agentStreamMsg) (tea.Model, tea.Cmd) {
 
 func (a *App) handleReasoningMsg(msg agentReasoningMsg) (tea.Model, tea.Cmd) {
 	a.reasoningAccum.WriteString(msg.delta)
-
-	// Show reasoning in a dedicated reasoning message
 	text := a.reasoningAccum.String()
-	// Bounded view: only show the last ~200 chars live
-	if len(text) > 200 {
-		text = "…" + text[len(text)-200:]
+	if len(text) > 300 {
+		text = "…" + text[len(text)-300:]
 	}
 
-	if len(a.chat.messages) == 0 || a.chat.messages[len(a.chat.messages)-1].Role != "reasoning" {
+	if !a.reasoningOpen {
 		a.chat.AddMessage(ChatMessage{Role: "reasoning", Content: "▎ thinking…"})
-		a.chat.AddMessage(ChatMessage{
-			Role:    "reasoning",
-			Content: dimLine(clampLine(text, a.width-10)),
-		})
-	} else {
-		// Replace the last line of the reasoning block
-		vis := a.reasoningAccum.String()
-		if len(vis) > 200 {
-			vis = "…" + vis[len(vis)-200:]
-		}
-		a.chat.UpdateLastMessage(dimLine(clampLine(vis, a.width-10)))
+		a.reasoningOpen = true
 	}
+
+	// Update the reasoning text inline (last message's Content)
+	a.chat.UpdateLastMessage(dimLine(clampLine(text, a.width-10)))
 	return a, nil
+}
+
+func (a *App) closeReasoning() {
+	if a.reasoningOpen {
+		a.reasoningAccum.Reset()
+		a.reasoningOpen = false
+	}
 }
 
 func (a *App) handleToolStartMsg(msg agentToolStartMsg) (tea.Model, tea.Cmd) {
@@ -336,7 +359,19 @@ func (a *App) handleToolStartMsg(msg agentToolStartMsg) (tea.Model, tea.Cmd) {
 
 func (a *App) handleToolEndMsg(msg agentToolEndMsg) (tea.Model, tea.Cmd) {
 	a.activeToolID = ""
-	// Update the last tool_call message to finalized
+
+	// Check if this is a todo_write tool — capture its args for the todo panel
+	if msg.name == "todo_write" {
+		a.todoArgs = msg.result
+		// The args are in result for the TUI; parse to validate
+		if todos := a.parseTodos(); len(todos) == 0 || allTodosDone(todos) {
+			a.todoArgs = ""
+		}
+		// Recalculate layout (todo panel height changed)
+		// View() recalculates chat size on each render, no need to do it here.
+		return a, nil
+	}
+
 	if len(a.chat.messages) > 0 {
 		last := a.chat.messages[len(a.chat.messages)-1]
 		if last.ToolCall != nil && last.ToolCall.Name == msg.name {
@@ -348,47 +383,156 @@ func (a *App) handleToolEndMsg(msg agentToolEndMsg) (tea.Model, tea.Cmd) {
 			return a, nil
 		}
 	}
-	// Fallback: add as text
 	label := "[ok]"
 	if msg.isErr {
 		label = "[err]"
 	}
-	a.chat.AddMessage(ChatMessage{
-		Role:    "system",
-		Content: fmt.Sprintf("%s %s", label, msg.name),
-	})
+	a.chat.AddMessage(ChatMessage{Role: "system", Content: fmt.Sprintf("%s %s", label, msg.name)})
 	return a, nil
 }
 
-// ── Keyboard handling with Esc state machine ──────────────────────────────────
+func (a *App) handleResponseMsg(msg agentResponseMsg) (tea.Model, tea.Cmd) {
+	a.querying = false
+	a.bubblePending = false
+	a.runElapsed = 0
+	a.input.Enable()
+	a.activeToolID = ""
+	if msg.err != nil {
+		a.chat.AddMessage(ChatMessage{Role: "error", Content: msg.err.Error()})
+	}
+	return a, nil
+}
+
+// ── Paste Support ─────────────────────────────────────────────────────────────
+
+type pastedBlock struct {
+	label string
+	text  string
+}
+
+const foldedPasteMinChars = 1000
+const foldedPasteMinLines = 5
+
+func shouldFoldPastedText(s string) bool {
+	return len([]rune(s)) >= foldedPasteMinChars || strings.Count(s, "\n")+1 >= foldedPasteMinLines
+}
+
+func pastedLineCount(s string) int {
+	if s == "" {
+		return 0
+	}
+	return strings.Count(strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n"), "\n") + 1
+}
+
+func foldedPasteLabel(id, lines int) string {
+	return fmt.Sprintf("[Pasted text #%d · %d lines]", id, lines)
+}
+
+func renderFoldedPasteBlock(block pastedBlock) string {
+	return fmt.Sprintf("%s\n\n--- Begin %s ---\n%s\n--- End %s ---", block.label, block.label, block.text, block.label)
+}
+
+func (a *App) handlePasteMsg(msg clipboardPasteMsg) (tea.Model, tea.Cmd) {
+	if msg.err != nil || msg.text == "" {
+		return a, nil
+	}
+	if shouldFoldPastedText(msg.text) {
+		label := foldedPasteLabel(a.nextPasteID, pastedLineCount(msg.text))
+		a.nextPasteID++
+		a.pastedBlocks = append(a.pastedBlocks, pastedBlock{label: label, text: msg.text})
+		a.input.InsertAtCursor(label + " ")
+	} else {
+		a.input.InsertAtCursor(msg.text)
+	}
+	return a, nil
+}
+
+func pasteFromClipboard() tea.Cmd {
+	return func() tea.Msg {
+		// Try reading clipboard via the platform tool
+		text, err := readClipboard()
+		if err != nil {
+			return clipboardPasteMsg{err: err}
+		}
+		return clipboardPasteMsg{text: text}
+	}
+}
+
+// readClipboard attempts to read text from the clipboard using platform tools.
+// This is a best-effort implementation that tries PowerShell on Windows.
+func readClipboard() (string, error) {
+	// Use PowerShell Get-Clipboard on Windows
+	cmd := exec.Command("powershell", "-NoProfile", "-Command", "Get-Clipboard")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("clipboard: %w", err)
+	}
+	return strings.TrimRight(string(out), "\r\n"), nil
+}
+
+// copyToClipboard writes text to the clipboard using platform tools.
+func copyToClipboard(text string) tea.Cmd {
+	return func() tea.Msg {
+		// Use PowerShell Set-Clipboard on Windows
+		cmd := exec.Command("powershell", "-NoProfile", "-Command", "Set-Clipboard")
+		cmd.Stdin = strings.NewReader(text)
+		if err := cmd.Run(); err != nil {
+			// Fallback: try clip.exe
+			cmd2 := exec.Command("clip")
+			cmd2.Stdin = strings.NewReader(text)
+			_ = cmd2.Run()
+		}
+		return nil // no message needed; copy is fire-and-forget
+	}
+}
+
+// ── Keyboard ──────────────────────────────────────────────────────────────────
 
 func (a *App) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	ks := msg.String()
 
-	// Approval dialog is modal
 	if a.dialog.Visible() {
 		return a.handleApprovalKey(ks)
 	}
 
-	// Scroll keys work in any state
 	switch ks {
 	case "pgup", "pgdown", "home", "end":
 		a.chat.Update(msg)
 		return a, nil
 	}
 
-	// Global shortcuts
 	switch ks {
 	case "ctrl+c":
+		// If there's a text selection, copy it to clipboard instead of abort/quit
+		if a.chat.HasSelection() {
+			text := a.chat.SelectedText()
+			if text != "" {
+				a.chat.clearSelection()
+				return a, copyToClipboard(text)
+			}
+		}
 		if a.querying {
 			a.agent.Abort()
 			a.chat.AddMessage(ChatMessage{Role: "system", Content: "Aborted"})
 			a.querying = false
+			a.bubblePending = false
 			a.input.Enable()
 			a.reasoningAccum.Reset()
+			a.reasoningOpen = false
 			return a, nil
 		}
-		return a, tea.Quit
+		// Idle: double Ctrl+C quits
+		if strings.TrimSpace(a.input.Value()) != "" {
+			a.input.ClearInput()
+			a.lastCtrlCAt = time.Time{}
+			return a, nil
+		}
+		if !a.lastCtrlCAt.IsZero() && time.Since(a.lastCtrlCAt) < 1500*time.Millisecond {
+			return a, tea.Quit
+		}
+		a.lastCtrlCAt = time.Now()
+		a.chat.AddMessage(ChatMessage{Role: "system", Content: "Press Ctrl+C again to quit"})
+		return a, nil
 
 	case "ctrl+d":
 		return a, tea.Quit
@@ -396,11 +540,14 @@ func (a *App) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+l":
 		a.chat.Clear()
 		a.reasoningAccum.Reset()
+		a.reasoningOpen = false
 		return a, nil
 
-	case "ctrl+o":
-		// Toggle reasoning view (placeholder — just ack)
-		return a, nil
+	case "ctrl+v", "ctrl+shift+v":
+		if a.querying {
+			return a, nil
+		}
+		return a, pasteFromClipboard()
 
 	case "shift+tab":
 		return a.cycleMode()
@@ -409,12 +556,10 @@ func (a *App) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a.handleEsc()
 	}
 
-	// While running, most keys are ignored (except those above)
 	if a.querying {
 		return a, nil
 	}
 
-	// Input handling
 	switch ks {
 	case "enter":
 		return a.handleEnter()
@@ -425,11 +570,53 @@ func (a *App) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case "up":
+		if a.input.CompletionActive() {
+			a.input.MoveCompletion(-1)
+			return a, nil
+		}
 		a.input.RecallPrevious()
 		return a, nil
 
 	case "down":
+		if a.input.CompletionActive() {
+			a.input.MoveCompletion(1)
+			return a, nil
+		}
 		a.input.RecallNext()
+		return a, nil
+
+	case "left":
+		a.input.CursorLeft()
+		a.input.ResetHistoryRecall()
+		return a, nil
+
+	case "right":
+		a.input.CursorRight()
+		a.input.ResetHistoryRecall()
+		return a, nil
+
+	case "ctrl+left":
+		a.input.CursorWordLeft()
+		a.input.ResetHistoryRecall()
+		return a, nil
+
+	case "ctrl+right":
+		a.input.CursorWordRight()
+		a.input.ResetHistoryRecall()
+		return a, nil
+
+	case "home":
+		if a.querying {
+			return a, nil
+		}
+		a.input.CursorHome()
+		return a, nil
+
+	case "end":
+		if a.querying {
+			return a, nil
+		}
+		a.input.CursorEnd()
 		return a, nil
 
 	case "backspace":
@@ -437,49 +624,72 @@ func (a *App) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		a.input.ResetHistoryRecall()
 		return a, nil
 
+	case "delete":
+		a.input.DeleteForward()
+		a.input.ResetHistoryRecall()
+		return a, nil
+
+	case "ctrl+w":
+		a.input.DeleteWordBackward()
+		a.input.ResetHistoryRecall()
+		return a, nil
+
+	case "ctrl+u":
+		a.input.ClearInput()
+		a.input.ResetHistoryRecall()
+		return a, nil
+
 	case "tab":
-		if a.input.CompletionActive() && len(a.input.CompletionItems()) > 0 {
-			a.input.AcceptCompletion()
+		if a.input.CompletionActive() {
+			accepted := a.input.AcceptCompletion()
+			// If this was an @ file directory, refresh completion with new directory content
+			if accepted && a.input.CompletionType() == 2 {
+				a.updateCompletion()
+			}
 			return a, nil
 		}
 		return a, nil
 	}
 
-	// Rune input
 	if len(msg.Runes) > 0 {
 		a.input.ResetHistoryRecall()
 		for _, r := range msg.Runes {
 			a.input.AppendRune(r)
 		}
-		// Update completion if typing /
-		if strings.HasPrefix(a.input.Value(), "/") {
-			a.updateCompletion()
-		}
+		a.updateCompletion()
 		return a, nil
 	}
 
 	return a, nil
 }
 
-// handleEsc implements Reasonix-style Esc state machine:
-//   - Running + pending bubble: unsend (restore text)
-//   - Running: cancel turn
-//   - YOLO mode: exit YOLO
-//   - Plan mode: exit Plan
-//   - Idle, empty input, double-Esc within 600ms: open rewind (future: placeholder)
-//   - Idle, non-empty: clear input
+// handleEsc: Bubble unsend → Cancel → Exit YOLO → Exit Plan → Clear input → Double-Esc
 func (a *App) handleEsc() (tea.Model, tea.Cmd) {
+	if a.querying && a.bubblePending {
+		// Unsend: restore input, pop bubble off transcript, cancel request
+		a.input.SetValue(a.bubbleRestore)
+		a.chat.PopLastMessage()
+		a.querying = false
+		a.bubblePending = false
+		a.input.Enable()
+		a.reasoningAccum.Reset()
+		a.reasoningOpen = false
+		a.agent.Abort()
+		return a, nil
+	}
+
 	if a.querying {
 		a.agent.Abort()
 		a.chat.AddMessage(ChatMessage{Role: "system", Content: "Canceled"})
 		a.querying = false
+		a.bubblePending = false
 		a.input.Enable()
 		a.reasoningAccum.Reset()
+		a.reasoningOpen = false
 		return a, nil
 	}
 
 	if a.mode == modeYOLO {
-		// Back out of YOLO
 		a.mode = modeAuto
 		a.chat.AddMessage(ChatMessage{Role: "system", Content: "Mode: Auto"})
 		return a, nil
@@ -490,13 +700,11 @@ func (a *App) handleEsc() (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 
-	// Idle: clear input
 	if strings.TrimSpace(a.input.Value()) != "" {
 		a.input.ClearInput()
 		return a, nil
 	}
 
-	// Double-Esc on empty input
 	if !a.lastEscAt.IsZero() && time.Since(a.lastEscAt) < 600*time.Millisecond {
 		a.lastEscAt = time.Time{}
 		a.chat.AddMessage(ChatMessage{Role: "system", Content: "Double Esc — rewind (placeholder)"})
@@ -506,7 +714,6 @@ func (a *App) handleEsc() (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
-// cycleMode cycles Auto → Plan → YOLO → Auto, like Shift+Tab in Reasonix.
 func (a *App) cycleMode() (tea.Model, tea.Cmd) {
 	switch a.mode {
 	case modeAuto:
@@ -519,7 +726,6 @@ func (a *App) cycleMode() (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
-// handleApprovalKey handles keys in the approval dialog.
 func (a *App) handleApprovalKey(ks string) (tea.Model, tea.Cmd) {
 	switch ks {
 	case "y", "Y":
@@ -541,34 +747,34 @@ func (a *App) handleApprovalKey(ks string) (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
-// handleEnter processes the Enter key: submits input or handles Alt+Enter.
 func (a *App) handleEnter() (tea.Model, tea.Cmd) {
 	if a.querying {
 		return a, nil
 	}
 
-	val := strings.TrimSpace(a.input.Value())
+	raw := a.input.Value()
+	val := strings.TrimSpace(raw)
 	if val == "" {
 		return a, nil
 	}
 
-	// Save to history
 	a.input.SaveToHistory(val)
+	a.input.ClearInput()
 
-	// Handle /commands
 	if strings.HasPrefix(val, "/") {
-		a.input.ClearInput()
 		return a.handleCommand(val)
 	}
 
-	a.input.ClearInput()
 	a.querying = true
 	a.input.Disable()
 	a.runStart = time.Now()
 	a.runElapsed = 0
-	a.reasoningAccum.Reset()
 
+	// Echo the user bubble immediately (bubble unsend pattern)
 	a.chat.AddMessage(ChatMessage{Role: "user", Content: val})
+	a.bubblePending = true
+	a.bubbleRestore = val
+
 	return a, tea.Batch(a.runAgent(val), elapsedTick())
 }
 
@@ -585,12 +791,12 @@ func (a *App) handleCommand(cmd string) (tea.Model, tea.Cmd) {
 	case "/clear":
 		a.chat.Clear()
 		a.reasoningAccum.Reset()
+		a.reasoningOpen = false
+		a.todoArgs = ""
 		a.agent.Reset()
 		llmProvider := openai.New()
 		a.agent = newAgent(a.cfg, llmProvider)
-		a.agent.Subscribe(func(evt agent.AgentEvent) {
-			a.handleAgentEvent(evt)
-		})
+		a.agent.Subscribe(func(evt agent.AgentEvent) { a.handleAgentEvent(evt) })
 		a.chat.AddMessage(ChatMessage{Role: "system", Content: "Conversation cleared"})
 		return a, nil
 
@@ -601,16 +807,17 @@ func (a *App) handleCommand(cmd string) (tea.Model, tea.Cmd) {
   /model           Show model info
   /compact         Compact context
   /new             New session
+  /todo            Dismiss todo list
   /quit, /exit     Exit
 
 Keys:
   Enter            Send
   Alt+Enter        New line
   ↑/↓              History
-  Ctrl+C           Abort/Quit
-  Ctrl+L           Clear
+  Ctrl+C           Abort (running) / Clear (idle) / Quit (double)
+  Ctrl+L           Clear screen
   Shift+Tab        Cycle mode (Auto→Plan→YOLO)
-  Esc              Back out (5 levels)
+  Esc              Unsend → Cancel → Exit mode → Clear input
   PgUp/PgDn        Scroll`
 		a.chat.AddMessage(ChatMessage{Role: "system", Content: helpText})
 		return a, nil
@@ -626,15 +833,19 @@ Keys:
 		a.chat.AddMessage(ChatMessage{Role: "system", Content: "Context compacted"})
 		return a, nil
 
+	case "/todo":
+		a.todoArgs = ""
+		return a, nil
+
 	case "/new":
 		a.chat.Clear()
 		a.reasoningAccum.Reset()
+		a.reasoningOpen = false
+		a.todoArgs = ""
 		a.agent.Reset()
 		llmProvider := openai.New()
 		a.agent = newAgent(a.cfg, llmProvider)
-		a.agent.Subscribe(func(evt agent.AgentEvent) {
-			a.handleAgentEvent(evt)
-		})
+		a.agent.Subscribe(func(evt agent.AgentEvent) { a.handleAgentEvent(evt) })
 		a.chat.AddMessage(ChatMessage{Role: "system", Content: "New session started"})
 		return a, nil
 
@@ -644,17 +855,16 @@ Keys:
 	}
 }
 
-// ── Agent runner ──────────────────────────────────────────────────────────────
+// ── Agent Runner ──────────────────────────────────────────────────────────────
 
 func (a *App) runAgent(prompt string) tea.Cmd {
 	return func() tea.Msg {
-		queryTimeout := a.cfg.QueryTimeout
-		if queryTimeout <= 0 {
-			queryTimeout = 10 * time.Minute
+		timeout := a.cfg.QueryTimeout
+		if timeout <= 0 {
+			timeout = 10 * time.Minute
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-
 		_, err := a.agent.Run(ctx, prompt)
 		if err != nil {
 			return agentResponseMsg{err: err}
@@ -671,28 +881,248 @@ func elapsedTick() tea.Cmd {
 
 func (a *App) updateCompletion() {
 	val := a.input.Value()
-	if !strings.HasPrefix(val, "/") {
+
+	// Detect @ file path completion
+	if ci := a.shouldCompleteFilePath(); ci != "" {
+		a.updateFileCompletion(ci)
+		return
+	}
+
+	// Detect / command completion
+	if strings.HasPrefix(val, "/") {
+		knownCommands := []CompletionItem{
+			{Label: "/help", Insert: "/help", Hint: "Show help"},
+			{Label: "/clear", Insert: "/clear", Hint: "Clear history"},
+			{Label: "/model", Insert: "/model", Hint: "Show model info"},
+			{Label: "/compact", Insert: "/compact", Hint: "Compact context"},
+			{Label: "/new", Insert: "/new", Hint: "New session"},
+			{Label: "/todo", Insert: "/todo", Hint: "Dismiss todo list"},
+			{Label: "/quit", Insert: "/quit", Hint: "Exit"},
+		}
+
+		prefix := strings.ToLower(val)
+		var matches []CompletionItem
+		for _, item := range knownCommands {
+			if strings.HasPrefix(strings.ToLower(item.Label), prefix) {
+				matches = append(matches, item)
+			}
+		}
+		a.input.SetCompletionItems(matches, 1)
+		return
+	}
+
+	// No completion pattern detected
+	a.input.DismissCompletion()
+}
+
+// shouldCompleteFilePath checks if the cursor is at an @ word boundary.
+// Returns the partial path after @ (e.g. "src/" for "@src/"), or empty.
+func (a *App) shouldCompleteFilePath() string {
+	val := a.input.Value()
+	if a.input.Cursor() == 0 {
+		return ""
+	}
+	// Find the last @ before the cursor
+	runes := []rune(val)
+	cursor := a.input.Cursor()
+	if cursor > len(runes) {
+		cursor = len(runes)
+	}
+	// Scan backwards from cursor to find @ at word boundary
+	for i := cursor - 1; i >= 0; i-- {
+		if runes[i] == '@' {
+			// Check word boundary: start of string or preceded by space
+			if i == 0 || runes[i-1] == ' ' {
+				pathPart := strings.TrimSpace(string(runes[i+1 : cursor]))
+				return pathPart
+			}
+			return ""
+		}
+		if runes[i] == ' ' {
+			// Hit a space before @ — not a valid @ trigger
+			return ""
+		}
+	}
+	return ""
+}
+
+// updateFileCompletion scans the filesystem for path completion.
+func (a *App) updateFileCompletion(partial string) {
+	// Get the working directory for the base path
+	wd, err := os.Getwd()
+	if err != nil {
 		a.input.DismissCompletion()
 		return
 	}
 
-	knownCommands := []CompletionItem{
-		{Label: "/help", Insert: "/help", Hint: "Show help"},
-		{Label: "/clear", Insert: "/clear", Hint: "Clear history"},
-		{Label: "/model", Insert: "/model", Hint: "Show model info"},
-		{Label: "/compact", Insert: "/compact", Hint: "Compact context"},
-		{Label: "/new", Insert: "/new", Hint: "New session"},
-		{Label: "/quit", Insert: "/quit", Hint: "Exit"},
-	}
+	// Determine the directory to scan and the prefix filter
+	searchDir := wd
+	filterPrefix := partial
 
-	prefix := strings.ToLower(val)
-	var matches []CompletionItem
-	for _, item := range knownCommands {
-		if strings.HasPrefix(strings.ToLower(item.Label), prefix) {
-			matches = append(matches, item)
+	if partial != "" {
+		// Separate directory part and file prefix
+		dirPart := filepath.Dir(partial)
+		filePrefix := filepath.Base(partial)
+
+		if filepath.IsAbs(partial) {
+			searchDir = dirPart
+		} else if dirPart != "." && dirPart != "" {
+			searchDir = filepath.Join(wd, dirPart)
+		}
+		// Treat "." and ".." as empty prefix (show everything)
+		if filePrefix == "." || filePrefix == ".." {
+			filterPrefix = ""
+		} else {
+			filterPrefix = filePrefix
 		}
 	}
-	a.input.SetCompletionItems(matches)
+
+	entries, err := os.ReadDir(searchDir)
+	if err != nil {
+		a.input.DismissCompletion()
+		return
+	}
+
+	var items []CompletionItem
+	for _, entry := range entries {
+		name := entry.Name()
+		// Skip hidden files and directories
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		// Apply prefix filter
+		if filterPrefix != "" && !strings.HasPrefix(strings.ToLower(name), strings.ToLower(filterPrefix)) {
+			continue
+		}
+
+		isDir := entry.IsDir()
+
+		// Build the full relative path for insertion
+		var insertPath string
+		if partial == "" {
+			insertPath = "@" + name
+		} else {
+			// Replace the last path component
+			dirPart := filepath.Dir(partial)
+			if dirPart == "." || dirPart == "" {
+				insertPath = "@" + name
+			} else {
+				insertPath = "@" + filepath.ToSlash(filepath.Join(dirPart, name))
+			}
+		}
+
+		hint := ""
+		if isDir {
+			hint = "dir"
+		} else {
+			// Add file extension as hint
+			if ext := filepath.Ext(name); ext != "" {
+				hint = ext
+			}
+		}
+
+		items = append(items, CompletionItem{
+			Label:       name,
+			Insert:      insertPath,
+			Hint:        hint,
+			IsDirectory: isDir,
+		})
+	}
+
+	// Sort: directories first, then files, alphabetically within each group
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].IsDirectory != items[j].IsDirectory {
+			return items[i].IsDirectory // directories first
+		}
+		return strings.ToLower(items[i].Label) < strings.ToLower(items[j].Label)
+	})
+
+	// Limit to 50 items
+	if len(items) > 50 {
+		items = items[:50]
+	}
+
+	a.input.SetCompletionItems(items, 2)
+}
+
+// ── Todo Panel ────────────────────────────────────────────────────────────────
+
+type todoItem struct {
+	Content    string `json:"content"`
+	Status     string `json:"status"`
+	ActiveForm string `json:"activeForm"`
+	Level      int    `json:"level"`
+}
+
+type todoPayload struct {
+	Todos []todoItem `json:"todos"`
+}
+
+func (a *App) parseTodos() []todoItem {
+	var p todoPayload
+	if err := json.Unmarshal([]byte(a.todoArgs), &p); err != nil {
+		return nil
+	}
+	return p.Todos
+}
+
+func allTodosDone(todos []todoItem) bool {
+	for _, t := range todos {
+		if t.Status != "completed" {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *App) renderTodoPanel() string {
+	todos := a.parseTodos()
+	if len(todos) == 0 {
+		return ""
+	}
+	done := 0
+	for _, t := range todos {
+		if t.Status == "completed" {
+			done++
+		}
+	}
+	if done == len(todos) {
+		a.todoArgs = ""
+		return ""
+	}
+
+	var b strings.Builder
+	header := todoHeaderStyle.Render(fmt.Sprintf("To-dos %d/%d", done, len(todos)))
+	b.WriteString(header)
+	b.WriteString("\n")
+
+	shown := 0
+	maxShow := 8
+
+	for _, t := range todos {
+		if shown >= maxShow {
+			b.WriteString(todoDimStyle.Render(fmt.Sprintf("  +%d more", len(todos)-shown)) + "\n")
+			break
+		}
+		shown++
+		indent := "  "
+		if t.Level >= 1 {
+			indent = "      "
+		}
+		switch t.Status {
+		case "completed":
+			b.WriteString(indent + todoGreenStyle.Render("✔") + " " + todoDimStyle.Render(t.Content) + "\n")
+		case "in_progress":
+			label := t.Content
+			if t.ActiveForm != "" {
+				label = t.ActiveForm
+			}
+			b.WriteString(indent + todoYellowStyle.Render("▶") + " " + todoYellowStyle.Render(label) + "\n")
+		default:
+			b.WriteString(indent + todoDimStyle.Render("○ "+t.Content) + "\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // ── View ──────────────────────────────────────────────────────────────────────
@@ -707,13 +1137,11 @@ func (a *App) View() string {
 		boxW = 10
 	}
 
-	// Title bar
+	// Title + separator (2 rows)
 	title := TitleStyle.Render("Crux Agent TUI")
-	sep := lipgloss.NewStyle().
-		Foreground(ColorBorder).
-		Render(strings.Repeat("─", boxW))
+	sep := separatorStyle.Render(strings.Repeat("─", boxW))
 
-	// Mode tag (pill)
+	// Mode pill
 	var modeTag string
 	switch a.mode {
 	case modeAuto:
@@ -724,37 +1152,83 @@ func (a *App) View() string {
 		modeTag = PillYOLOStyle.Render("YOLO")
 	}
 
-	// Status line (row 1): mode pill + state + hints
+	// Status line
 	var statusText string
 	switch {
+	case a.querying && a.bubblePending:
+		statusText = fmt.Sprintf("%s · sending…", modeTag)
 	case a.querying:
-		spinner := spinnerFrame(a.runElapsed)
-		statusText = fmt.Sprintf("%s · %s thinking · %ds", modeTag, spinner, a.runElapsed)
+		sp := spinnerFrame(a.runElapsed)
+		statusText = fmt.Sprintf("%s · %s thinking · %ds", modeTag, sp, a.runElapsed)
 	default:
-		statusText = fmt.Sprintf("%s · ready (%s)", modeTag, dimLine("Shift+Tab to cycle"))
+		statusText = fmt.Sprintf("%s · ready (%s)", modeTag, dimLine("Shift+Tab to cycle, double Ctrl+C to quit"))
 	}
 
-	// Data line (row 2): model info
+	// Data line (model, context usage, messages, etc.)
 	modelInfo := fmt.Sprintf("%s · %s", dimLine(a.cfg.ProviderName), dimLine(a.cfg.ModelID))
+
+	// Context usage
+	ctxInfo := a.agent.ContextInfo()
+	msgCount := a.agent.MessageCount()
+	if ctxInfo != "" {
+		modelInfo += " · " + dimLine(ctxInfo)
+	}
+	if msgCount > 0 {
+		modelInfo += " · " + dimLine(fmt.Sprintf("%d msgs", msgCount))
+	}
+
 	modeInfo := ""
 	switch a.mode {
 	case modePlan:
-		modeInfo = dimLine(" · plan mode: read-only")
+		modeInfo = dimLine(" · plan: read-only")
 	case modeYOLO:
-		modeInfo = lipgloss.NewStyle().Foreground(ColorDanger).Render(" · approvals: skipped")
+		modeInfo = modeYOLOInfoStyle.Render(" · approvals: skipped")
 	}
 
-	// Working spinner line (shown above input when running)
+	// Working spinner above input
 	var workingLine string
 	if a.querying {
-		workingLine = lipgloss.NewStyle().Foreground(ColorMuted).Padding(0, 1).
-			Render(fmt.Sprintf(" %s agent working…", spinnerFrame(a.runElapsed)))
+		workingLine = workingStyle.Render(fmt.Sprintf(" %s agent working…", spinnerFrame(a.runElapsed)))
 	}
 
-	// Input box
+	// Todo panel (pinned above input)
+	todoPanel := a.renderTodoPanel()
+
+	// Completion menu (above input box)
+	completionMenu := a.input.RenderCompletionMenu()
+
+	// Input
 	inputBox := a.input.View()
 
-	// Chat area
+	// Layout: compute row positions so ChatView knows its Y offset for mouse
+	// Row 0: title
+	// Row 1: separator
+	// Row 2...: ChatView (variable height)
+	// After chat: workingLine (1), todoPanel (variable), completionMenu (N), inputBox (N rows), status (1), data (1)
+	bottomRows := 0
+	if workingLine != "" {
+		bottomRows++ // working line
+	}
+	if todoPanel != "" {
+		bottomRows += strings.Count(todoPanel, "\n") + 1
+	}
+	if completionMenu != "" {
+		bottomRows += strings.Count(completionMenu, "\n") + 1
+	}
+	bottomRows += a.input.VisibleRows() // input box (dynamic height)
+	bottomRows += 2                     // status + data lines
+
+	chatHeight := a.height - 2 - bottomRows // 2 = title + separator
+	if chatHeight < 5 {
+		chatHeight = 5
+	}
+	a.chat.SetSize(boxW, chatHeight)
+
+	// Set transcript Y offset for mouse coordinate mapping
+	transcriptY := 2 // title (1) + separator (1)
+	a.chat.SetTranscriptY(transcriptY)
+
+	// Chat content (now includes scrollbar)
 	chatContent := a.chat.View()
 
 	// Build full layout
@@ -766,9 +1240,16 @@ func (a *App) View() string {
 	b.WriteString(chatContent)
 	b.WriteString("\n")
 
-	// Bottom region: working line + input + status line + data line
 	if workingLine != "" {
 		b.WriteString(workingLine)
+		b.WriteString("\n")
+	}
+	if todoPanel != "" {
+		b.WriteString(todoPanel)
+		b.WriteString("\n")
+	}
+	if completionMenu != "" {
+		b.WriteString(completionMenu)
 		b.WriteString("\n")
 	}
 	b.WriteString(inputBox)
@@ -782,15 +1263,12 @@ func (a *App) View() string {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// spinnerFrame returns a simple spinner character based on elapsed time.
 func spinnerFrame(elapsed int) string {
 	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-	return lipgloss.NewStyle().Foreground(ColorAccent).Render(frames[elapsed%len(frames)])
+	return spinnerStyle.Render(frames[elapsed%len(frames)])
 }
 
-// extractPrimaryArg extracts a human-readable primary argument from a tool call.
 func extractPrimaryArg(name, rawArgs string) string {
-	// Simple extraction — just use the raw args trimmed
 	arg := strings.TrimSpace(rawArgs)
 	if len(arg) > 60 {
 		arg = arg[:60] + "…"
