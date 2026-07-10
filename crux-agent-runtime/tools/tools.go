@@ -1,9 +1,12 @@
 // Package tools provides built-in tools for the agent.
 //
+// All tools are cross-platform (Windows / Linux / macOS). Each tool's
+// description and behavior adapts to the current OS at runtime.
+//
 // Available tools:
 //   - read_file  - read file contents (with optional line range)
 //   - write_file - create or overwrite a file
-//   - bash       - run a shell command
+//   - bash       - run a shell command (PowerShell on Windows, sh on Unix)
 //   - glob       - list files matching a pattern
 //   - grep       - search file contents
 //   - web_fetch  - fetch a URL and return plain text content

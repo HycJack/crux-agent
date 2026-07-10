@@ -26,6 +26,14 @@ export function GetCompactionStatus() {
   return window['go']['main']['App']['GetCompactionStatus']();
 }
 
+export function GetFileTree() {
+  return window['go']['main']['App']['GetFileTree']();
+}
+
+export function GetFileTreeExpanded() {
+  return window['go']['main']['App']['GetFileTreeExpanded']();
+}
+
 export function GetMemories() {
   return window['go']['main']['App']['GetMemories']();
 }
@@ -64,6 +72,14 @@ export function LoadSettings() {
 
 export function PickWorkingDir() {
   return window['go']['main']['App']['PickWorkingDir']();
+}
+
+export function ReadDir(arg1) {
+  return window['go']['main']['App']['ReadDir'](arg1);
+}
+
+export function ReadFileContent(arg1) {
+  return window['go']['main']['App']['ReadFileContent'](arg1);
 }
 
 export function ReloadSkills(arg1) {

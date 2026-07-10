@@ -44,7 +44,7 @@ const bashSchema = `{
 	"properties": {
 		"command": { "type": "string", "description": "Shell command to run." },
 		"timeout": { "type": "integer", "description": "Maximum runtime in milliseconds (default 30000)." },
-		"shell":   { "type": "string", "description": "Override the shell binary. 'auto' picks cmd.exe on Windows and sh elsewhere.", "enum": ["auto", "cmd", "powershell", "bash", "sh"] }
+		"shell":   { "type": "string", "description": "Override the shell. 'auto' picks powershell.exe on Windows and sh on Unix.", "enum": ["auto", "cmd", "powershell", "bash", "sh"] }
 	},
 	"required": ["command"]
 }`
@@ -52,11 +52,35 @@ const bashSchema = `{
 // DefaultBashTimeout is the default max-runtime for a single bash call.
 const DefaultBashTimeout = 30 * time.Second
 
+// bashDescription returns a platform-aware tool description so the LLM
+// knows which shell and commands are available.
+func bashDescription() string {
+	switch runtime.GOOS {
+	case "windows":
+		return `Run a shell command and return stdout, stderr, and exit code.
+
+CURRENT OS: Windows.
+- Default shell: PowerShell. Most Unix commands (ls=Get-ChildItem, cat=Get-Content, pwd=Get-Location, rm=Remove-Item, cp=Copy-Item, mv=Move-Item) work via PowerShell aliases.
+- Use '.\' prefix for executables in the current directory.
+- System drive is typically C:\ and paths use backslashes.
+- Environment variables: $env:VAR_NAME (PowerShell) or %VAR_NAME% (cmd).
+- To use cmd.exe exclusively, set shell="cmd".`
+	default:
+		return `Run a shell command and return stdout, stderr, and exit code.
+
+CURRENT OS: Unix (Linux/macOS).
+- Default shell: sh (POSIX).
+- Standard Unix commands (ls, cat, grep, find, git, etc.) are available.
+- Use ./ prefix for executables in the current directory.
+- Environment variables: $VAR_NAME.`
+	}
+}
+
 // Bash returns the bash tool.
 func Bash() agent.AgentTool {
 	return agent.AgentTool{
 		Name:        "bash",
-		Description: "Run a shell command and return stdout, stderr, and exit code.",
+		Description: bashDescription(),
 		Parameters:  mustSchema(bashSchema),
 		Execute:     executeBash,
 	}
@@ -145,7 +169,7 @@ func executeBash(ctx context.Context, toolCallID string, params json.RawMessage,
 func pickShell(name, goos string) (binary string, prefix []string) {
 	if name == "" || name == "auto" {
 		if goos == "windows" {
-			return "cmd.exe", []string{"/c"}
+			return "powershell.exe", []string{"-NoProfile", "-Command"}
 		}
 		return "sh", []string{"-c"}
 	}
@@ -153,7 +177,7 @@ func pickShell(name, goos string) (binary string, prefix []string) {
 	case "cmd":
 		return "cmd.exe", []string{"/c"}
 	case "powershell":
-		return "powershell", []string{"-NoProfile", "-Command"}
+		return "powershell.exe", []string{"-NoProfile", "-Command"}
 	case "bash":
 		return "bash", []string{"-c"}
 	case "sh":

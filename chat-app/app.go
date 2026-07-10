@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	stdruntime "runtime"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -331,6 +335,365 @@ func (a *App) GetCompactionStatus() string {
 	c := agt.Compaction()
 	return fmt.Sprintf("MaxTokens: %d, ReserveTokens: %d, OverflowRetries: %d, Compactor: %T",
 		c.MaxTokens, c.ReserveTokens, c.OverflowRetries, c.Compactor)
+}
+
+// -------------------- File tree & preview API --------------------
+
+// FileNode represents a single entry in the file tree.
+type FileNode struct {
+	Name     string     `json:"name"`
+	Path     string     `json:"path"`
+	IsDir    bool       `json:"isDir"`
+	Size     int64      `json:"size,omitempty"`
+	Children []FileNode `json:"children,omitempty"`
+}
+
+// GetFileTree returns a recursive file tree rooted at the working directory.
+// It skips common ignore files (node_modules, .git, etc.) for performance.
+func (a *App) GetFileTree() (FileNode, error) {
+	root := a.GetWorkingDir()
+	if root == "" {
+		return FileNode{}, fmt.Errorf("working directory not set")
+	}
+
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return FileNode{}, fmt.Errorf("cannot access working directory: %w", err)
+	}
+
+	rootName := filepath.Base(root)
+	if rootName == "" {
+		rootName = root
+	}
+
+	return FileNode{
+		Name:  rootName,
+		Path:  root,
+		IsDir: true,
+		Size:  rootInfo.Size(),
+	}, nil
+}
+
+// shouldSkipDir returns true for directories that should not be traversed.
+func shouldSkipDir(name string) bool {
+	switch name {
+	case "node_modules", ".git", ".svn", ".hg", ".idea", ".vscode",
+		"__pycache__", ".next", ".turbo", "dist", "build", ".cache",
+		"target", "vendor", ".tox", ".eggs", ".mypy_cache", ".pytest_cache":
+		return true
+	}
+	return false
+}
+
+// shouldSkipFile returns true for files that should be excluded from the tree.
+func shouldSkipFile(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.HasSuffix(lower, ".pyc") || strings.HasSuffix(lower, ".pyo")
+}
+
+// maxTreeDepth defines how deep the file tree can go to avoid performance issues.
+const maxTreeDepth = 6
+
+// readDirRecursive recursively reads a directory up to a given depth.
+func readDirRecursive(dir string, depth int) ([]FileNode, error) {
+	if depth > maxTreeDepth {
+		return nil, nil
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	// Sort: directories first, then files, both alphabetical
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].IsDir() != entries[j].IsDir() {
+			return entries[i].IsDir()
+		}
+		return strings.ToLower(entries[i].Name()) < strings.ToLower(entries[j].Name())
+	})
+
+	nodes := make([]FileNode, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") {
+			continue // skip hidden files/dirs
+		}
+		if entry.IsDir() && shouldSkipDir(name) {
+			continue
+		}
+		if !entry.IsDir() && shouldSkipFile(name) {
+			continue
+		}
+
+		fullPath := filepath.Join(dir, name)
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		node := FileNode{
+			Name:  name,
+			Path:  fullPath,
+			IsDir: entry.IsDir(),
+			Size:  info.Size(),
+		}
+
+		if entry.IsDir() {
+			children, err := readDirRecursive(fullPath, depth+1)
+			if err == nil {
+				node.Children = children
+			}
+		}
+
+		nodes = append(nodes, node)
+	}
+
+	return nodes, nil
+}
+
+// GetFileTreeExpanded returns a fully expanded file tree for the working directory.
+func (a *App) GetFileTreeExpanded() (FileNode, error) {
+	root := a.GetWorkingDir()
+	if root == "" {
+		return FileNode{}, fmt.Errorf("working directory not set")
+	}
+
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return FileNode{}, fmt.Errorf("cannot access working directory: %w", err)
+	}
+
+	rootName := filepath.Base(root)
+	if rootName == "" {
+		rootName = root
+	}
+
+	children, err := readDirRecursive(root, 0)
+	if err != nil {
+		return FileNode{}, fmt.Errorf("read directory: %w", err)
+	}
+
+	return FileNode{
+		Name:     rootName,
+		Path:     root,
+		IsDir:    true,
+		Size:     rootInfo.Size(),
+		Children: children,
+	}, nil
+}
+
+// FileContent is the result of reading a file.
+type FileContent struct {
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	Content  string `json:"content"`
+	Size     int64  `json:"size"`
+	IsBinary bool   `json:"isBinary"`
+	Encoding string `json:"encoding,omitempty"` // "base64" for binary files
+}
+
+// maxPreviewSize is the maximum file size (in bytes) we'll attempt to preview.
+const maxPreviewSize int64 = 50 * 1024 * 1024 // 50 MB
+
+// textExtensions lists extensions that should be treated as text files.
+var textExtensions = map[string]bool{
+	".txt": true, ".md": true, ".markdown": true, ".html": true, ".htm": true,
+	".css": true, ".scss": true, ".less": true, ".js": true, ".jsx": true,
+	".ts": true, ".tsx": true, ".json": true, ".xml": true, ".yaml": true,
+	".yml": true, ".toml": true, ".ini": true, ".cfg": true, ".conf": true,
+	".go": true, ".py": true, ".rs": true, ".java": true, ".c": true,
+	".cpp": true, ".h": true, ".hpp": true, ".cs": true, ".rb": true,
+	".php": true, ".swift": true, ".kt": true, ".scala": true, ".sh": true,
+	".bat": true, ".ps1": true, ".env": true, ".gitignore": true,
+	".dockerfile": true, ".vue": true, ".svelte": true, ".astro": true,
+	".sql": true, ".r": true, ".pl": true, ".lua": true, ".dart": true,
+	".proto": true, ".gradle": true, ".mjs": true, ".cjs": true,
+	".makefile": true, "makefile": true, "dockerfile": true,
+}
+
+var previewExtensions = map[string]bool{
+	".pdf": true, ".docx": true, ".pptx": true, ".xlsx": true,
+}
+
+// isTextFile checks if the file extension is a known text format.
+func isTextFile(ext string) bool {
+	return textExtensions[strings.ToLower(ext)]
+}
+
+// isPreviewFile checks if the file can be previewed with special viewers.
+func isPreviewFile(ext string) bool {
+	return previewExtensions[strings.ToLower(ext)]
+}
+
+// ReadFileContent reads the content of a file from the working directory.
+// It returns base64-encoded content for binary files and plain text for text files.
+func (a *App) ReadFileContent(filePath string) (*FileContent, error) {
+	wd := a.GetWorkingDir()
+	if wd == "" {
+		return nil, fmt.Errorf("working directory not set")
+	}
+
+	// Security: ensure the path is within the working directory
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid path: %w", err)
+	}
+
+	// Resolve symlinks to their real path before checking
+	realPath := absPath
+	if resolved, err := filepath.EvalSymlinks(absPath); err == nil {
+		realPath = resolved
+	}
+
+	wdAbs, _ := filepath.Abs(wd)
+	if !strings.HasPrefix(realPath, wdAbs) {
+		return nil, fmt.Errorf("access denied: file is outside working directory")
+	}
+
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot access file: %w", err)
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("path is a directory, not a file")
+	}
+
+	// Check file size
+	if info.Size() > maxPreviewSize {
+		return nil, fmt.Errorf("file too large to preview (%d MB)", info.Size()/(1024*1024))
+	}
+
+	f, err := os.Open(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open file: %w", err)
+	}
+	defer f.Close()
+
+	ext := strings.ToLower(filepath.Ext(absPath))
+
+	// If it's a text file, read as text
+	if isTextFile(ext) || isPreviewFile(ext) {
+		data, err := io.ReadAll(f)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read file: %w", err)
+		}
+		return &FileContent{
+			Name:     info.Name(),
+			Path:     absPath,
+			Content:  string(data),
+			Size:     info.Size(),
+			IsBinary: false,
+		}, nil
+	}
+
+	// Try reading a small portion to detect if it's text
+	header := make([]byte, 512)
+	n, _ := f.Read(header)
+	header = header[:n]
+
+	// Simple binary detection: check for null bytes
+	isBinary := false
+	for _, b := range header {
+		if b == 0 {
+			isBinary = true
+			break
+		}
+	}
+
+	if !isBinary {
+		// Read the whole file as text
+		f.Seek(0, 0)
+		data, err := io.ReadAll(f)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read file: %w", err)
+		}
+		return &FileContent{
+			Name:     info.Name(),
+			Path:     absPath,
+			Content:  string(data),
+			Size:     info.Size(),
+			IsBinary: false,
+		}, nil
+	}
+
+	// Binary file: read and base64 encode (limit to 10MB for binary preview)
+	readSize := info.Size()
+	if readSize > 10*1024*1024 {
+		readSize = 10 * 1024 * 1024
+	}
+	f.Seek(0, 0)
+	data := make([]byte, readSize)
+	_, err = io.ReadFull(f, data)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return nil, fmt.Errorf("cannot read binary file: %w", err)
+	}
+
+	return &FileContent{
+		Name:     info.Name(),
+		Path:     absPath,
+		Content:  base64.StdEncoding.EncodeToString(data),
+		Size:     info.Size(),
+		IsBinary: true,
+		Encoding: "base64",
+	}, nil
+}
+
+// ReadDir reads the immediate children of a directory.
+func (a *App) ReadDir(dirPath string) ([]FileNode, error) {
+	wd := a.GetWorkingDir()
+	if wd == "" {
+		return nil, fmt.Errorf("working directory not set")
+	}
+
+	// Security check
+	absPath, err := filepath.Abs(dirPath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid path: %w", err)
+	}
+	wdAbs, _ := filepath.Abs(wd)
+	if !strings.HasPrefix(absPath, wdAbs) {
+		return nil, fmt.Errorf("access denied: directory is outside working directory")
+	}
+
+	entries, err := os.ReadDir(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read directory: %w", err)
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].IsDir() != entries[j].IsDir() {
+			return entries[i].IsDir()
+		}
+		return strings.ToLower(entries[i].Name()) < strings.ToLower(entries[j].Name())
+	})
+
+	nodes := make([]FileNode, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		if entry.IsDir() && shouldSkipDir(name) {
+			continue
+		}
+
+		fullPath := filepath.Join(absPath, name)
+		info, _ := entry.Info()
+		size := int64(0)
+		if info != nil {
+			size = info.Size()
+		}
+
+		nodes = append(nodes, FileNode{
+			Name:  name,
+			Path:  fullPath,
+			IsDir: entry.IsDir(),
+			Size:  size,
+		})
+	}
+
+	return nodes, nil
 }
 
 // -------------------- Auto-learn management --------------------

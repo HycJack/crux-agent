@@ -6,6 +6,9 @@ import {
   GetWorkingDir,
   LoadConversations,
   LoadSettings,
+  ReadFileContent as ReadFileContentBackend,
+  GetFileTreeExpanded as GetFileTreeExpandedBackend,
+  ReadDir as ReadDirBackend,
   ResetAgent,
   SaveConversations,
   SaveSettings,
@@ -15,10 +18,12 @@ import {
 } from '../wailsjs/go/main/App';
 import { EventsOff, EventsOn } from '../wailsjs/runtime/runtime';
 import ChatArea from './components/ChatArea';
+import FilePreviewPanel from './components/FilePreviewPanel';
+import FileTreePanel from './components/FileTreePanel';
 import SettingsPanel from './components/SettingsPanel';
 import Sidebar from './components/Sidebar';
 import type { Conversation, Message, Settings, ToolExecution } from './types';
-import { MenuOutlined } from './icons';
+import { FolderIcon, MenuOutlined } from './icons';
 
 interface ModelInfo {
   id: string;
@@ -70,6 +75,16 @@ function formatTimestamp(date: Date) {
   return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
 }
 
+/**
+ * Trim a tool result to the first and last N characters, with a middle
+ * truncation marker. This drastically reduces token consumption while
+ * preserving the head (what was produced) and tail (errors / final lines).
+ */
+function trimToolResult(text: string, keep: number = 200): string {
+  if (!text || text.length <= keep * 2 + 20) return text || '';
+  return text.slice(0, keep) + `\n\n[... ${text.length - keep * 2} bytes omitted ...]\n\n` + text.slice(-keep);
+}
+
 // updateLastAssistant returns a new conversation with the last assistant
 // message mutated via mutator. If the last message isn't from the assistant,
 // the conversation is returned unchanged. Used by every stream handler —
@@ -99,6 +114,8 @@ function App() {
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
   const [hasLoaded, setHasLoaded] = useState(false);
   const [models, setModels] = useState<ModelInfo[]>([]);
+  const [showFileExplorer, setShowFileExplorer] = useState(false);
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
 
   const currentUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const activeIdRef = useRef<string | null>(null);
@@ -507,22 +524,26 @@ function App() {
       // Use the override model from chat input, or the setting's model
       const finalModel = modelOverride || (settings.model === 'custom' ? settings.customModel : settings.model);
 
-      // Build conversation history for context restoration
-      // Include tool calls and tool results so the LLM sees the full context
+      // Build conversation history for context restoration.
+      // To save token space, tool calls and results are embedded into the
+      // assistant message text instead of emitting separate "tool" role
+      // messages. Each tool result is trimmed to the first/last N chars.
       const targetConv = conversations.find((c) => c.id === targetId);
       const historyMessages: Record<string, unknown>[] = targetConv?.messages.flatMap((m) => {
-        const base: Record<string, unknown> = { role: m.role, content: m.content };
-        if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
-          const toolResults = (m.toolExecutions || []).map((te) => ({
-            role: 'tool',
-            content: te.result || '',
-            toolCallId: te.id,
-            toolName: te.name,
-            isError: te.isError || false,
-          }));
-          return [{ ...base, toolCalls: m.toolCalls }, ...toolResults];
+        if (m.role !== 'assistant') {
+          return [{ role: m.role, content: m.content }];
         }
-        return [base];
+        // Build an assistant message that inlines tool execution summaries.
+        let content = m.content;
+        if (m.toolCalls && m.toolCalls.length > 0) {
+          const summaries = (m.toolExecutions || []).map((te, i) => {
+            const tc = m.toolCalls![i];
+            const trimmed = trimToolResult(te.result || '');
+            return `[Tool: ${te.name}]${te.isError ? ' (error)' : ''}\nArgs: ${tc.arguments}\nResult: ${trimmed}`;
+          });
+          content = content ? `${content}\n\n${summaries.join('\n\n')}` : summaries.join('\n\n');
+        }
+        return [{ role: 'assistant', content }];
       }) ?? [];
 
       try {
@@ -582,15 +603,27 @@ function App() {
     setSettings((prev) => ({ ...prev, thinkingLevel: level }));
   }, []);
 
+  const handleSelectFile = useCallback((path: string) => {
+    setSelectedFile(path);
+    setShowFileExplorer(true);
+  }, []);
+
+  const handleClosePreview = useCallback(() => {
+    setSelectedFile(null);
+  }, []);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         setIsSettingsOpen(false);
+        if (selectedFile) {
+          setSelectedFile(null);
+        }
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, []);
+  }, [selectedFile]);
 
   return (
     <div className={`app-shell${sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
@@ -637,25 +670,75 @@ function App() {
           </div>
         </header>
 
-        <ChatArea
-          messages={activeConversation?.messages ?? []}
-          isLoading={isLoading}
-          onSendMessage={handleSendMessage}
-          onStop={() => {
-            CancelStream().catch(() => undefined);
-            setIsLoading(false);
-            streamingIdRef.current = null;
-          }}
-          onSpeak={speakText}
-          onStopSpeak={stopSpeaking}
-          speakingMessageId={speakingMessageId}
-          workingDir={settings.workingDir}
-          models={models}
-          currentModel={settings.model === 'custom' ? settings.customModel : settings.model}
-          currentThinkingLevel={settings.thinkingLevel ?? ''}
-          onModelChange={handleModelChange}
-          onThinkingLevelChange={handleThinkingLevelChange}
-        />
+        <div className="main-body">
+          <div className="main-chat">
+            <ChatArea
+              messages={activeConversation?.messages ?? []}
+              isLoading={isLoading}
+              onSendMessage={handleSendMessage}
+              onStop={() => {
+                CancelStream().catch(() => undefined);
+                setIsLoading(false);
+                streamingIdRef.current = null;
+              }}
+              onSpeak={speakText}
+              onStopSpeak={stopSpeaking}
+              speakingMessageId={speakingMessageId}
+              workingDir={settings.workingDir}
+              models={models}
+              currentModel={settings.model === 'custom' ? settings.customModel : settings.model}
+              currentThinkingLevel={settings.thinkingLevel ?? ''}
+              onModelChange={handleModelChange}
+              onThinkingLevelChange={handleThinkingLevelChange}
+            />
+          </div>
+
+          <div className={`main-explorer-sidebar ${showFileExplorer ? 'expanded' : ''}`}>
+            <button
+              className="main-explorer-toggle"
+              onClick={() => setShowFileExplorer((p) => !p)}
+              title={showFileExplorer ? 'Collapse file explorer' : 'Expand file explorer'}
+              aria-label="Toggle file explorer"
+            >
+              <span className="main-explorer-toggle-icon">
+                <FolderIcon size={16} />
+              </span>
+              <span className="main-explorer-toggle-text">Files</span>
+            </button>
+            <div className="main-explorer-content">
+              <div className="main-explorer-tabs">
+                <button
+                  className={`main-explorer-tab ${!selectedFile ? 'active' : ''}`}
+                  onClick={() => setSelectedFile(null)}
+                >
+                  Files
+                </button>
+                {selectedFile && (
+                  <button className="main-explorer-tab active">
+                    Preview
+                  </button>
+                )}
+              </div>
+              <div className="main-explorer-body">
+                {selectedFile ? (
+                  <FilePreviewPanel
+                    filePath={selectedFile}
+                    readFileContent={ReadFileContentBackend}
+                    onClose={handleClosePreview}
+                  />
+                ) : (
+                  <FileTreePanel
+                    workingDir={settings.workingDir}
+                    onSelectFile={handleSelectFile}
+                    selectedFile={selectedFile}
+                    getFileTreeExpanded={GetFileTreeExpandedBackend}
+                    readDir={ReadDirBackend}
+                  />
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
       </main>
 
       <SettingsPanel

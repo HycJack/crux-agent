@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"crux-agent-runtime/agent"
@@ -20,11 +21,19 @@ const globSchema = `{
 	"required": ["pattern"]
 }`
 
+// globDescription returns a platform-aware description.
+func globDescription() string {
+	if runtime.GOOS == "windows" {
+		return "List files matching a glob pattern. Use backslash paths. Supports standard glob patterns like *.go, **/*.txt."
+	}
+	return "List files matching a glob pattern. Supports standard glob patterns like *.go, **/*.txt."
+}
+
 // Glob returns the glob tool.
 func Glob() agent.AgentTool {
 	return agent.AgentTool{
 		Name:        "glob",
-		Description: "List files matching a glob pattern.",
+		Description: globDescription(),
 		Parameters:  mustSchema(globSchema),
 		Execute:     executeGlob,
 	}

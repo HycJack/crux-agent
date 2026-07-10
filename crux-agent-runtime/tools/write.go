@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"crux-agent-runtime/agent"
 )
@@ -20,11 +21,19 @@ const writeSchema = `{
 	"required": ["filePath", "content"]
 }`
 
+// writeDescription returns a platform-aware description.
+func writeDescription() string {
+	if runtime.GOOS == "windows" {
+		return "Create or overwrite a file. Use Windows backslash paths. Optionally append to existing file."
+	}
+	return "Create or overwrite a file. Optionally append to existing file."
+}
+
 // Write returns the write_file tool.
 func Write() agent.AgentTool {
 	return agent.AgentTool{
 		Name:        "write_file",
-		Description: "Create or overwrite a file. Optionally append to existing file.",
+		Description: writeDescription(),
 		Parameters:  mustSchema(writeSchema),
 		Execute:     executeWrite,
 	}

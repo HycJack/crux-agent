@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 
 	"crux-agent-runtime/agent"
@@ -24,11 +25,19 @@ const grepSchema = `{
 	"required": ["pattern"]
 }`
 
+// grepDescription returns a platform-aware description.
+func grepDescription() string {
+	if runtime.GOOS == "windows" {
+		return "Search file contents for a pattern (substring or regex). Uses Go built-in file search (no external grep command). Use backslash paths."
+	}
+	return "Search file contents for a pattern (substring or regex). Uses Go built-in file search (no external grep command)."
+}
+
 // Grep returns the grep tool.
 func Grep() agent.AgentTool {
 	return agent.AgentTool{
 		Name:        "grep",
-		Description: "Search file contents for a pattern (substring or regex).",
+		Description: grepDescription(),
 		Parameters:  mustSchema(grepSchema),
 		Execute:     executeGrep,
 	}

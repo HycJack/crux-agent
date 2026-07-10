@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"crux-agent-runtime/agent"
@@ -21,11 +22,19 @@ const readSchema = `{
 	"required": ["filePath"]
 }`
 
+// readDescription returns a platform-aware description.
+func readDescription() string {
+	if runtime.GOOS == "windows" {
+		return "Read the contents of a file. Use Windows backslash paths (e.g. C:\\Users\\file.txt or relative paths). Optionally limit by offset/line."
+	}
+	return "Read the contents of a file. Optionally limit by offset/line."
+}
+
 // Read returns the read_file tool.
 func Read() agent.AgentTool {
 	return agent.AgentTool{
 		Name:        "read_file",
-		Description: "Read the contents of a file. Optionally limit by offset/line.",
+		Description: readDescription(),
 		Parameters:  mustSchema(readSchema),
 		Execute:     executeRead,
 	}

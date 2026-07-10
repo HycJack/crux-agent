@@ -14,6 +14,10 @@ export function GetAutoLearnEnabled():Promise<boolean>;
 
 export function GetCompactionStatus():Promise<string>;
 
+export function GetFileTree():Promise<main.FileNode>;
+
+export function GetFileTreeExpanded():Promise<main.FileNode>;
+
 export function GetMemories():Promise<Record<string, string>>;
 
 export function GetModels(arg1:Record<string, any>):Promise<Array<main.ModelInfo>>;
@@ -33,6 +37,10 @@ export function LoadConversations():Promise<Array<main.PersistedConversation>>;
 export function LoadSettings():Promise<main.PersistedSettings>;
 
 export function PickWorkingDir():Promise<string>;
+
+export function ReadDir(arg1:string):Promise<Array<main.FileNode>>;
+
+export function ReadFileContent(arg1:string):Promise<main.FileContent>;
 
 export function ReloadSkills(arg1:string):Promise<void>;
 
