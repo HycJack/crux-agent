@@ -44,6 +44,8 @@ export function ReadFileContent(arg1:string):Promise<main.FileContent>;
 
 export function ReloadSkills(arg1:string):Promise<void>;
 
+export function RenderToHTML(arg1:string):Promise<string>;
+
 export function ResetAgent():Promise<void>;
 
 export function SaveConversations(arg1:Array<main.PersistedConversation>):Promise<void>;

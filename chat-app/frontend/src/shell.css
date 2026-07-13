@@ -50,6 +50,10 @@
   align-items: center;
 }
 
+.sidebar-logo-collapsed {
+  margin-bottom: 4px;
+}
+
 .brand-block {
   display: flex;
   align-items: center;
@@ -122,11 +126,22 @@
   display: flex;
   align-items: center;
   gap: 10px;
+  width: 100%;
   background: var(--n-tint-sky);
   border: 1px solid #c7dff7;
   border-radius: var(--radius-md);
   padding: 10px 12px;
   color: var(--n-primary-deep);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: filter 120ms ease, box-shadow 120ms ease;
+}
+.workspace-card:hover { filter: brightness(0.97); }
+.workspace-card:active { filter: brightness(0.94); }
+.workspace-card.active {
+  box-shadow: 0 0 0 2px var(--n-primary);
+  border-color: var(--n-primary);
 }
 .workspace-card svg { flex: 0 0 auto; color: var(--n-primary); }
 .workspace-meta { display: flex; flex-direction: column; min-width: 0; }
@@ -313,6 +328,11 @@
 .app-sidebar:not(.collapsed) .sidebar-toggle {
   display: none;
 }
+.nav-icon-btn.active {
+  background: var(--n-hairline-soft);
+  color: var(--n-primary);
+}
+
 .nav-icon-btn {
   display: flex;
   align-items: center;
@@ -1343,74 +1363,118 @@
   overflow: hidden;
 }
 
-/* ─── Right sidebar: collapsible file explorer ─────────────── */
+/* ─── Right sidebar: collapsible & resizable file explorer ─── */
 .main-explorer-sidebar {
   display: flex;
-  flex-shrink: 0;
+  flex: 0 0 auto;
   position: relative;
+  /* collapsed: fixed 36px width */
+  width: 36px;
+  overflow: visible;
 }
 
-.main-explorer-toggle {
+.main-explorer-sidebar.expanded {
+  /* width is driven by .main-explorer-content, so unset the 36px */
+  width: auto;
+  flex: 0 0 auto;
+}
+
+/* Resize handle (grabbable strip on the left edge, expanded only) */
+.main-explorer-resize-handle {
+  display: none;
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 5px;
+  z-index: 10;
+  cursor: col-resize;
+  background: transparent;
+  transition: background 100ms ease;
+}
+
+.main-explorer-sidebar.expanded .main-explorer-resize-handle {
+  display: block;
+}
+
+.main-explorer-resize-handle:hover,
+.main-explorer-resize-handle:active {
+  background: var(--n-primary);
+}
+
+/* Collapsed: just a thin icon strip filling full height */
+.main-explorer-collapsed-toggle {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: 6px;
+  justify-content: center;
   width: 36px;
-  padding: 12px 0;
+  height: 100%;
   border: none;
   border-left: 1px solid var(--n-hairline);
   background: var(--n-surface);
   color: var(--n-steel);
   cursor: pointer;
   transition: color 120ms ease, background 120ms ease;
-  writing-mode: vertical-lr;
   flex-shrink: 0;
 }
 
-.main-explorer-toggle:hover {
+.main-explorer-collapsed-toggle:hover {
   background: var(--n-hairline-soft);
   color: var(--n-charcoal);
 }
 
-.main-explorer-toggle-icon {
-  writing-mode: horizontal-tb;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.main-explorer-toggle-text {
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 1px;
-  text-transform: uppercase;
-}
-
+/* Expanded content */
 .main-explorer-content {
-  width: 0;
-  overflow: hidden;
-  display: flex;
+  display: none;
   flex-direction: column;
   background: var(--n-canvas);
   border-left: 1px solid var(--n-hairline);
-  transition: width 200ms ease;
 }
 
 .main-explorer-sidebar.expanded .main-explorer-content {
-  width: 380px;
+  display: flex;
   min-width: 300px;
-  max-width: 50vw;
+}
+
+/* Header row: collapse button + tabs */
+.main-explorer-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 4px;
+  border-bottom: 1px solid var(--n-hairline-soft);
+  flex-shrink: 0;
+  background: var(--n-surface);
+  height: 36px;
+}
+
+.main-explorer-collapse-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: var(--n-radius, 4px);
+  background: transparent;
+  color: var(--n-steel);
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease;
+  flex-shrink: 0;
+}
+
+.main-explorer-collapse-btn:hover {
+  background: var(--n-hairline-soft);
+  color: var(--n-charcoal);
 }
 
 .main-explorer-tabs {
   display: flex;
-  border-bottom: 1px solid var(--n-hairline-soft);
-  flex-shrink: 0;
-  background: var(--n-surface);
+  flex: 1;
 }
 
 .main-explorer-tab {
-  padding: 8px 16px;
+  padding: 6px 12px;
   font-size: 12px;
   font-weight: 600;
   border: none;
@@ -1544,6 +1608,10 @@
   justify-content: center;
   flex-shrink: 0;
   color: var(--n-stone);
+  transition: transform 120ms ease;
+}
+.file-tree-chevron.collapsed {
+  transform: rotate(-90deg);
 }
 
 .file-tree-spacer {
@@ -1964,12 +2032,130 @@
   font-weight: 600;
 }
 
-/* ─── HTML / PDF / DOCX preview containers ───────────────────── */
-.preview-html-container-inner,
-.preview-pdf-container-inner {
+/* ─── HTML preview (iframe container) ──────────────────────── */
+.preview-html-container-inner {
   width: 100%;
   height: 100%;
   display: flex;
+}
+
+/* ─── Office HTML viewer (server-side rendered) ──────────────── */
+.preview-office-html {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.preview-office-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--n-hairline-soft);
+  background: var(--n-surface);
+  flex-shrink: 0;
+}
+
+.preview-office-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.preview-office-filename {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--n-charcoal);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 200px;
+}
+
+.preview-office-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.preview-office-zoom-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 22px;
+  border: 1px solid var(--n-hairline-soft);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--n-steel);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 100ms ease, color 100ms ease;
+}
+
+.preview-office-zoom-btn:hover {
+  background: var(--n-hairline-soft);
+  color: var(--n-charcoal);
+}
+
+.preview-office-zoom-level {
+  font-size: 11px;
+  color: var(--n-slate);
+  min-width: 36px;
+  text-align: center;
+}
+
+.preview-office-iframe-wrapper {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+.preview-office-iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+}
+
+/* ─── PDF preview (pdfjs canvas) ───────────────────────────── */
+.preview-pdf-container {
+  width: 100%;
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 8px;
+  background: #e8e9eb;
+}
+
+.pdf-page-canvas {
+  max-width: 100%;
+  height: auto !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  border-radius: var(--radius-sm);
+  background: white;
+}
+
+/* ─── DOCX preview ──────────────────────────────────────────── */
+.preview-docx-container {
+  width: 100%;
+  min-height: 100%;
+  background: #e8e9eb;
+  padding: 16px;
+}
+
+.preview-docx-container .docx-preview-body {
+  max-width: 800px;
+  margin: 0 auto;
+  background: white;
+  padding: 32px 40px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  border-radius: var(--radius-sm);
+  min-height: 400px;
 }
 
 .preview-iframe {
@@ -2137,28 +2323,18 @@
   font-size: 12px;
   color: var(--n-steel);
   margin: 0;
-  max-width: 280px;
+  max-width: 320px;
   line-height: 1.5;
 }
 
-.preview-placeholder-binary {
-  margin-top: 8px;
-  padding: 12px 16px;
+.preview-placeholder-size {
+  font-size: 11px;
+  color: var(--n-slate);
+  margin: 0;
+  padding: 4px 10px;
   background: var(--n-surface);
   border: 1px solid var(--n-hairline-soft);
   border-radius: var(--radius-sm);
-  font-size: 11px;
-  color: var(--n-slate);
-  line-height: 1.5;
-  max-width: 320px;
-  text-align: left;
-}
-
-.preview-placeholder-binary code {
-  background: #f0eeec;
-  padding: 1px 4px;
-  border-radius: 2px;
-  font-size: 10px;
 }
 
 /* ─── Scrollable container ───────────────────────────────────── */

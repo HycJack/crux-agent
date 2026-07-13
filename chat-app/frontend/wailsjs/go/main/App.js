@@ -86,6 +86,10 @@ export function ReloadSkills(arg1) {
   return window['go']['main']['App']['ReloadSkills'](arg1);
 }
 
+export function RenderToHTML(arg1) {
+  return window['go']['main']['App']['RenderToHTML'](arg1);
+}
+
 export function ResetAgent() {
   return window['go']['main']['App']['ResetAgent']();
 }

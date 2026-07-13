@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   ChevronDownOutlined,
-  ChevronUpOutlined,
   FolderIcon,
   FolderOpenOutlined,
   CodeOutlined,
@@ -113,8 +112,8 @@ function TreeNode({
         title={node.path}
       >
         {node.isDir ? (
-          <span className="file-tree-chevron">
-            {isExpanded ? <ChevronDownOutlined size={12} /> : <ChevronUpOutlined size={12} />}
+          <span className={`file-tree-chevron ${isExpanded ? '' : 'collapsed'}`}>
+            <ChevronDownOutlined size={12} />
           </span>
         ) : (
           <span className="file-tree-spacer" />
@@ -212,21 +211,10 @@ export default function FileTreePanel({
     loadTree();
   }, [loadTree]);
 
-  // Expand root by default
+  // Expand root by default, keep subdirs collapsed
   useEffect(() => {
     if (tree && expandedDirs.size === 0) {
       setExpandedDirs(new Set([tree.path]));
-
-      // Also expand first level
-      const dirs = new Set<string>([tree.path]);
-      if (tree.children) {
-        tree.children.forEach((child) => {
-          if (child.isDir && child.name !== 'node_modules' && child.name !== '.git') {
-            dirs.add(child.path);
-          }
-        });
-      }
-      setExpandedDirs(dirs);
     }
   }, [tree]); // eslint-disable-line react-hooks/exhaustive-deps
 

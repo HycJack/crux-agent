@@ -17,11 +17,13 @@ interface SidebarProps {
   activeConversation: string | null;
   workingDir: string;
   collapsed: boolean;
+  explorerOpen: boolean;
   onSelectConversation: (id: string) => void;
   onCreateNewConversation: () => void;
   onDeleteConversation: (id: string) => void;
   onRenameConversation: (id: string, title: string) => void;
   onOpenSettings: () => void;
+  onToggleExplorer: () => void;
 }
 
 export default function Sidebar({
@@ -29,11 +31,13 @@ export default function Sidebar({
   activeConversation,
   workingDir,
   collapsed,
+  explorerOpen,
   onSelectConversation,
   onCreateNewConversation,
   onDeleteConversation,
   onRenameConversation,
   onOpenSettings,
+  onToggleExplorer,
 }: SidebarProps) {
   const dirName = workingDir ? workingDir.split(/[\\/]/).filter(Boolean).slice(-1)[0] : 'No workspace';
 
@@ -79,16 +83,24 @@ export default function Sidebar({
   if (collapsed) {
     return (
       <aside className="app-sidebar collapsed">
-        <button className="icon-btn sidebar-toggle" onClick={() => {}} aria-label="Expand sidebar">
-          <MenuOutlined size={18} />
-        </button>
+        <div className="brand-mark sidebar-logo-collapsed">
+          <div className="brand-logo">C</div>
+        </div>
         <button className="nav-icon-btn" onClick={onCreateNewConversation} title="New chat">
           <EditOutlined size={18} />
         </button>
+        {/* File explorer toggle */}
+        <button
+          className={`nav-icon-btn ${explorerOpen ? 'active' : ''}`}
+          onClick={onToggleExplorer}
+          title={explorerOpen ? 'Close file explorer' : 'Open file explorer'}
+        >
+          <FolderOpenOutlined size={18} />
+        </button>
+        <div className="sidebar-spacer" />
         <button className="nav-icon-btn" onClick={onOpenSettings} title="Settings">
           <SettingOutlined size={18} />
         </button>
-        <div className="sidebar-spacer" />
         <button className="nav-icon-btn profile-link" title="Crux Agent">
           <UserOutlined size={18} />
         </button>
@@ -116,13 +128,17 @@ export default function Sidebar({
         <span>New chat</span>
       </button>
 
-      <div className="workspace-card" title={workingDir}>
+      <button
+        className={`workspace-card ${explorerOpen ? 'active' : ''}`}
+        onClick={onToggleExplorer}
+        title={workingDir || 'Working directory'}
+      >
         <FolderOpenOutlined size={18} />
         <div className="workspace-meta">
           <div className="workspace-label">Working directory</div>
           <div className="workspace-path">{dirName || 'Not set'}</div>
         </div>
-      </div>
+      </button>
 
       <div className="history-list">
         <div className="history-list-header">

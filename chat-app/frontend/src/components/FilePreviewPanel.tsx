@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import OfficeHtmlViewer from './OfficeHtmlViewer';
+import { RenderToHTML } from '../../wailsjs/go/main/App';
 
 interface FileContent {
   name: string;
@@ -12,6 +14,7 @@ interface FileContent {
 interface FilePreviewPanelProps {
   filePath: string | null;
   readFileContent: (path: string) => Promise<FileContent>;
+  renderToHtml?: (path: string) => Promise<string>;
   onClose: () => void;
 }
 
@@ -93,6 +96,7 @@ function fileTypeBadge(name: string): { label: string; color: string } {
 export default function FilePreviewPanel({
   filePath,
   readFileContent,
+  renderToHtml,
   onClose,
 }: FilePreviewPanelProps) {
   const [fileData, setFileData] = useState<FileContent | null>(null);
@@ -100,6 +104,7 @@ export default function FilePreviewPanel({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
+  const [officeHtml, setOfficeHtml] = useState<string | null>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
 
   const loadFile = useCallback(async () => {
@@ -107,29 +112,37 @@ export default function FilePreviewPanel({
     setLoading(true);
     setError(null);
     setFileData(null);
+    setOfficeHtml(null);
     setZoom(1);
 
     const ptype = detectPreviewType(filePath);
     setPreviewType(ptype);
 
+    // For office documents (docx, xlsx, pptx, pdf), try server-side HTML rendering first
+    if (['pdf', 'docx', 'xlsx', 'pptx'].includes(ptype)) {
+      const renderFn = renderToHtml || RenderToHTML;
+      try {
+        const html = await renderFn(filePath);
+        if (html && html.length > 0) {
+          setOfficeHtml(html);
+          setLoading(false);
+          return;
+        }
+      } catch {
+        // Fall through to client-side rendering
+      }
+    }
+
     try {
       const data = await readFileContent(filePath);
       setFileData(data);
-
-      // Binary files that are images need special handling
-      if (ptype === 'image' && data.isBinary && data.encoding === 'base64') {
-        // Image will be shown via data URL
-      } else if (data.isBinary && ptype !== 'image') {
-        // For docx/xlsx/pptx, we have the raw binary data base64 encoded
-        // We still show what we can
-      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setPreviewType('error');
     } finally {
       setLoading(false);
     }
-  }, [filePath, readFileContent]);
+  }, [filePath, readFileContent, renderToHtml]);
 
   useEffect(() => {
     loadFile();
@@ -276,30 +289,47 @@ export default function FilePreviewPanel({
               </div>
             )}
 
-            {/* PDF preview - embed using iframe with browser's native PDF viewer */}
-            {previewType === 'pdf' && fileData.isBinary && fileData.encoding === 'base64' && (
-              <div className="preview-pdf-container-inner">
-                <iframe
-                  ref={iframeRef}
-                  src={`data:application/pdf;base64,${fileData.content}`}
-                  className="preview-iframe"
-                  title={fileName}
-                />
-              </div>
+            {/* Office documents rendered server-side (DOCX, XLSX, PPTX) */}
+            {officeHtml && ['docx', 'xlsx', 'pptx'].includes(previewType) && (
+              <OfficeHtmlViewer html={officeHtml} fileName={fileName} />
             )}
 
-            {/* DOCX preview - render in iframe */}
-            {previewType === 'docx' && fileData.isBinary && fileData.encoding === 'base64' && (
+            {/* PDF: prefer server-side render; skip OfficeHtmlViewer to avoid iframe nesting */}
+            {previewType === 'pdf' && (
+              officeHtml ? (
+                // Backend returned base64 PDF data – embed directly
+                <div className="preview-office-html">
+                  <div className="preview-office-toolbar">
+                    <div className="preview-office-toolbar-left">
+                      <span className="preview-office-filename">{fileName}</span>
+                    </div>
+                  </div>
+                  <div className="preview-office-iframe-wrapper" style={{ height: 'calc(100vh - 200px)' }}>
+                    <iframe
+                      src={`data:application/pdf;base64,${officeHtml}`}
+                      sandbox="allow-same-origin"
+                      style={{ width: '100%', height: '100%', border: 'none' }}
+                      title={fileName}
+                    />
+                  </div>
+                </div>
+              ) : fileData?.isBinary && fileData?.encoding === 'base64' ? (
+                <PdfPreview base64={fileData.content} />
+              ) : null
+            )}
+
+            {/* DOCX preview - render with docx-preview (fallback if server-side failed) */}
+            {!officeHtml && previewType === 'docx' && fileData?.isBinary && fileData?.encoding === 'base64' && (
               <DocxPreview base64={fileData.content} fileName={fileName} />
             )}
 
-            {/* XLSX preview */}
-            {previewType === 'xlsx' && fileData.isBinary && fileData.encoding === 'base64' && (
+            {/* XLSX preview (fallback if server-side failed) */}
+            {!officeHtml && previewType === 'xlsx' && fileData?.isBinary && fileData?.encoding === 'base64' && (
               <XlsxPreview base64={fileData.content} fileName={fileName} />
             )}
 
-            {/* PPTX preview */}
-            {previewType === 'pptx' && fileData.isBinary && fileData.encoding === 'base64' && (
+            {/* PPTX preview (fallback if server-side failed) */}
+            {!officeHtml && previewType === 'pptx' && fileData?.isBinary && fileData?.encoding === 'base64' && (
               <PptxPreview base64={fileData.content} fileName={fileName} />
             )}
 
@@ -325,16 +355,108 @@ export default function FilePreviewPanel({
   );
 }
 
-// Stub component for DOCX preview (requires docx-preview library)
+// ─── PDF preview (pdfjs-dist) ────────────────────────────────────
+function PdfPreview({ base64 }: { base64: string }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [pageCount, setPageCount] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function renderPdf() {
+      try {
+        const pdfjsLib = await import('pdfjs-dist');
+        pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+          'pdfjs-dist/build/pdf.worker.min.mjs',
+          import.meta.url,
+        ).toString();
+
+        // Decode base64 to bytes – more robust than manual atob+loop
+        const binaryStr = atob(base64);
+        const bytes = new Uint8Array(binaryStr.length);
+        for (let i = 0; i < binaryStr.length; i++) {
+          bytes[i] = binaryStr.charCodeAt(i);
+        }
+
+        const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
+        if (cancelled) return;
+
+        setPageCount(pdf.numPages);
+        const container = containerRef.current;
+        if (!container) return;
+
+        for (let i = 1; i <= pdf.numPages; i++) {
+          if (cancelled) return;
+          const page = await pdf.getPage(i);
+          const viewport = page.getViewport({ scale: 1.4 });
+
+          const canvas = document.createElement('canvas');
+          canvas.className = 'pdf-page-canvas';
+          canvas.height = viewport.height;
+          canvas.width = viewport.width;
+          container.appendChild(canvas);
+
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            if (!cancelled) setError('Canvas 2D context not available');
+            break;
+          }
+          await page.render({
+            canvas,
+            viewport,
+          }).promise;
+        }
+        if (!cancelled) setLoading(false);
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : String(err));
+          setLoading(false);
+        }
+      }
+    }
+    renderPdf();
+    return () => {
+      cancelled = true;
+      // Clean up canvases
+      const container = containerRef.current;
+      if (container) container.innerHTML = '';
+    };
+  }, [base64]);
+
+  if (loading) {
+    return (
+      <div className="file-preview-status">
+        <div className="file-preview-spinner" />
+        <span>Rendering PDF ({pageCount > 0 ? `${pageCount} pages` : '...'})</span>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="file-preview-error">
+        <div className="file-preview-error-icon">!</div>
+        <div className="file-preview-error-text">PDF render error: {error}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="preview-scrollable preview-pdf-container" ref={containerRef} />
+  );
+}
+
+// ─── DOCX preview (docx-preview) ────────────────────────────────
 function DocxPreview({ base64, fileName }: { base64: string; fileName: string }) {
-  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
     async function renderDocx() {
       try {
-        // Dynamic import of docx-preview
         const { renderAsync } = await import('docx-preview');
 
         const binaryStr = atob(base64);
@@ -346,23 +468,10 @@ function DocxPreview({ base64, fileName }: { base64: string; fileName: string })
           type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         });
 
-        const iframe = iframeRef.current;
-        if (!iframe) return;
+        const container = containerRef.current;
+        if (!container) return;
 
-        const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
-        if (!iframeDoc) {
-          setError('Could not access preview container');
-          setLoading(false);
-          return;
-        }
-
-        iframeDoc.open();
-        iframeDoc.write(
-          `<!DOCTYPE html><html><head><style>body{margin:0;padding:16px;background:#e8e9eb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}</style></head><body></body></html>`,
-        );
-        iframeDoc.close();
-
-        await renderAsync(blob, iframeDoc.body, iframeDoc.head, {
+        await renderAsync(blob, container, undefined, {
           className: 'docx-preview-body',
           inWrapper: true,
           ignoreWidth: false,
@@ -370,14 +479,22 @@ function DocxPreview({ base64, fileName }: { base64: string; fileName: string })
           breakPages: true,
         });
 
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-        setLoading(false);
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : String(err));
+          setLoading(false);
+        }
       }
     }
 
     renderDocx();
+    return () => {
+      cancelled = true;
+      // Clean up rendered content
+      const container = containerRef.current;
+      if (container) container.innerHTML = '';
+    };
   }, [base64]);
 
   if (loading) {
@@ -398,17 +515,10 @@ function DocxPreview({ base64, fileName }: { base64: string; fileName: string })
     );
   }
 
-  return (
-    <iframe
-      ref={iframeRef}
-      sandbox="allow-same-origin"
-      className="preview-iframe"
-      title={fileName}
-    />
-  );
+  return <div className="preview-scrollable preview-docx-container" ref={containerRef} />;
 }
 
-// Stub component for XLSX preview (requires xlsx library)
+// ─── XLSX preview (xlsx) ─────────────────────────────────────────
 function XlsxPreview({ base64, fileName }: { base64: string; fileName: string }) {
   const [sheets, setSheets] = useState<{ name: string; html: string }[]>([]);
   const [activeSheet, setActiveSheet] = useState(0);
@@ -484,24 +594,20 @@ function XlsxPreview({ base64, fileName }: { base64: string; fileName: string })
   );
 }
 
-// Stub component for PPTX preview
+// ─── PPTX preview (placeholder) ──────────────────────────────────
 function PptxPreview({ base64, fileName }: { base64: string; fileName: string }) {
   return (
     <div className="preview-placeholder">
       <div className="preview-placeholder-icon">P</div>
       <p className="preview-placeholder-title">{fileName}</p>
       <p className="preview-placeholder-text">
-        PPTX preview. Install pptxjs for full support.
+        PPTX files can not be previewed inline. Please open this file with an external application (e.g. PowerPoint, LibreOffice).
       </p>
-      <div className="preview-placeholder-binary">
-        <p>
-          <strong>Fallback:</strong> This is a <code>.pptx</code> file (
-          {(base64.length * 3) / 4 / 1024 > 1024
-            ? `${((base64.length * 3) / 4 / (1024 * 1024)).toFixed(1)} MB`
-            : `${((base64.length * 3) / 4 / 1024).toFixed(1)} KB`}
-          ). You can open it externally to view its contents.
-        </p>
-      </div>
+      <p className="preview-placeholder-size">
+        {(base64.length * 3) / 4 / 1024 > 1024
+          ? `${((base64.length * 3) / 4 / (1024 * 1024)).toFixed(1)} MB`
+          : `${((base64.length * 3) / 4 / 1024).toFixed(1)} KB`}
+      </p>
     </div>
   );
 }

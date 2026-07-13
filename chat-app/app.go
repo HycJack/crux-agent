@@ -573,7 +573,7 @@ func (a *App) ReadFileContent(filePath string) (*FileContent, error) {
 	ext := strings.ToLower(filepath.Ext(absPath))
 
 	// If it's a text file, read as text
-	if isTextFile(ext) || isPreviewFile(ext) {
+	if isTextFile(ext) {
 		data, err := io.ReadAll(f)
 		if err != nil {
 			return nil, fmt.Errorf("cannot read file: %w", err)
@@ -584,6 +584,27 @@ func (a *App) ReadFileContent(filePath string) (*FileContent, error) {
 			Content:  string(data),
 			Size:     info.Size(),
 			IsBinary: false,
+		}, nil
+	}
+
+	// Known binary preview formats (.pdf, .docx, .xlsx, .pptx) – treat as binary
+	if isPreviewFile(ext) {
+		readSize := info.Size()
+		if readSize > 10*1024*1024 {
+			readSize = 10 * 1024 * 1024
+		}
+		data := make([]byte, readSize)
+		_, err := io.ReadFull(f, data)
+		if err != nil && err != io.ErrUnexpectedEOF {
+			return nil, fmt.Errorf("cannot read binary file: %w", err)
+		}
+		return &FileContent{
+			Name:     info.Name(),
+			Path:     absPath,
+			Content:  base64.StdEncoding.EncodeToString(data),
+			Size:     info.Size(),
+			IsBinary: true,
+			Encoding: "base64",
 		}, nil
 	}
 

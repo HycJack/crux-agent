@@ -116,6 +116,32 @@ function App() {
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [showFileExplorer, setShowFileExplorer] = useState(false);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const sidebarRef = useRef<HTMLDivElement>(null);
+  const [explorerWidth, setExplorerWidth] = useState('380px');
+
+  const handleResizeStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = sidebarRef.current?.offsetWidth ?? 380;
+
+    const onMove = (ev: MouseEvent) => {
+      const diff = startX - ev.clientX;
+      const newW = Math.max(280, Math.min(800, startWidth + diff));
+      setExplorerWidth(`${newW}px`);
+    };
+
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  }, []);
 
   const currentUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const activeIdRef = useRef<string | null>(null);
@@ -632,11 +658,13 @@ function App() {
         activeConversation={activeConversationId}
         workingDir={settings.workingDir}
         collapsed={sidebarCollapsed}
+        explorerOpen={showFileExplorer}
         onSelectConversation={selectConversation}
         onCreateNewConversation={createNewConversation}
         onDeleteConversation={deleteConversation}
         onRenameConversation={renameConversation}
         onOpenSettings={() => setIsSettingsOpen(true)}
+        onToggleExplorer={() => setShowFileExplorer((p) => !p)}
       />
 
       <main className="main-frame">
@@ -693,31 +721,50 @@ function App() {
             />
           </div>
 
-          <div className={`main-explorer-sidebar ${showFileExplorer ? 'expanded' : ''}`}>
-            <button
-              className="main-explorer-toggle"
-              onClick={() => setShowFileExplorer((p) => !p)}
-              title={showFileExplorer ? 'Collapse file explorer' : 'Expand file explorer'}
-              aria-label="Toggle file explorer"
-            >
-              <span className="main-explorer-toggle-icon">
-                <FolderIcon size={16} />
-              </span>
-              <span className="main-explorer-toggle-text">Files</span>
-            </button>
-            <div className="main-explorer-content">
-              <div className="main-explorer-tabs">
+          <div
+            className={`main-explorer-sidebar ${showFileExplorer ? 'expanded' : ''}`}
+            ref={sidebarRef}
+          >
+            {/* Resizable handle – click or drag */}
+            <div
+              className="main-explorer-resize-handle"
+              onMouseDown={handleResizeStart}
+            />
+            {/* Collapsed state: vertical icon strip */}
+            {!showFileExplorer && (
+              <button
+                className="main-explorer-collapsed-toggle"
+                onClick={() => setShowFileExplorer(true)}
+                title="Open file explorer"
+                aria-label="Open file explorer"
+              >
+                <FolderIcon size={18} />
+              </button>
+            )}
+            {/* Expanded content */}
+            <div className="main-explorer-content" style={{ width: explorerWidth }}>
+              <div className="main-explorer-header">
                 <button
-                  className={`main-explorer-tab ${!selectedFile ? 'active' : ''}`}
-                  onClick={() => setSelectedFile(null)}
+                  className="main-explorer-collapse-btn"
+                  onClick={() => setShowFileExplorer(false)}
+                  title="Close file explorer"
+                  aria-label="Close file explorer"
                 >
-                  Files
+                  <FolderIcon size={16} />
                 </button>
-                {selectedFile && (
-                  <button className="main-explorer-tab active">
-                    Preview
+                <div className="main-explorer-tabs">
+                  <button
+                    className={`main-explorer-tab ${!selectedFile ? 'active' : ''}`}
+                    onClick={() => setSelectedFile(null)}
+                  >
+                    Files
                   </button>
-                )}
+                  {selectedFile && (
+                    <button className="main-explorer-tab active">
+                      Preview
+                    </button>
+                  )}
+                </div>
               </div>
               <div className="main-explorer-body">
                 {selectedFile ? (
