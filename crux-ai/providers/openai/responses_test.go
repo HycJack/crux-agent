@@ -9,21 +9,19 @@ import (
 	core "github.com/hycjack/crux-ai/core"
 )
 
-// runResponsesSSE feeds SSE-formatted data to processResponsesSSE and
-// returns the accumulated events and final message.
+// runResponsesSSE feeds SSE data through processResponsesSSE +
+// CanonicalizeProviderStream and returns all events plus the final message.
 func runResponsesSSE(t *testing.T, sseData string) ([]core.AssistantMessageEvent, core.AssistantMessage) {
 	t.Helper()
 	model := core.Model{ID: "gpt-test", Provider: "openai-responses", API: "openai-responses"}
-	stream := core.NewEventStream[core.AssistantMessageEvent, core.AssistantMessage]()
+	ps := core.NewProviderEventStream()
 
 	var events []core.AssistantMessageEvent
 	done := make(chan struct{})
+	out := core.CanonicalizeProviderStream(ps, model.API, model.Provider, model.ID)
 	go func() {
 		defer close(done)
-		for evt := range stream.Events() {
-			if evt.Err() != nil {
-				continue
-			}
+		for evt := range out.Events() {
 			if evt.Done() {
 				return
 			}
@@ -32,17 +30,23 @@ func runResponsesSSE(t *testing.T, sseData string) ([]core.AssistantMessageEvent
 	}()
 
 	r := strings.NewReader(sseData)
-	out, err := processResponsesSSE(r, stream, model, core.StreamOptions{})
+	err := processResponsesSSE(r, ps, model, core.StreamOptions{})
 	if err != nil {
 		t.Fatalf("processResponsesSSE: %v", err)
 	}
-	stream.End(out)
+	ps.End(core.ProviderEventStreamResult{})
 	<-done
-	return events, out
+
+	var msg core.AssistantMessage
+	for _, evt := range events {
+		if d, ok := evt.(core.EventDone); ok {
+			msg = d.Message
+		}
+	}
+	return events, msg
 }
 
 // eventTypeOf returns a discriminator string for an AssistantMessageEvent.
-// Uses the Type field embedded in each event variant.
 func eventTypeOf(e core.AssistantMessageEvent) string {
 	switch ev := e.(type) {
 	case core.EventStart:
@@ -70,14 +74,11 @@ func eventTypeOf(e core.AssistantMessageEvent) string {
 	case core.EventError:
 		return ev.Type
 	default:
-		// Print the actual type for debugging
 		return fmt.Sprintf("unknown(%T)", e)
 	}
 }
 
 func TestResponses_HandlesReasoningItem(t *testing.T) {
-	// The OpenAI Responses API emits a separate "reasoning" item
-	// with reasoning_text.delta events.
 	sse := "" +
 		`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}
 ` +
@@ -121,7 +122,6 @@ func TestResponses_HandlesReasoningItem(t *testing.T) {
 		}
 	}
 
-	// Validate content blocks: a ThinkingContent + a TextContent.
 	var sawThinking, sawText bool
 	for _, b := range msg.Content {
 		if tc, ok := b.(core.ThinkingContent); ok {
@@ -144,7 +144,6 @@ func TestResponses_HandlesReasoningItem(t *testing.T) {
 		t.Errorf("missing TextContent block")
 	}
 
-	// Validate usage fields.
 	if msg.Usage.Input != 10 {
 		t.Errorf("usage.input: got %d", msg.Usage.Input)
 	}
@@ -176,9 +175,9 @@ func TestResponses_NoReasoning_StillWorks(t *testing.T) {
 
 func TestResponses_ScannerErrorPropagated(t *testing.T) {
 	model := core.Model{ID: "gpt-test", Provider: "openai-responses", API: "openai-responses"}
-	stream := core.NewEventStream[core.AssistantMessageEvent, core.AssistantMessage]()
+	ps := core.NewProviderEventStream()
 	r := strings.NewReader("")
-	_, err := processResponsesSSE(r, stream, model, core.StreamOptions{})
+	err := processResponsesSSE(r, ps, model, core.StreamOptions{})
 	if err != nil {
 		t.Logf("got error (expected for empty stream with no [DONE]): %v", err)
 	}

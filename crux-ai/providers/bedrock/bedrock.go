@@ -3,12 +3,10 @@ package bedrock
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -104,6 +102,8 @@ func streamBedrock(ctx context.Context, model core.Model, c core.Context, opts c
 		region = defaultRegion
 	}
 
+	c.Messages = core.TransformMessages(c.Messages, model, nil)
+
 	body, err := buildBedrockBody(model, c, opts, bedrockOpts)
 	if err != nil {
 		return nil, fmt.Errorf("bedrock: failed to build request: %w", err)
@@ -112,23 +112,25 @@ func streamBedrock(ctx context.Context, model core.Model, c core.Context, opts c
 		opts.OnPayload(body)
 	}
 
-	stream := core.NewEventStream[core.AssistantMessageEvent, core.AssistantMessage]()
+	ps := core.NewProviderEventStream()
 
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				stream.Error(fmt.Errorf("bedrock: panic: %v", r))
+				ps.Error(fmt.Errorf("bedrock: panic: %v", r))
 			}
 		}()
-		msg, err := doBedrockStream(ctx, region, apiKey, model, body, stream, opts, bedrockOpts)
+		err := doBedrockStream(ctx, region, apiKey, model, body, ps, opts, bedrockOpts)
 		if err != nil {
-			stream.Error(err)
+			ps.Error(err)
 			return
 		}
-		stream.End(msg)
+		ps.End(core.ProviderEventStreamResult{})
 	}()
 
-	return stream, nil
+	out := core.CanonicalizeProviderStream(ps, model.API, model.Provider, model.ID)
+	return out, nil
+
 }
 
 func buildBedrockBody(model core.Model, c core.Context, opts core.StreamOptions, bedrockOpts Options) (map[string]any, error) {
@@ -309,59 +311,46 @@ func mimeToFormat(mimeType string) string {
 	return mimeType
 }
 
-func doBedrockStream(ctx context.Context, region, apiKey string, model core.Model, body map[string]any, stream *core.AssistantMessageEventStream, opts core.StreamOptions, bedrockOpts Options) (core.AssistantMessage, error) {
+func doBedrockStream(ctx context.Context, region, apiKey string, model core.Model, body map[string]any, ps *core.ProviderEventStream, opts core.StreamOptions, bedrockOpts Options) error {
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-		return core.AssistantMessage{}, err
+		return err
 	}
 	url := fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/converse-stream", region, model.ID)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return core.AssistantMessage{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
+	headers := map[string]string{"Content-Type": "application/json"}
 	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
+		headers["Authorization"] = "Bearer " + apiKey
 	}
 	for k, v := range core.ProviderHeadersToRecord(core.MergeProviderHeaders(model.Headers, opts.Headers)) {
-		req.Header.Set(k, v)
+		headers[k] = v
 	}
 
 	client := core.NewTimeoutClient(opts.TimeoutMs)
-	resp, err := client.Do(req)
+	resp, err := core.DoWithRetry(ctx, client, "POST", url, bodyBytes, headers, model.Provider, opts)
 	if err != nil {
-		return core.AssistantMessage{}, err
+		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return core.AssistantMessage{}, fmt.Errorf("bedrock: API error %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-	return processBedrockSSE(resp.Body, stream, model, opts)
+	return processBedrockSSE(resp.Body, ps, model, opts)
 }
 
-func processBedrockSSE(body io.Reader, stream *core.AssistantMessageEventStream, model core.Model, opts core.StreamOptions) (core.AssistantMessage, error) {
+func processBedrockSSE(body io.Reader, ps *core.ProviderEventStream, model core.Model, opts core.StreamOptions) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
 	var (
-		msg         core.AssistantMessage
-		textBuf     strings.Builder
-		thinkBuf    strings.Builder
-		toolCalls   []core.ToolCall
-		textOpen    bool
-		thinkOpen   bool
-		nextBlockIx int
+		textBuf    strings.Builder
+		thinkBuf   strings.Builder
+		toolCalls  []core.ToolCall
+		textOpen   bool
+		thinkOpen  bool
+		usage      core.Usage
+		stopReason core.StopReason
 	)
-	msg.API = model.API
-	msg.Provider = model.Provider
-	msg.Model = model.ID
-	msg.Role = "assistant"
-	msg.Timestamp = time.Now()
 
-	stream.Push(core.EventStart{Type: "start", API: model.API, Provider: model.Provider, Model: model.ID, Timestamp: time.Now()})
+	ps.Push(core.ProviderResponseStart{Type: "response_start", Model: model.ID, Timestamp: time.Now()})
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -381,46 +370,36 @@ func processBedrockSSE(body io.Reader, stream *core.AssistantMessageEventStream,
 			delta, _ := contentBlockDelta["delta"].(map[string]any)
 			if text, ok := delta["text"].(string); ok && text != "" {
 				if !textOpen {
-					idx := nextBlockIx
-					nextBlockIx++
-					stream.Push(core.EventTextStart{Type: "text_start", ContentIndex: idx})
 					textOpen = true
 				}
 				textBuf.WriteString(text)
-				stream.Push(core.EventTextDelta{Type: "text_delta", Delta: text})
+				ps.Push(core.ProviderTextDelta{Type: "text_delta", Delta: text})
 			}
 			if thinking, ok := delta["thinking"].(map[string]any); ok {
 				if t, ok := thinking["thinking"].(string); ok && t != "" {
 					if !thinkOpen {
-						idx := nextBlockIx
-						nextBlockIx++
-						stream.Push(core.EventThinkingStart{Type: "thinking_start", ContentIndex: idx})
 						thinkOpen = true
 					}
 					thinkBuf.WriteString(t)
-					stream.Push(core.EventThinkingDelta{Type: "thinking_delta", Delta: t})
+					ps.Push(core.ProviderThinkingDelta{Type: "thinking_delta", Delta: t})
 				}
 			}
+			// Emit tool call as ProviderToolCall once complete
+			// Bedrock emits toolUse input deltas; we collect and
+			// emit the full tool call on contentBlockStop boundary.
 			if toolUse, ok := delta["toolUse"].(map[string]any); ok {
-				// Some Bedrock models emit the toolUse input delta before or
-				// without a matching contentBlockStart. To avoid silently
-				// dropping bytes, ensure we always have a tail tool call to
-				// append to — synthesise one from the delta when needed.
 				if input, ok := toolUse["input"].(string); ok && input != "" {
 					if len(toolCalls) == 0 {
 						id, _ := toolUse["toolUseId"].(string)
 						name, _ := toolUse["name"].(string)
 						if id == "" {
-							id = fmt.Sprintf("toolcall_%d", nextBlockIx)
+							id = fmt.Sprintf("toolcall_%d", 0)
 						}
-						idx := nextBlockIx
-						nextBlockIx++
-						toolCalls = append(toolCalls, core.ToolCall{Type: "toolCall", ID: id, Name: name})
-						stream.Push(core.EventToolCallStart{Type: "toolcall_start", ContentIndex: idx, ID: id, Name: name})
+						tc := core.ToolCall{Type: "toolCall", ID: id, Name: name}
+						toolCalls = append(toolCalls, tc)
 					}
 					last := &toolCalls[len(toolCalls)-1]
 					last.Arguments = append(last.Arguments, []byte(input)...)
-					stream.Push(core.EventToolCallDelta{Type: "toolcall_delta", ID: last.ID, ArgumentsDelta: input})
 				}
 			}
 		}
@@ -430,50 +409,65 @@ func processBedrockSSE(body io.Reader, stream *core.AssistantMessageEventStream,
 			if toolUse, ok := start["toolUse"].(map[string]any); ok {
 				id, _ := toolUse["toolUseId"].(string)
 				name, _ := toolUse["name"].(string)
-				idx := nextBlockIx
-				nextBlockIx++
-				toolCalls = append(toolCalls, core.ToolCall{Type: "toolCall", ID: id, Name: name})
-				stream.Push(core.EventToolCallStart{Type: "toolcall_start", ContentIndex: idx, ID: id, Name: name})
+				tc := core.ToolCall{Type: "toolCall", ID: id, Name: name}
+				toolCalls = append(toolCalls, tc)
+			}
+		}
+
+		// Emit tool calls when each content block ends
+		if contentBlockStop, ok := event["contentBlockStop"].(map[string]any); ok {
+			_ = contentBlockStop
+			// Close active text/thinking blocks
+			if textOpen {
+				ps.Push(core.ProviderContentBlockStop{Type: "content_block_stop"})
+				textOpen = false
+			}
+			if thinkOpen {
+				ps.Push(core.ProviderContentBlockStop{Type: "content_block_stop"})
+				thinkOpen = false
+			}
+			// Emit accumulated tool calls
+			for _, tc := range toolCalls {
+				ps.Push(core.ProviderToolCall{
+					Type: "tool_call", ID: tc.ID, Name: tc.Name,
+					Arguments: tc.Arguments,
+				})
 			}
 		}
 
 		if messageStop, ok := event["messageStop"].(map[string]any); ok {
-			if stopReason, ok := messageStop["stopReason"].(string); ok {
-				msg.StopReason = mapBedrockStopReason(stopReason)
+			if reason, ok := messageStop["stopReason"].(string); ok {
+				stopReason = mapBedrockStopReason(reason)
 			}
 		}
 		if metadata, ok := event["metadata"].(map[string]any); ok {
-			if usage, ok := metadata["usage"].(map[string]any); ok {
-				msg.Usage.Input = conv.GetInt(usage, "inputTokens")
-				msg.Usage.Output = conv.GetInt(usage, "outputTokens")
-				msg.Usage.CacheRead = conv.GetInt(usage, "cacheReadInputTokens")
-				msg.Usage.CacheWrite = conv.GetInt(usage, "cacheWriteInputTokens")
+			if u, ok := metadata["usage"].(map[string]any); ok {
+				usage.Input = conv.GetInt(u, "inputTokens")
+				usage.Output = conv.GetInt(u, "outputTokens")
+				usage.CacheRead = conv.GetInt(u, "cacheReadInputTokens")
+				usage.CacheWrite = conv.GetInt(u, "cacheWriteInputTokens")
 			}
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return msg, fmt.Errorf("bedrock: SSE read error: %w", err)
+		return fmt.Errorf("bedrock: SSE read error: %w", err)
 	}
 
-	if textOpen {
-		msg.Content = append(msg.Content, core.TextContent{Type: "text", Text: textBuf.String()})
-		stream.Push(core.EventTextEnd{Type: "text_end", Content: textBuf.String()})
-	}
-	if thinkOpen {
-		msg.Content = append(msg.Content, core.ThinkingContent{Type: "thinking", Thinking: thinkBuf.String()})
-		stream.Push(core.EventThinkingEnd{Type: "thinking_end", Content: thinkBuf.String()})
-	}
-	for _, tc := range toolCalls {
-		stream.Push(core.EventToolCallEnd{Type: "toolcall_end", ID: tc.ID, Arguments: tc.Arguments})
-		msg.Content = append(msg.Content, tc)
+	usage.TotalTokens = usage.Input + usage.Output + usage.CacheRead + usage.CacheWrite
+	usage.Cost = core.CalculateCost(model, usage)
+
+	final := core.AssistantMessage{
+		Role: "assistant", API: model.API, Provider: model.Provider, Model: model.ID,
+		Usage: usage, StopReason: stopReason, Timestamp: time.Now(),
 	}
 
-	msg.Usage.TotalTokens = msg.Usage.Input + msg.Usage.Output + msg.Usage.CacheRead + msg.Usage.CacheWrite
-	msg.Usage.Cost = core.CalculateCost(model, msg.Usage)
-	stream.Push(core.EventDone{Type: "done", Reason: msg.StopReason, Message: msg})
+	ps.Push(core.ProviderResponseEnd{
+		Type: "response_end", Message: final,
+		FinishReason: string(stopReason),
+	})
 
-	return msg, nil
+	return nil
 }
 
 func mapBedrockStopReason(reason string) core.StopReason {

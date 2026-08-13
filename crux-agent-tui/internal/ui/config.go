@@ -11,15 +11,6 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// ProviderConfig holds the AI provider configuration.
-type ProviderConfig struct {
-	Name      string // provider name (e.g., "openai", "deepseek", "custom")
-	Model     string
-	APIKey    string
-	BaseURL   string
-	MaxTokens int
-}
-
 // tuiConfig holds the configuration for the TUI app.
 type tuiConfig struct {
 	ProviderName string // provider name for display
@@ -33,16 +24,21 @@ type tuiConfig struct {
 }
 
 // defaultSystemPrompt is the default system prompt.
-const defaultSystemPrompt = `You are a helpful coding assistant. You can:
-- Read and write files on the user's machine
-- Execute shell commands
-- List directory contents
-- Edit files with precise search-and-replace operations
+const defaultSystemPrompt = `You are a helpful coding assistant. You have access to the following tools:
+
+- read_file: Read a file with line numbers. Supports offset/limit.
+- write_file: Create or overwrite a file. Creates parent directories.
+- edit_file: Search-and-replace edit (old_text must be unique in the file).
+- list_files: List directory contents (supports recursive, show_hidden).
+- bash: Execute a shell command.
+- glob: List files matching a glob pattern (e.g. "**/*.go").
+- grep: Search file contents for a pattern (substring or regex).
+- web_fetch: Fetch a URL and return its content as plain text.
 
 Rules:
-- After using tools, always summarize what you did and the results.
-- Chain multiple tool calls together when a task requires multiple steps (e.g. read → edit → verify).
-- Explain what you plan to do before using tools.
+- Use tools to inspect and modify files. Do not guess file contents.
+- Chain multiple tool calls when a task needs multiple steps (e.g. glob → read → edit → verify).
+- After using tools, briefly summarize what you did and the results.
 - Be careful with destructive operations.
 - If a task is complete, say so clearly.`
 
@@ -60,10 +56,11 @@ func loadConfig() (*tuiConfig, error) {
 		Temperature: 0.7,
 	}
 
-	// Detect provider and API key
+	// Detect provider and API key. An explicit AI_PROVIDER wins, otherwise
+	// infer from which provider API key is present on the environment.
 	cfg.ProviderName, cfg.APIKey = detectProvider()
 	if cfg.ProviderName == "" {
-		return nil, fmt.Errorf("no AI API key found. Set one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, GOOGLE_API_KEY, XAI_API_KEY, GROQ_API_KEY, MISTRAL_API_KEY")
+		return nil, fmt.Errorf("no AI API key found. Set one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, GOOGLE_API_KEY, XAI_API_KEY, GROQ_API_KEY, MISTRAL_API_KEY — or use AI_PROVIDER=openai-compatible with OPENAI_API_KEY + AI_BASE_URL")
 	}
 
 	cfg.ModelID = os.Getenv("AI_MODEL")
@@ -104,6 +101,17 @@ func loadConfig() (*tuiConfig, error) {
 }
 
 func detectProvider() (string, string) {
+	// Explicit AI_PROVIDER override (mirrors demo-agent).
+	if p := os.Getenv("AI_PROVIDER"); p != "" {
+		switch p {
+		case "openai-compatible":
+			return "openai-compatible", os.Getenv("OPENAI_API_KEY")
+		case "openai", "anthropic", "google", "deepseek", "xai", "groq", "mistral":
+			return p, apiKeyFor(p)
+		default:
+			return p, os.Getenv(strings.ToUpper(p) + "_API_KEY")
+		}
+	}
 	type providerEntry struct {
 		name    string
 		envVars []string
@@ -117,6 +125,12 @@ func detectProvider() (string, string) {
 		{"groq", []string{"GROQ_API_KEY"}},
 		{"mistral", []string{"MISTRAL_API_KEY"}},
 	}
+	// pre-check: if AI_BASE_URL is set, default to openai-compatible
+	if os.Getenv("AI_BASE_URL") != "" {
+		if key := os.Getenv("OPENAI_API_KEY"); key != "" {
+			return "openai-compatible", key
+		}
+	}
 	for _, p := range providers {
 		for _, envVar := range p.envVars {
 			if key := os.Getenv(envVar); key != "" {
@@ -127,10 +141,36 @@ func detectProvider() (string, string) {
 	return "", ""
 }
 
+func apiKeyFor(p string) string {
+	switch p {
+	case "openai":
+		return os.Getenv("OPENAI_API_KEY")
+	case "anthropic":
+		return os.Getenv("ANTHROPIC_API_KEY")
+	case "google":
+		if k := os.Getenv("GOOGLE_API_KEY"); k != "" {
+			return k
+		}
+		return os.Getenv("GEMINI_API_KEY")
+	case "deepseek":
+		return os.Getenv("DEEPSEEK_API_KEY")
+	case "xai":
+		return os.Getenv("XAI_API_KEY")
+	case "groq":
+		return os.Getenv("GROQ_API_KEY")
+	case "mistral":
+		return os.Getenv("MISTRAL_API_KEY")
+	default:
+		return os.Getenv(strings.ToUpper(p) + "_API_KEY")
+	}
+}
+
 func setDefaults(cfg *tuiConfig) {
 	if cfg.ModelID != "" {
 		return
 	}
+	// Default model per provider (metadata is resolved via ai.GetModel at
+	// agent construction time, so we only need the model id here).
 	switch cfg.ProviderName {
 	case "anthropic":
 		cfg.ModelID = "claude-sonnet-4-20250514"
@@ -138,33 +178,20 @@ func setDefaults(cfg *tuiConfig) {
 		cfg.ModelID = "gpt-4o"
 	case "deepseek":
 		cfg.ModelID = "deepseek-chat"
-		if cfg.BaseURL == "" {
-			cfg.BaseURL = "https://api.deepseek.com/v1"
-		}
 	case "google":
 		cfg.ModelID = "gemini-2.5-flash-preview-05-20"
 	case "xai":
 		cfg.ModelID = "grok-3-mini"
-		if cfg.BaseURL == "" {
-			cfg.BaseURL = "https://api.x.ai/v1"
-		}
 	case "groq":
 		cfg.ModelID = "llama-3.3-70b-versatile"
 	case "mistral":
 		cfg.ModelID = "mistral-large-latest"
+	case "openai-compatible":
+		if cfg.BaseURL == "" {
+			cfg.BaseURL = "https://api.openai.com/v1"
+		}
 	default:
 		cfg.ModelID = "gpt-4o"
-	}
-}
-
-// mustUseOpenAIProtocol returns true if the provider uses the OpenAI-compatible protocol.
-func (c *tuiConfig) mustUseOpenAIProtocol() bool {
-	// Most providers use OpenAI protocol. Anthropic and Google are the exceptions.
-	switch c.ProviderName {
-	case "anthropic", "google":
-		return false
-	default:
-		return true
 	}
 }
 

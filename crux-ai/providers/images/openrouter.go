@@ -2,12 +2,9 @@
 package images
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
 	"time"
 
@@ -70,27 +67,20 @@ func (p *OpenRouterProvider) GenerateImages(model core.ImagesModel, c core.Conte
 	ctx, cancel := context.WithCancel(sigCtx)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, err
+	headers := map[string]string{
+		"Content-Type":  "application/json",
+		"Authorization": "Bearer " + apiKey,
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
 	for k, v := range core.ProviderHeadersToRecord(core.MergeProviderHeaders(model.Headers, opts.Headers)) {
-		req.Header.Set(k, v)
+		headers[k] = v
 	}
 
 	client := core.NewTimeoutClient(0)
-	resp, err := client.Do(req)
+	resp, err := core.DoWithRetry(ctx, client, "POST", url, bodyBytes, headers, model.Provider, core.StreamOptions{})
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("openrouter-images: API error %d: %s", resp.StatusCode, string(bodyBytes))
-	}
 
 	var result struct {
 		Choices []struct {

@@ -1,12 +1,9 @@
 package google
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 
 	core "github.com/hycjack/crux-ai/core"
@@ -76,56 +73,51 @@ func streamVertex(ctx context.Context, model core.Model, c core.Context, opts co
 		opts.OnPayload(body)
 	}
 
-	stream := core.NewEventStream[core.AssistantMessageEvent, core.AssistantMessage]()
+	c.Messages = core.TransformMessages(c.Messages, model, nil)
+
+	ps := core.NewProviderEventStream()
 
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				stream.Error(fmt.Errorf("google-vertex: panic: %v", r))
+				ps.Error(fmt.Errorf("google-vertex: panic: %v", r))
 			}
 		}()
 		baseURL := fmt.Sprintf("https://%s-aiplatform.googleapis.com", location)
-		msg, err := doVertexStream(ctx, baseURL, apiKey, project, location, model, body, stream, opts)
+		err := doVertexStream(ctx, baseURL, apiKey, project, location, model, body, ps, opts)
 		if err != nil {
-			stream.Error(err)
+			ps.Error(err)
 			return
 		}
-		stream.End(msg)
+		ps.End(core.ProviderEventStreamResult{})
 	}()
 
-	return stream, nil
+	out := core.CanonicalizeProviderStream(ps, model.API, model.Provider, model.ID)
+	return out, nil
 }
 
-func doVertexStream(ctx context.Context, baseURL, apiKey, project, location string, model core.Model, body map[string]any, stream *core.AssistantMessageEventStream, opts core.StreamOptions) (core.AssistantMessage, error) {
+func doVertexStream(ctx context.Context, baseURL, apiKey, project, location string, model core.Model, body map[string]any, ps *core.ProviderEventStream, opts core.StreamOptions) error {
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-		return core.AssistantMessage{}, err
+		return err
 	}
 	url := fmt.Sprintf("%s/v1/projects/%s/locations/%s/publishers/google/models/%s:streamGenerateContent?alt=sse",
 		baseURL, project, location, model.ID)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return core.AssistantMessage{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
+	headers := map[string]string{"Content-Type": "application/json"}
 	if apiKey != "" {
-		req.Header.Set("x-goog-api-key", apiKey)
+		headers["x-goog-api-key"] = apiKey
 	}
 	for k, v := range core.ProviderHeadersToRecord(core.MergeProviderHeaders(model.Headers, opts.Headers)) {
-		req.Header.Set(k, v)
+		headers[k] = v
 	}
 
 	client := core.NewTimeoutClient(opts.TimeoutMs)
-	resp, err := client.Do(req)
+	resp, err := core.DoWithRetry(ctx, client, "POST", url, bodyBytes, headers, model.Provider, opts)
 	if err != nil {
-		return core.AssistantMessage{}, err
+		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		errBody, _ := io.ReadAll(resp.Body)
-		return core.AssistantMessage{}, fmt.Errorf("google-vertex: API error %d: %s", resp.StatusCode, string(errBody))
-	}
-	return processGoogleSSE(resp.Body, stream, model, opts)
+	return processGoogleSSE(resp.Body, ps, model, opts)
 }

@@ -4,16 +4,19 @@ import (
 	"github.com/hycjack/crux-ai/core"
 	"github.com/hycjack/crux-ai/providers/anthropic"
 	"github.com/hycjack/crux-ai/providers/bedrock"
+	"github.com/hycjack/crux-ai/providers/cerebras"
 	"github.com/hycjack/crux-ai/providers/compat"
 	"github.com/hycjack/crux-ai/providers/deepseek"
 	"github.com/hycjack/crux-ai/providers/faux"
 	"github.com/hycjack/crux-ai/providers/glm"
 	"github.com/hycjack/crux-ai/providers/google"
+	"github.com/hycjack/crux-ai/providers/groq"
 	"github.com/hycjack/crux-ai/providers/images"
 	"github.com/hycjack/crux-ai/providers/kimi"
 	"github.com/hycjack/crux-ai/providers/mistral"
 	"github.com/hycjack/crux-ai/providers/ollama"
 	"github.com/hycjack/crux-ai/providers/openai"
+	"github.com/hycjack/crux-ai/providers/xai"
 	"github.com/hycjack/crux-ai/providers/xiaomi"
 )
 
@@ -25,10 +28,11 @@ const OpenRouterImagesAPI core.KnownAPI = "openrouter-images"
 
 // RegisterBuiltInProviders registers all built-in API providers.
 //
-// OpenAI-protocol providers (OpenAI, Xiaomi, GLM, DeepSeek, Kimi) are
-// registered together under APIOpenAICompletions via a single compat.Router
-// that dispatches by model.Provider at request time. Native providers
-// (Anthropic, Google, Mistral, Bedrock) keep their dedicated APIs.
+// OpenAI-protocol providers (OpenAI, Xiaomi, GLM, DeepSeek, Kimi, Ollama,
+// Groq, xAI, Cerebras) are registered together under APIOpenAICompletions
+// via a single compat.Router that dispatches by model.Provider at request
+// time. Native providers (Anthropic, Google, Mistral, Bedrock) keep their
+// dedicated APIs.
 func RegisterBuiltInProviders() {
 	// --- Native providers ---
 	core.RegisterProvider(core.APIAnthropicMessages, anthropic.New(), "builtin")
@@ -52,7 +56,10 @@ func RegisterBuiltInProviders() {
 		WithConfig(glm.New()).
 		WithConfig(deepseek.New()).
 		WithConfig(kimi.New()).
-		WithConfig(ollama.New())
+		WithConfig(ollama.New()).
+		WithConfig(groq.New()).
+		WithConfig(xai.New()).
+		WithConfig(cerebras.New())
 	core.RegisterProvider(core.APIOpenAICompletions, openaiCompat, "builtin")
 
 	// --- Faux (testing) ---

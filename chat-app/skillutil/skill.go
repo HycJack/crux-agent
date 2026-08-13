@@ -23,7 +23,7 @@ import (
 	"strings"
 	"sync"
 
-	"crux-agent-runtime/agent"
+	"github.com/hycjack/agent-engine/engine"
 
 	"github.com/hycjack/crux-ai/core"
 )
@@ -271,11 +271,11 @@ func (l *Loader) Count() int {
 
 // AsAgentTools converts all loaded skills into agent tools.
 // Each skill becomes a tool that returns the SKILL.md content.
-func (l *Loader) AsAgentTools() []agent.AgentTool {
+func (l *Loader) AsAgentTools() []engine.AgentTool {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	tools := make([]agent.AgentTool, 0, len(l.skills))
+	tools := make([]engine.AgentTool, 0, len(l.skills))
 	for name, skill := range l.skills {
 		t := skillToTool(name, skill)
 		tools = append(tools, t)
@@ -290,13 +290,13 @@ func (l *Loader) AsAgentTools() []agent.AgentTool {
 }
 
 // skillToTool converts a Skill into an agent tool.
-func skillToTool(name string, skill *Skill) agent.AgentTool {
-	return agent.AgentTool{
+func skillToTool(name string, skill *Skill) engine.AgentTool {
+	return engine.AgentTool{
 		Name:        "skill_" + name,
 		Description: skill.Description,
 		Parameters:  mustSchema(`{"type":"object","properties":{},"additionalProperties":false}`),
-		Execute: func(_ context.Context, _ string, _ json.RawMessage, _ func(json.RawMessage)) (agent.AgentToolResult, error) {
-			return agent.AgentToolResult{
+		Execute: func(_ context.Context, _ string, _ json.RawMessage, _ func(json.RawMessage)) (engine.AgentToolResult, error) {
+			return engine.AgentToolResult{
 				Content: []core.ContentBlock{
 					core.TextContent{
 						Type: "text",

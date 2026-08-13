@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,14 +16,11 @@ import (
 	"sync"
 	"time"
 
-	"crux-agent-runtime/agent"
-	"crux-agent-runtime/autolearn"
-	ctxpkg "crux-agent-runtime/context"
-	"crux-agent-runtime/memory"
-	"crux-agent-runtime/tools"
-
+	"github.com/hycjack/agent-engine/defaults"
+	"github.com/hycjack/agent-engine/engine"
 	"github.com/hycjack/crux-ai/ai"
 	core "github.com/hycjack/crux-ai/core"
+	plugin "github.com/hycjack/crux-plugin"
 
 	// Register built-in LLM providers (OpenAI, Anthropic, Google, etc.).
 	_ "github.com/hycjack/crux-ai/providers"
@@ -31,6 +29,7 @@ import (
 
 	"chat-app/logutil"
 	"chat-app/skillutil"
+	"chat-app/tools"
 )
 
 // App is the Wails application struct bound to the frontend.
@@ -40,19 +39,24 @@ type App struct {
 	mu         sync.RWMutex
 	workingDir string
 	cancelFn   context.CancelFunc
-	agt        *agent.Agent
+	agt        *engine.Agent
 
 	// Cross-session long-term memory
-	mem    *memory.Memory
+	mem    *defaults.Memory
 	memDir string
 
 	// Skill loader
 	skillLoader *skillutil.Loader
 
+	// crux-plugin: subprocess JSON-RPC plugin manager + discovered tools
+	pluginMgr *plugin.Manager
+	pluginCtx context.Context
+	pluginCnl context.CancelFunc
+
 	// Auto-learn
-	learner          *autolearn.AutoLearner
+	learner          *defaults.AutoLearner
 	wfDir            string
-	wfExtractor      *autolearn.WorkflowExtractor
+	wfExtractor      *defaults.WorkflowExtractor
 	autoLearnEnabled bool
 }
 
@@ -102,7 +106,7 @@ func (a *App) startup(ctx context.Context) {
 	if appDir, err := appDataDir(); err == nil {
 		a.memDir = appDir
 		memPath := filepath.Join(appDir, "memory.json")
-		mem, err := memory.New(memPath)
+		mem, err := defaults.NewMemory(memPath)
 		if err != nil {
 			logutil.Warnf("Failed to init memory: %v", err)
 		} else {
@@ -112,6 +116,10 @@ func (a *App) startup(ctx context.Context) {
 	}
 
 	logutil.Infof("App startup complete")
+
+	// Initialize crux-plugin: discover + start subprocess tool plugins in
+	// the conventional plugin directories. Missing dirs are skipped silently.
+	a.initPlugins(ctx)
 }
 
 // AppDataDir returns the OS-conventional directory for app data.
@@ -1159,9 +1167,157 @@ You have access to the following tools to inspect and modify files inside the wo
 	return prompt
 }
 
+// -------------------- crux-plugin wiring --------------------
+
+// initPlugins discovers and starts subprocess JSON-RPC plugins from the
+// conventional plugin directories. Tool-capable plugins expose tools that
+// are merged into the agent's tool set on each turn (see buildAllTools).
+//
+// Directories are resolved relative to the executable so the app works
+// when the working directory is set to a project folder. Missing
+// directories are skipped silently by Manager.Discover.
+func (a *App) initPlugins(ctx context.Context) {
+	pluginDirs := []string{
+		filepath.Join(executableDir(), "plugins"),
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		pluginDirs = append(pluginDirs, filepath.Join(home, ".crux", "plugins"))
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelWarn,
+	}))
+	mgr := plugin.NewManager(logger)
+
+	if err := mgr.Discover(pluginDirs); err != nil {
+		logutil.Warnf("[plugin] discover failed: %v", err)
+	}
+
+	pctx, cancel := context.WithCancel(ctx)
+	a.mu.Lock()
+	a.pluginMgr = mgr
+	a.pluginCtx = pctx
+	a.pluginCnl = cancel
+	a.mu.Unlock()
+
+	if err := mgr.StartAll(pctx); err != nil {
+		logutil.Warnf("[plugin] start failed: %v", err)
+	}
+
+	if n := len(mgr.Plugins()); n > 0 {
+		logutil.Infof("[plugin] %d plugin(s) discovered", n)
+	} else {
+		logutil.Infof("[plugin] no plugins discovered (looked in %v)", pluginDirs)
+	}
+}
+
+// executableDir returns the directory of the running executable.
+func executableDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	return filepath.Dir(exe)
+}
+
+// adaptPluginTools converts a batch of crux-plugin ToolAdapters into
+// agent-engine tools. Each adapter represents a tool that runs in a
+// subprocess via JSON-RPC (e.g. `<pluginID>.<toolName>`).
+func adaptPluginTools(adapters []plugin.ToolAdapter) []engine.AgentTool {
+	out := make([]engine.AgentTool, 0, len(adapters))
+	for _, a := range adapters {
+		out = append(out, toEngineTool(adaptToEngineToolPlugin(a)))
+	}
+	return out
+}
+
+// adaptToEngineToolPlugin adapts a crux-plugin ToolAdapter into the
+// agent-engine ToolPlugin contract (in-process wrapper around the
+// subprocess Execute closure). See agent-engine/examples/crux-plugin-tool.
+func adaptToEngineToolPlugin(a plugin.ToolAdapter) engineToolPlugin {
+	params, _ := json.Marshal(a.Parameters)
+	return &adapterToolPlugin{
+		name:        a.Name,
+		description: a.Description,
+		parameters:  params,
+		execute:     a.Execute,
+	}
+}
+
+// toEngineTool converts a ToolPlugin into an engine.AgentTool.
+func toEngineTool(tp engineToolPlugin) engine.AgentTool {
+	return engine.AgentTool{
+		Name:        tp.Name(),
+		Description: tp.Description(),
+		Parameters:  json.RawMessage(tp.Parameters()),
+		Execute: func(ctx context.Context, id string, args json.RawMessage, onUpdate func(json.RawMessage)) (engine.AgentToolResult, error) {
+			bridge := func(b []byte) { onUpdate(json.RawMessage(b)) }
+			r, err := tp.Execute(ctx, id, args, bridge)
+			if err != nil {
+				return engine.AgentToolResult{
+					Content: []core.ContentBlock{core.TextContent{Type: "text", Text: err.Error()}},
+					IsError: true,
+				}, nil
+			}
+			return engine.AgentToolResult{
+				Content:   r.Content,
+				Details:   r.Details,
+				IsError:   r.IsError,
+				Terminate: r.Terminate,
+			}, nil
+		},
+	}
+}
+
+// engineToolPlugin is the minimal crux-plugin tool contract used by the
+// in-process adapter. It mirrors agent-engine/plugin.ToolPlugin so we don't
+// need to depend on that package here; only the pieces needed by the
+// chat app's agent are kept.
+type engineToolPlugin interface {
+	Name() string
+	Description() string
+	Parameters() []byte
+	Execute(ctx context.Context, toolCallID string, params []byte, onUpdate func([]byte)) (pluginToolResult, error)
+}
+
+// pluginToolResult is the in-process result of a plugin tool execution.
+type pluginToolResult struct {
+	Content   []core.ContentBlock
+	Details   json.RawMessage
+	IsError   bool
+	Terminate bool
+}
+
+// adapterToolPlugin wraps a crux-plugin ToolAdapter into the engineToolPlugin
+// contract. ToolAdapter.Execute returns a result string which becomes the
+// TextContent returned to the LLM.
+type adapterToolPlugin struct {
+	name        string
+	description string
+	parameters  []byte
+	execute     func(ctx context.Context, args json.RawMessage) (string, error)
+}
+
+func (t *adapterToolPlugin) Name() string        { return t.name }
+func (t *adapterToolPlugin) Description() string { return t.description }
+func (t *adapterToolPlugin) Parameters() []byte  { return t.parameters }
+
+func (t *adapterToolPlugin) Execute(ctx context.Context, _ string, params []byte, _ func([]byte)) (pluginToolResult, error) {
+	out, err := t.execute(ctx, params)
+	if err != nil {
+		return pluginToolResult{
+			Content: []core.ContentBlock{core.TextContent{Type: "text", Text: err.Error()}},
+			IsError: true,
+		}, nil
+	}
+	return pluginToolResult{
+		Content: []core.ContentBlock{core.TextContent{Type: "text", Text: out}},
+	}, nil
+}
+
 // -------------------- Agent wiring --------------------
 
-func (a *App) getOrCreateAgent(model core.Model, cwd, apiKey string, thinkingLevel ...string) *agent.Agent {
+func (a *App) getOrCreateAgent(model core.Model, cwd, apiKey string, thinkingLevel ...string) *engine.Agent {
 	if a.agt != nil {
 		// Agent already exists — update its config for this turn.
 		a.agt.SetModel(model)
@@ -1180,12 +1336,12 @@ func (a *App) getOrCreateAgent(model core.Model, cwd, apiKey string, thinkingLev
 
 	compaction := buildCompactionConfig(model, apiKey)
 
-	agt := agent.New(agent.AgentOptions{
-		InitialState: &agent.AgentState{
+	agt := engine.New(engine.AgentOptions{
+		InitialState: &engine.AgentState{
 			Model:         model,
 			SystemPrompt:  a.buildSystemPrompt(cwd),
 			Tools:         toolsAll,
-			ToolExecution: agent.ToolExecSequential,
+			ToolExecution: engine.ToolExecSequential,
 			SimpleStreamOptions: core.SimpleStreamOptions{
 				StreamOptions: core.StreamOptions{
 					APIKey: apiKey,
@@ -1196,7 +1352,7 @@ func (a *App) getOrCreateAgent(model core.Model, cwd, apiKey string, thinkingLev
 		Compaction: compaction,
 	})
 
-	agt.Subscribe(func(evt agent.AgentEvent) {
+	agt.Subscribe(func(evt engine.AgentEvent) {
 		a.forwardAgentEvent(evt)
 	})
 
@@ -1229,11 +1385,10 @@ func (a *App) initAutolearn(model core.Model, apiKey string) {
 	wfDir := filepath.Join(a.workingDir, "skills", "auto-extracted")
 	_ = os.MkdirAll(wfDir, 0755)
 
-	learner := autolearn.New(mem, autolearn.DefaultSettings())
-	learner.SetSignalExtractor(&autolearn.LLMSignalExtractor{SummarizeFunc: signalSummarize})
-	learner.SetWorkflowDir(wfDir)
+	learner := defaults.NewAutoLearner(mem, 5) // extract every 5 turns (matches runtime DefaultSettings.ExtractEveryN)
+	learner.SetSignalExtractor(&defaults.LLMSignalExtractor{SummarizeFunc: signalSummarize})
 
-	wfExtractor := &autolearn.WorkflowExtractor{SummarizeFunc: wfSummarize}
+	wfExtractor := &defaults.WorkflowExtractor{SummarizeFunc: wfSummarize}
 
 	a.mu.Lock()
 	a.learner = learner
@@ -1245,14 +1400,27 @@ func (a *App) initAutolearn(model core.Model, apiKey string) {
 }
 
 // buildAllTools builds the full tool set including built-in tools,
-// skill tools, and memory tools.
-func (a *App) buildAllTools(cwd string) []agent.AgentTool {
-	var allTools []agent.AgentTool
+// crux-plugin subprocess tools, skill tools, and memory tools.
+func (a *App) buildAllTools(cwd string) []engine.AgentTool {
+	var allTools []engine.AgentTool
 
-	// Built-in tools (wrapped with working dir)
-	builtins := tools.All()
-	for _, t := range builtins {
+	// Built-in tools (chat-app/tools), already engine.AgentTool, wrapped
+	// with the working dir so relative paths and shell commands resolve
+	// inside cwd instead of the process's working dir.
+	for _, t := range tools.All() {
 		allTools = append(allTools, wrapWithWorkingDir(t, cwd))
+	}
+
+	// crux-plugin subprocess tools (ToolAdapter → engine.AgentTool).
+	a.mu.RLock()
+	mgr := a.pluginMgr
+	a.mu.RUnlock()
+	if mgr != nil {
+		if adapters, err := mgr.RegisterPluginTools(a.ctx); err == nil {
+			allTools = append(allTools, adaptPluginTools(adapters)...)
+		} else {
+			logutil.Warnf("[plugin] register tools failed: %v", err)
+		}
 	}
 
 	// Skill tools
@@ -1277,24 +1445,24 @@ func (a *App) buildAllTools(cwd string) []agent.AgentTool {
 }
 
 // rememberTool returns a tool that stores a key=value pair into long-term memory.
-func (a *App) rememberTool(mem *memory.Memory) agent.AgentTool {
-	return agent.AgentTool{
+func (a *App) rememberTool(mem *defaults.Memory) engine.AgentTool {
+	return engine.AgentTool{
 		Name:        "remember",
 		Description: "Store a key-value pair into long-term memory. Use this when the user asks you to remember something or when you learn a fact about the user (their name, preferences, project details) that will be useful in future conversations.",
 		Parameters:  mustRawMessage(`{"type":"object","properties":{"key":{"type":"string","description":"Memory key, e.g. user.name or project.tech_stack"},"value":{"type":"string","description":"Value to store"}},"required":["key","value"]}`),
-		Execute: func(_ context.Context, _ string, params json.RawMessage, _ func(json.RawMessage)) (agent.AgentToolResult, error) {
+		Execute: func(_ context.Context, _ string, params json.RawMessage, _ func(json.RawMessage)) (engine.AgentToolResult, error) {
 			var args struct {
 				Key   string `json:"key"`
 				Value string `json:"value"`
 			}
 			if err := json.Unmarshal(params, &args); err != nil {
-				return agent.AgentToolResult{
+				return engine.AgentToolResult{
 					Content: []core.ContentBlock{core.TextContent{Type: "text", Text: "Error: invalid arguments - " + err.Error()}},
 					IsError: true,
 				}, nil
 			}
 			if args.Key == "" {
-				return agent.AgentToolResult{
+				return engine.AgentToolResult{
 					Content: []core.ContentBlock{core.TextContent{Type: "text", Text: "Error: key is required"}},
 					IsError: true,
 				}, nil
@@ -1302,7 +1470,7 @@ func (a *App) rememberTool(mem *memory.Memory) agent.AgentTool {
 			mem.Set(args.Key, args.Value)
 			_ = mem.Save()
 			logutil.Infof("[memory] set %s=%s", args.Key, args.Value)
-			return agent.AgentToolResult{
+			return engine.AgentToolResult{
 				Content: []core.ContentBlock{core.TextContent{Type: "text", Text: fmt.Sprintf("Remembered: %s = %s", args.Key, args.Value)}},
 			}, nil
 		},
@@ -1310,33 +1478,33 @@ func (a *App) rememberTool(mem *memory.Memory) agent.AgentTool {
 }
 
 // recallTool returns a tool that retrieves a value from long-term memory.
-func (a *App) recallTool(mem *memory.Memory) agent.AgentTool {
-	return agent.AgentTool{
+func (a *App) recallTool(mem *defaults.Memory) engine.AgentTool {
+	return engine.AgentTool{
 		Name:        "recall",
 		Description: "Retrieve a value from long-term memory by key. Use this when you need to recall information about the user or project that was previously stored.",
 		Parameters:  mustRawMessage(`{"type":"object","properties":{"key":{"type":"string","description":"Memory key to look up, e.g. user.name or project.tech_stack"}},"required":["key"]}`),
-		Execute: func(_ context.Context, _ string, params json.RawMessage, _ func(json.RawMessage)) (agent.AgentToolResult, error) {
+		Execute: func(_ context.Context, _ string, params json.RawMessage, _ func(json.RawMessage)) (engine.AgentToolResult, error) {
 			var args struct {
 				Key string `json:"key"`
 			}
 			if err := json.Unmarshal(params, &args); err != nil {
-				return agent.AgentToolResult{
+				return engine.AgentToolResult{
 					Content: []core.ContentBlock{core.TextContent{Type: "text", Text: "Error: invalid arguments - " + err.Error()}},
 					IsError: true,
 				}, nil
 			}
 			if args.Key == "" {
-				return agent.AgentToolResult{
+				return engine.AgentToolResult{
 					Content: []core.ContentBlock{core.TextContent{Type: "text", Text: "Error: key is required"}},
 					IsError: true,
 				}, nil
 			}
 			if value, ok := mem.Get(args.Key); ok {
-				return agent.AgentToolResult{
+				return engine.AgentToolResult{
 					Content: []core.ContentBlock{core.TextContent{Type: "text", Text: fmt.Sprintf("Memory: %s = %s", args.Key, value)}},
 				}, nil
 			}
-			return agent.AgentToolResult{
+			return engine.AgentToolResult{
 				Content: []core.ContentBlock{core.TextContent{Type: "text", Text: fmt.Sprintf("No memory found for key: %s", args.Key)}},
 			}, nil
 		},
@@ -1353,12 +1521,12 @@ func mustRawMessage(s string) json.RawMessage {
 
 // wrapWithWorkingDir rewrites file/shell tools so relative paths and shell
 // commands resolve inside cwd instead of the process's working dir.
-func wrapWithWorkingDir(t agent.AgentTool, cwd string) agent.AgentTool {
+func wrapWithWorkingDir(t engine.AgentTool, cwd string) engine.AgentTool {
 	if cwd == "" {
 		return t
 	}
 	inner := t.Execute
-	t.Execute = func(ctx context.Context, toolCallID string, params json.RawMessage, onUpdate func(json.RawMessage)) (agent.AgentToolResult, error) {
+	t.Execute = func(ctx context.Context, toolCallID string, params json.RawMessage, onUpdate func(json.RawMessage)) (engine.AgentToolResult, error) {
 		if rewritten, ok := rewriteToolParams(t.Name, params, cwd); ok {
 			params = rewritten
 		}
@@ -1375,11 +1543,12 @@ func rewriteToolParams(name string, params json.RawMessage, cwd string) (json.Ra
 	case "bash":
 		var args struct {
 			Command string `json:"command"`
+			Shell   string `json:"shell"`
 		}
 		if err := json.Unmarshal(params, &args); err != nil || args.Command == "" {
 			return nil, false
 		}
-		args.Command = injectCwd(args.Command, cwd)
+		args.Command = injectCwd(args.Command, cwd, args.Shell)
 		return jsonMarshal(args)
 	case "read_file", "write_file":
 		var args struct {
@@ -1419,11 +1588,34 @@ func jsonMarshal(v interface{}) (json.RawMessage, bool) {
 
 // injectCwd prefixes the shell command with a "cd into cwd" step so
 // relative paths resolve there. Uses platform-native shell semantics.
-func injectCwd(cmd, cwd string) string {
-	if stdruntime.GOOS == "windows" {
-		return fmt.Sprintf("cd /d \"%s\" & %s", cwd, cmd)
+//
+// The separator and the cd syntax differ per shell:
+//   - PowerShell (default on Windows): '&' is a reserved call operator, so it
+//     cannot be used as a command separator on PowerShell 5.1+. We use ';' and
+//     Set-Location instead.
+//   - cmd.exe:                       uses cd /d and '&' as the separator.
+//   - bash/sh:                       uses cd and '&&' as the separator.
+func injectCwd(cmd, cwd, shellOverride string) string {
+	shell := strings.ToLower(strings.TrimSpace(shellOverride))
+	if shell == "" {
+		shell = strings.ToLower(strings.TrimSpace(os.Getenv("CRUX_SHELL")))
 	}
-	return fmt.Sprintf("cd \"%s\" && %s", cwd, cmd)
+
+	switch stdruntime.GOOS {
+	case "windows":
+		switch shell {
+		case "cmd", "cmd.exe":
+			return fmt.Sprintf(`cd /d "%s" & %s`, cwd, cmd)
+		case "bash", "sh":
+			return fmt.Sprintf(`cd "%s" && %s`, cwd, cmd)
+		default:
+			// Default Windows shell is PowerShell (pwsh or powershell.exe).
+			// Use ; as the separator and Set-Location for the cd step.
+			return fmt.Sprintf(`Set-Location -LiteralPath "%s"; %s`, cwd, cmd)
+		}
+	default:
+		return fmt.Sprintf(`cd "%s" && %s`, cwd, cmd)
+	}
 }
 
 // buildCompactionConfig wires up automatic context-window compaction.
@@ -1432,22 +1624,17 @@ func injectCwd(cmd, cwd string) string {
 //     compactor: LLM summarize (lossy) → slide window (cheap).
 //  2. Overflow retry: after a context-overflow error, force-compact and retry
 //     up to OverflowRetries times.
-func buildCompactionConfig(model core.Model, apiKey string) agent.CompactionConfig {
-	summarizer := &ctxpkg.LLMSummarize{
-		KeepLast:   8,
-		MinTrigger: 20,
-		Summarize:  buildSummarizeFunc(model, apiKey),
-	}
+func buildCompactionConfig(model core.Model, apiKey string) engine.CompactionConfig {
+	summarizer := defaults.NewLLMSummarize()
+	summarizer.KeepLast = 8
+	summarizer.MinTrigger = 20
+	summarizer.Summarize = buildSummarizeFunc(model, apiKey)
 
-	chained := &ctxpkg.ChainedCompactor{
-		Compactors: []ctxpkg.Compactor{
-			summarizer,
-			ctxpkg.NewSlideWindow(40),
-		},
-	}
-
-	return agent.CompactionConfig{
-		Compactor:       chained,
+	return engine.CompactionConfig{
+		// agent-engine uses a plain function signature for compaction;
+		// defaults.NewChainedCompactorFunc wraps the LLM-summarize + slide
+		// window strategies to satisfy it.
+		Compactor: defaults.NewChainedCompactorFunc(summarizer, defaults.NewSlideWindow(40)),
 		MaxTokens:       60000,
 		ReserveTokens:   4096,
 		OverflowRetries: 2,
@@ -1460,25 +1647,25 @@ func buildCompactionConfig(model core.Model, apiKey string) agent.CompactionConf
 
 // forwardAgentEvent converts agent events into Wails runtime events so
 // the React frontend can render streaming output.
-func (a *App) forwardAgentEvent(evt agent.AgentEvent) {
+func (a *App) forwardAgentEvent(evt engine.AgentEvent) {
 	switch e := evt.(type) {
-	case agent.EventAgentStart:
+	case engine.EventAgentStart:
 		wruntime.EventsEmit(a.ctx, "stream-agent-start", "")
 		logutil.Debugf("[agent] started")
-	case agent.EventAgentEnd:
+	case engine.EventAgentEnd:
 		wruntime.EventsEmit(a.ctx, "stream-done", "")
 		logutil.Debugf("[agent] ended")
-	case agent.EventTurnStart:
+	case engine.EventTurnStart:
 		logutil.Debugf("[agent] turn start")
-	case agent.EventTurnEnd:
+	case engine.EventTurnEnd:
 		logutil.Debugf("[agent] turn end")
-	case agent.EventMessageUpdate:
+	case engine.EventMessageUpdate:
 		a.forwardAssistantEvent(e.AssistantEvent)
-	case agent.EventToolExecStart:
+	case engine.EventToolExecStart:
 		data, _ := json.Marshal(map[string]string{"id": e.ToolCallID, "name": e.ToolName})
 		wruntime.EventsEmit(a.ctx, "stream-tool-exec-start", string(data))
 		logutil.Debugf("[tool] executing %s (%s)", e.ToolName, string(e.ToolCallID))
-	case agent.EventToolExecEnd:
+	case engine.EventToolExecEnd:
 		text := string(e.Result)
 		event := "stream-tool-exec-end"
 		if e.IsError {

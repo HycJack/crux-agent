@@ -27,9 +27,10 @@ type ToolCallInfo struct {
 
 // ChatMessage represents a single message in the conversation.
 type ChatMessage struct {
-	Role     string // "user", "assistant", "system", "error", "reasoning", "tool_call"
-	Content  string
-	ToolCall *ToolCallInfo // non-nil only for tool_call role
+	Role      string // "user", "assistant", "system", "error", "reasoning", "tool_call"
+	Content   string
+	ToolCall  *ToolCallInfo // non-nil only for tool_call role
+	Streaming bool          // true while an assistant message is still accumulating tokens
 }
 
 // ── Selection ─────────────────────────────────────────────────────────────────
@@ -94,8 +95,9 @@ type ChatView struct {
 	dirty          bool // true if full rebuild needed (width change, pop, clear)
 
 	// Content management
-	content      string   // concatenation of messageRenders (built only when dirty)
-	wrappedLines []string // content wrapped to contentWidth
+	content    string     // concatenation of messageRenders (built only on full rebuild)
+	msgWrapped [][]string // wrapped lines per message (streaming splice source)
+	msgStart   []int      // msgStart[i] = flat line index where message i's lines begin
 
 	// Scrolling
 	yoff  int // first visible line index
@@ -110,6 +112,11 @@ type ChatView struct {
 
 	// Cached contentWidth for wrapStyle cache
 	lastCW int
+
+	// Streaming markdown cache: holds incremental render state for the current
+	// streaming assistant message so each token re-renders only the delta
+	// instead of re-parsing the whole accumulated content.
+	stream *streamMDState
 
 	// Transcript top offset (set by App.View for mouse coordinate mapping)
 	transcriptY int
@@ -138,16 +145,25 @@ func (c *ChatView) SetSize(w, h int) {
 // ── Message management ────────────────────────────────────────────────────────
 
 // AddMessage appends a new message and scrolls to bottom.
+// Only the new message is rendered and wrapped; earlier messages are untouched.
 func (c *ChatView) AddMessage(msg ChatMessage) {
 	c.messages = append(c.messages, msg)
+	// A new message means the previous streaming message finished accumulating;
+	// drop its incremental render state so the next stream starts fresh.
+	c.stream = nil
 	// Only render the new message incrementally
 	rendered := c.formatMessage(msg)
 	c.messageRenders = append(c.messageRenders, rendered)
-	c.rebuildContentFromRenders()
+	lines := c.wrapMessage(rendered)
+	c.msgWrapped = append(c.msgWrapped, lines)
+	c.total += len(lines)
+	c.recomputeMsgStart()
 	c.GotoBottom()
 }
 
 // UpdateLastMessage updates the content of the most recent message (incremental).
+// Only the last message's render + wrapped lines are recomputed; earlier
+// messages are left untouched (no full transcript re-wrap).
 func (c *ChatView) UpdateLastMessage(content string) {
 	if len(c.messages) == 0 {
 		return
@@ -155,20 +171,19 @@ func (c *ChatView) UpdateLastMessage(content string) {
 	c.messages[len(c.messages)-1].Content = content
 	// Incremental: only re-render the last message
 	c.messageRenders[len(c.messageRenders)-1] = c.formatMessage(c.messages[len(c.messages)-1])
-	c.rebuildContentFromRenders()
+	c.spliceLast()
 	c.GotoBottom()
 }
 
 // ReplaceLastMessage replaces the last message entirely (incremental).
 func (c *ChatView) ReplaceLastMessage(msg ChatMessage) {
 	if len(c.messages) == 0 {
-		c.messages = append(c.messages, msg)
-		c.messageRenders = append(c.messageRenders, c.formatMessage(msg))
-	} else {
-		c.messages[len(c.messages)-1] = msg
-		c.messageRenders[len(c.messageRenders)-1] = c.formatMessage(msg)
+		c.AddMessage(msg)
+		return
 	}
-	c.rebuildContentFromRenders()
+	c.messages[len(c.messages)-1] = msg
+	c.messageRenders[len(c.messageRenders)-1] = c.formatMessage(msg)
+	c.spliceLast()
 	c.GotoBottom()
 }
 
@@ -184,11 +199,11 @@ func (c *ChatView) UpdateLastToolOutput(chunk string) {
 	}
 	// Incremental: only re-render last message
 	c.messageRenders[len(c.messageRenders)-1] = c.formatMessage(c.messages[len(c.messages)-1])
-	c.rebuildContentFromRenders()
+	c.spliceLast()
 	c.GotoBottom()
 }
 
-// PopLastMessage removes the most recent message and returns it (full rebuild).
+// PopLastMessage removes the most recent message and returns it (incremental).
 func (c *ChatView) PopLastMessage() *ChatMessage {
 	if len(c.messages) == 0 {
 		return nil
@@ -196,7 +211,15 @@ func (c *ChatView) PopLastMessage() *ChatMessage {
 	last := c.messages[len(c.messages)-1]
 	c.messages = c.messages[:len(c.messages)-1]
 	c.messageRenders = c.messageRenders[:len(c.messageRenders)-1]
-	c.rebuildContentFromRenders()
+	// The last message's lines start at its msgStart entry; drop the tail.
+	c.msgWrapped = c.msgWrapped[:len(c.msgWrapped)-1]
+	if len(c.msgWrapped) > 0 {
+		c.total = c.msgStart[len(c.msgWrapped)-1] + len(c.msgWrapped[len(c.msgWrapped)-1])
+	} else {
+		c.total = 0
+	}
+	c.msgStart = c.msgStart[:len(c.msgStart)-1]
+	c.stream = nil
 	c.GotoBottom()
 	return &last
 }
@@ -205,16 +228,19 @@ func (c *ChatView) PopLastMessage() *ChatMessage {
 func (c *ChatView) Clear() {
 	c.messages = nil
 	c.messageRenders = nil
+	c.msgWrapped = nil
+	c.msgStart = nil
 	c.sel = selection{}
+	c.stream = nil
 	c.content = ""
-	c.wrappedLines = nil
 	c.total = 0
 }
+
+// Width returns the viewport width.  Returns the viewport width.
 
 // Height returns the viewport height.
 func (c *ChatView) Height() int { return c.height }
 
-// Width returns the viewport width.  Returns the viewport width.
 func (c *ChatView) Width() int { return c.width }
 
 // ── Content rebuild (incremental) ─────────────────────────────────────────────
@@ -250,11 +276,14 @@ func (c *ChatView) fullRebuild() {
 	c.rebuildContentFromRenders()
 }
 
-// rebuildContentFromRenders concatenates messageRenders and re-wraps.
+// rebuildContentFromRenders re-wraps every message's render from scratch.
+// Called only on full rebuild (resize, pop-of-middle, clear) — never on the
+// per-token streaming path.
 func (c *ChatView) rebuildContentFromRenders() {
 	if len(c.messageRenders) == 0 {
 		c.content = ""
-		c.wrappedLines = nil
+		c.msgWrapped = nil
+		c.msgStart = nil
 		c.total = 0
 		return
 	}
@@ -262,14 +291,85 @@ func (c *ChatView) rebuildContentFromRenders() {
 	est := len(c.messageRenders[0]) * len(c.messageRenders)
 	var b strings.Builder
 	b.Grow(est)
+	wrapped := make([][]string, 0, len(c.messageRenders))
+	total := 0
 	for i, r := range c.messageRenders {
 		if i > 0 {
 			b.WriteString("\n")
 		}
 		b.WriteString(r)
+		lines := c.wrapMessage(r)
+		wrapped = append(wrapped, lines)
+		total += len(lines)
 	}
 	c.content = b.String()
-	c.wrapContent()
+	c.msgWrapped = wrapped
+	c.total = total
+	c.recomputeMsgStart()
+}
+
+// wrapMessage wraps a single message's rendered ANSI into lines using the
+// current content width. Wrapping per-message and joining is output-identical
+// to wrapping the concatenation of messages, because every message is joined
+// with a "\n" (a hard wrap point) — see tests.
+func (c *ChatView) wrapMessage(render string) []string {
+	cw := c.contentWidth()
+	c.lastCW = cw
+	if cw <= 0 {
+		return nil
+	}
+	ws := getWrapStyle(cw)
+	return strings.Split(ws.Render(render), "\n")
+}
+
+// recomputeMsgStart rebuilds the cumulative per-message line offsets from
+// msgWrapped lengths. O(number of messages), never called per streaming token.
+func (c *ChatView) recomputeMsgStart() {
+	c.msgStart = make([]int, len(c.msgWrapped))
+	acc := 0
+	for i, m := range c.msgWrapped {
+		c.msgStart[i] = acc
+		acc += len(m)
+	}
+}
+
+// lineAt returns the wrapped line at the given absolute line index, or "" if
+// out of range. Random access via the cumulative per-message offsets avoids
+// maintaining a flattened copy that would have to be re-copied on every token.
+func (c *ChatView) lineAt(idx int) string {
+	if idx < 0 || idx >= c.total {
+		return ""
+	}
+	// Backwards scan: streaming appends land near the tail, so this is cheap.
+	for i := len(c.msgStart) - 1; i >= 0; i-- {
+		if idx >= c.msgStart[i] {
+			off := idx - c.msgStart[i]
+			if off < len(c.msgWrapped[i]) {
+				return c.msgWrapped[i][off]
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
+// spliceLast re-wraps only the last message's line slice in place. Earlier
+// messages' line slices and offsets are never touched, so per-token streaming
+// cost does not grow with the size of a fixed transcript.
+func (c *ChatView) spliceLast() {
+	last := len(c.msgWrapped) - 1
+	if last < 0 {
+		return
+	}
+	// Re-wrap only the last message's render.
+	c.msgWrapped[last] = c.wrapMessage(c.messageRenders[last])
+	// msgStart[last] still points at the (unchanged) lines before it; recompute
+	// the total from the per-message lengths. O(number of messages), not lines.
+	total := 0
+	for _, m := range c.msgWrapped {
+		total += len(m)
+	}
+	c.total = total
 }
 
 // getWrapStyle returns a cached lipgloss.Style for a given width.
@@ -285,21 +385,6 @@ func getWrapStyle(cw int) lipgloss.Style {
 		wrapStyleCW = cw
 	}
 	return wrapStyleCache
-}
-
-// wrapContent wraps the raw content to contentWidth using a cached style.
-func (c *ChatView) wrapContent() {
-	cw := c.contentWidth()
-	c.lastCW = cw
-	if cw <= 0 {
-		c.wrappedLines = nil
-		c.total = 0
-		return
-	}
-	ws := getWrapStyle(cw)
-	wrapped := ws.Render(c.content)
-	c.wrappedLines = strings.Split(wrapped, "\n")
-	c.total = len(c.wrappedLines)
 }
 
 // ── Scrolling ─────────────────────────────────────────────────────────────────
@@ -420,10 +505,7 @@ func (c *ChatView) SelectedText() string {
 
 // wrappedLineSafe returns a wrapped line, or "" if out of range.
 func (c *ChatView) wrappedLineSafe(idx int) string {
-	if idx < 0 || idx >= len(c.wrappedLines) {
-		return ""
-	}
-	return c.wrappedLines[idx]
+	return c.lineAt(idx)
 }
 
 // ── View ──────────────────────────────────────────────────────────────────────
@@ -459,8 +541,9 @@ func (c *ChatView) View() string {
 	for r := 0; r < h; r++ {
 		idx := yoff + r
 		line := blank
-		if idx >= 0 && idx < len(c.wrappedLines) {
-			line = c.wrappedLines[idx]
+		if idx >= 0 && idx < total {
+			line = c.lineAt(idx)
+
 			// Pad to content width — use blank if shorter, else concatenate
 			if dw := displayWidth(stripANSI(line)); dw < cw {
 				line += blank[cw-dw:] // reuse tail of the precomputed blank
@@ -595,7 +678,14 @@ func (c *ChatView) formatMessage(msg ChatMessage) string {
 
 	case "assistant":
 		label := AssistantMsgStyle.Render("Assistant:")
-		content := renderMarkdown(msg.Content, innerW)
+		var content string
+		if msg.Streaming {
+			// Fast incremental path: only the appended delta is re-rendered.
+			content = c.streamRenderAssistant(msg.Content, innerW)
+		} else {
+			// Finalized: do the full markdown + syntax-highlight render once.
+			content = renderMarkdown(msg.Content, innerW)
+		}
 		return lipgloss.JoinVertical(lipgloss.Left, label, content)
 
 	case "system":
@@ -696,6 +786,145 @@ func (c *ChatView) formatToolCard(tc *ToolCallInfo) string {
 }
 
 // ── Markdown rendering ───────────────────────────────────────────────────────
+
+// streamMDState carries incremental markdown render state for the currently
+// streaming assistant message. Each new token re-renders only the appended
+// delta instead of re-parsing the whole accumulated content, keeping the
+// streaming path roughly O(delta) per token.
+//
+// While streaming, prose is rendered with inline markdown and code blocks are
+// shown as plain (unhighlighted) lines so tokens stay cheap; the full
+// markdown + chroma render runs once the message finalizes (Streaming=false).
+type streamMDState struct {
+	committed    strings.Builder // ANSI for all fully-terminated output lines (no trailing \n)
+	committedLen int             // bytes of the current content encoded into `committed`
+	prevContent  string          // content from the previous call, for growth check
+	inCode       bool            // currently inside a ``` code fence
+	codeLang     string          // language hint after the opening fence
+	width        int
+}
+
+// boldInlineStyle is a cached bold style used by the inline-markdown fast path
+// (avoids allocating a new Style per token).
+var boldInlineStyle = lipgloss.NewStyle().Bold(true)
+
+// maxStreamPartial caps how much of a still-growing (newline-less) partial line
+// is rendered each token, bounding the worst-case cost of a single very long
+// unbroken line during streaming. Once newline arrives the full line is
+// committed and rendered correctly, so this only affects transient display.
+const maxStreamPartial = 512
+
+// markdownInline applies inline markdown (code + bold) to a single line.
+func markdownInline(line string) string {
+	line = codeRE.ReplaceAllString(line, CodeBlockStyle.Render("$1"))
+	line = boldRE.ReplaceAllString(line, boldInlineStyle.Render("$1"))
+	return line
+}
+
+// streamRenderAssistant incrementally renders an in-progress assistant message.
+func (c *ChatView) streamRenderAssistant(content string, width int) string {
+	if width < 10 {
+		width = 80
+	}
+
+	s := c.stream
+	// Reset/full-render when the message is replaced or the width changes.
+	if s == nil || s.width != width || !strings.HasPrefix(content, s.prevContent) {
+		full := renderMarkdown(content, width)
+		s = &streamMDState{prevContent: content, width: width, committedLen: len(content)}
+		s.committed.WriteString(full)
+		// Reconstruct code-fence state so the next delta is classified correctly.
+		s.inCode, s.codeLang = scanCodeState(content)
+		c.stream = s
+		return full
+	}
+
+	s.prevContent = content
+	// Commit every complete (newline-terminated) line that has appeared since the
+	// last call; the trailing partial line is re-rendered fresh each call.
+	rest := content[s.committedLen:]
+	for {
+		nl := strings.IndexByte(rest, '\n')
+		if nl < 0 {
+			break
+		}
+		s.commitLine(rest[:nl])
+		s.committedLen += nl + 1
+		rest = rest[nl+1:]
+	}
+
+	partial := content[s.committedLen:]
+	var partialRender string
+	if partial != "" {
+		// The trailing partial line is transient: once a newline arrives it is
+		// committed correctly (full render). While it is still growing we cap its
+		// display length so a single very long unbroken line cannot cause O(n²)
+		// re-renders on every token.
+		if len(partial) > maxStreamPartial {
+			partial = partial[:maxStreamPartial] + "…"
+		}
+		if s.inCode {
+			partialRender = CodeBlockStyle.Render("  " + partial)
+		} else {
+			partialRender = markdownInline(partial)
+		}
+	}
+
+	if partialRender == "" {
+		return s.committed.String()
+	}
+	if s.committed.Len() > 0 {
+		return s.committed.String() + "\n" + partialRender
+	}
+	return partialRender
+}
+
+// commitLine consumes one complete (newline-terminated) input line into the
+// committed output buffer.
+func (s *streamMDState) commitLine(line string) {
+	trimmed := line
+	if strings.HasPrefix(trimmed, "```") {
+		if s.inCode {
+			// Closing fence: back to prose. The fence line renders nothing.
+			s.inCode = false
+			s.codeLang = ""
+		} else {
+			// Opening fence: subsequent lines are code, shown plain while streaming.
+			s.inCode = true
+			s.codeLang = strings.TrimSpace(trimmed[3:])
+		}
+		return
+	}
+
+	if s.committed.Len() > 0 {
+		s.committed.WriteString("\n")
+	}
+	if s.inCode {
+		// Plain code line while streaming (highlighted on finalize).
+		s.committed.WriteString(CodeBlockStyle.Render("  " + trimmed))
+	} else {
+		s.committed.WriteString(markdownInline(trimmed))
+	}
+}
+
+// scanCodeState walks complete content and returns (inCode, codeLang) so the
+// incremental renderer can resume after a full re-render.
+func scanCodeState(content string) (bool, string) {
+	inCode := false
+	lang := ""
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(line, "```") {
+			if inCode {
+				inCode = false
+				lang = ""
+			} else {
+				inCode = true
+				lang = strings.TrimSpace(line[3:])
+			}
+		}
+	}
+	return inCode, lang
+}
 
 // renderMarkdown renders markdown content in the terminal.
 func renderMarkdown(text string, width int) string {

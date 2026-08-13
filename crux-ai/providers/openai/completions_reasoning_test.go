@@ -7,32 +7,43 @@ import (
 	core "github.com/hycjack/crux-ai/core"
 )
 
+// runCompletionsSSE feeds SSE data through processCompletionsSSE +
+// CanonicalizeProviderStream and returns all events plus the final message.
 func runCompletionsSSE(t *testing.T, sseData string) ([]core.AssistantMessageEvent, core.AssistantMessage) {
 	t.Helper()
 	model := core.Model{ID: "gpt-test", Provider: "openai", API: "openai-completions"}
-	stream := core.NewEventStream[core.AssistantMessageEvent, core.AssistantMessage]()
+	ps := core.NewProviderEventStream()
+
+	// Collect the bridged events
 	var events []core.AssistantMessageEvent
 	done := make(chan struct{})
+	out := core.CanonicalizeProviderStream(ps, model.API, model.Provider, model.ID)
 	go func() {
 		defer close(done)
-		for evt := range stream.Events() {
-			if evt.Err() != nil {
-				continue
-			}
+		for evt := range out.Events() {
 			if evt.Done() {
 				return
 			}
 			events = append(events, evt.Value())
 		}
 	}()
+
 	r := strings.NewReader(sseData)
-	out, err := processCompletionsSSE(r, stream, model, core.StreamOptions{})
+	err := processCompletionsSSE(r, ps, model, core.StreamOptions{})
 	if err != nil {
 		t.Fatalf("processCompletionsSSE: %v", err)
 	}
-	stream.End(out)
+	ps.End(core.ProviderEventStreamResult{})
 	<-done
-	return events, out
+
+	// Extract the final message from EventDone
+	var msg core.AssistantMessage
+	for _, evt := range events {
+		if d, ok := evt.(core.EventDone); ok {
+			msg = d.Message
+		}
+	}
+	return events, msg
 }
 
 // OpenAI's reasoning_content (o1/o3 series, o4-mini) is reasoning, NOT

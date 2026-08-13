@@ -2,12 +2,10 @@ package google
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 	"time"
 
@@ -77,6 +75,8 @@ func streamGoogle(ctx context.Context, model core.Model, c core.Context, opts co
 	}
 	baseURL := core.ResolveBaseURL(model, defaultBaseURL)
 
+	c.Messages = core.TransformMessages(c.Messages, model, nil)
+
 	body, err := buildGoogleBody(model, c, opts, googleOpts)
 	if err != nil {
 		return nil, fmt.Errorf("google: failed to build request: %w", err)
@@ -85,23 +85,24 @@ func streamGoogle(ctx context.Context, model core.Model, c core.Context, opts co
 		opts.OnPayload(body)
 	}
 
-	stream := core.NewEventStream[core.AssistantMessageEvent, core.AssistantMessage]()
+	ps := core.NewProviderEventStream()
 
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				stream.Error(fmt.Errorf("google: panic: %v", r))
+				ps.Error(fmt.Errorf("google: panic: %v", r))
 			}
 		}()
-		msg, err := doGoogleStream(ctx, baseURL, apiKey, model, body, stream, opts)
+		err := doGoogleStream(ctx, baseURL, apiKey, model, body, ps, opts)
 		if err != nil {
-			stream.Error(err)
+			ps.Error(err)
 			return
 		}
-		stream.End(msg)
+		ps.End(core.ProviderEventStreamResult{})
 	}()
 
-	return stream, nil
+	out := core.CanonicalizeProviderStream(ps, model.API, model.Provider, model.ID)
+	return out, nil
 }
 
 func buildGoogleBody(model core.Model, c core.Context, opts core.StreamOptions, googleOpts Options) (map[string]any, error) {
@@ -146,57 +147,46 @@ func buildGoogleBody(model core.Model, c core.Context, opts core.StreamOptions, 
 	return body, nil
 }
 
-func doGoogleStream(ctx context.Context, baseURL, apiKey string, model core.Model, body map[string]any, stream *core.AssistantMessageEventStream, opts core.StreamOptions) (core.AssistantMessage, error) {
+func doGoogleStream(ctx context.Context, baseURL, apiKey string, model core.Model, body map[string]any, ps *core.ProviderEventStream, opts core.StreamOptions) error {
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-		return core.AssistantMessage{}, err
+		return err
 	}
 	url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", baseURL, model.ID)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return core.AssistantMessage{}, err
+	headers := map[string]string{
+		"Content-Type":   "application/json",
+		"x-goog-api-key": apiKey,
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-goog-api-key", apiKey)
 	for k, v := range core.ProviderHeadersToRecord(core.MergeProviderHeaders(model.Headers, opts.Headers)) {
-		req.Header.Set(k, v)
+		headers[k] = v
 	}
 
 	client := core.NewTimeoutClient(opts.TimeoutMs)
-	resp, err := client.Do(req)
+	resp, err := core.DoWithRetry(ctx, client, "POST", url, bodyBytes, headers, model.Provider, opts)
 	if err != nil {
-		return core.AssistantMessage{}, err
+		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return core.AssistantMessage{}, fmt.Errorf("google: API error %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-	return processGoogleSSE(resp.Body, stream, model, opts)
+	return processGoogleSSE(resp.Body, ps, model, opts)
 }
 
-func processGoogleSSE(body io.Reader, stream *core.AssistantMessageEventStream, model core.Model, opts core.StreamOptions) (core.AssistantMessage, error) {
+func processGoogleSSE(body io.Reader, ps *core.ProviderEventStream, model core.Model, opts core.StreamOptions) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
 	var (
-		msg          core.AssistantMessage
 		textBuf      strings.Builder
 		thinkBuf     strings.Builder
 		toolCalls    []core.ToolCall
 		textOpen     bool
 		thinkingOpen bool
-		nextBlockIdx int
+		usage        core.Usage
+		stopReason   core.StopReason
 	)
-	msg.API = model.API
-	msg.Provider = model.Provider
-	msg.Model = model.ID
-	msg.Role = "assistant"
-	msg.Timestamp = time.Now()
 
-	stream.Push(core.EventStart{Type: "start", API: model.API, Provider: model.Provider, Model: model.ID, Timestamp: time.Now()})
+	ps.Push(core.ProviderResponseStart{Type: "response_start", Model: model.ID, Timestamp: time.Now()})
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -220,7 +210,7 @@ func processGoogleSSE(body io.Reader, stream *core.AssistantMessageEventStream, 
 			continue
 		}
 		if finishReason, ok := candidate["finishReason"].(string); ok {
-			msg.StopReason = MapStopReason(finishReason)
+			stopReason = MapStopReason(finishReason)
 		}
 		content, ok := candidate["content"].(map[string]any)
 		if !ok {
@@ -238,23 +228,17 @@ func processGoogleSSE(body io.Reader, stream *core.AssistantMessageEventStream, 
 			if IsThinkingPart(p) {
 				if text, ok := p["text"].(string); ok {
 					if !thinkingOpen {
-						idx := nextBlockIdx
-						nextBlockIdx++
-						stream.Push(core.EventThinkingStart{Type: "thinking_start", ContentIndex: idx})
 						thinkingOpen = true
 					}
 					thinkBuf.WriteString(text)
-					stream.Push(core.EventThinkingDelta{Type: "thinking_delta", Delta: text})
+					ps.Push(core.ProviderThinkingDelta{Type: "thinking_delta", Delta: text})
 				}
 			} else if text, ok := p["text"].(string); ok {
 				if !textOpen {
-					idx := nextBlockIdx
-					nextBlockIdx++
-					stream.Push(core.EventTextStart{Type: "text_start", ContentIndex: idx})
 					textOpen = true
 				}
 				textBuf.WriteString(text)
-				stream.Push(core.EventTextDelta{Type: "text_delta", Delta: text})
+				ps.Push(core.ProviderTextDelta{Type: "text_delta", Delta: text})
 			} else if fc, ok := p["functionCall"].(map[string]any); ok {
 				name, _ := fc["name"].(string)
 				args, _ := fc["args"].(map[string]any)
@@ -262,37 +246,46 @@ func processGoogleSSE(body io.Reader, stream *core.AssistantMessageEventStream, 
 				id := fmt.Sprintf("call_%d", len(toolCalls))
 				tc := core.ToolCall{Type: "toolCall", ID: id, Name: name, Arguments: argsBytes}
 				toolCalls = append(toolCalls, tc)
-				idx := nextBlockIdx
-				nextBlockIdx++
-				stream.Push(core.EventToolCallStart{Type: "toolcall_start", ContentIndex: idx, ID: id, Name: name})
-				stream.Push(core.EventToolCallEnd{Type: "toolcall_end", ContentIndex: idx, ID: id, Arguments: argsBytes})
+				ps.Push(core.ProviderToolCall{
+					Type: "tool_call", ID: id, Name: name,
+					Arguments: argsBytes,
+				})
 			}
 		}
 		if usageMetadata, ok := chunk["usageMetadata"].(map[string]any); ok {
-			msg.Usage.Input = conv.GetInt(usageMetadata, "promptTokenCount")
-			msg.Usage.Output = conv.GetInt(usageMetadata, "candidatesTokenCount")
-			msg.Usage.TotalTokens = conv.GetInt(usageMetadata, "totalTokenCount")
+			usage.Input = conv.GetInt(usageMetadata, "promptTokenCount")
+			usage.Output = conv.GetInt(usageMetadata, "candidatesTokenCount")
+			usage.TotalTokens = conv.GetInt(usageMetadata, "totalTokenCount")
+		}
+
+		// When finishReason is set, close active blocks
+		if fr, ok := candidate["finishReason"].(string); ok && fr != "" {
+			if textOpen {
+				ps.Push(core.ProviderContentBlockStop{Type: "content_block_stop"})
+				textOpen = false
+			}
+			if thinkingOpen {
+				ps.Push(core.ProviderContentBlockStop{Type: "content_block_stop"})
+				thinkingOpen = false
+			}
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return msg, fmt.Errorf("google: SSE read error: %w", err)
+		return fmt.Errorf("google: SSE read error: %w", err)
 	}
 
-	if textOpen {
-		msg.Content = append(msg.Content, core.TextContent{Type: "text", Text: textBuf.String()})
-		stream.Push(core.EventTextEnd{Type: "text_end", Content: textBuf.String()})
-	}
-	if thinkingOpen {
-		msg.Content = append(msg.Content, core.ThinkingContent{Type: "thinking", Thinking: thinkBuf.String()})
-		stream.Push(core.EventThinkingEnd{Type: "thinking_end", Content: thinkBuf.String()})
-	}
-	for _, tc := range toolCalls {
-		msg.Content = append(msg.Content, tc)
+	usage.Cost = core.CalculateCost(model, usage)
+
+	final := core.AssistantMessage{
+		Role: "assistant", API: model.API, Provider: model.Provider, Model: model.ID,
+		Usage: usage, StopReason: stopReason, Timestamp: time.Now(),
 	}
 
-	msg.Usage.Cost = core.CalculateCost(model, msg.Usage)
-	stream.Push(core.EventDone{Type: "done", Reason: msg.StopReason, Message: msg})
+	ps.Push(core.ProviderResponseEnd{
+		Type: "response_end", Message: final,
+		FinishReason: string(stopReason),
+	})
 
-	return msg, nil
+	return nil
 }

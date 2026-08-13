@@ -70,6 +70,16 @@ type EventToolCallDelta = core.EventToolCallDelta
 type EventToolCallEnd = core.EventToolCallEnd
 type EventDone = core.EventDone
 type EventError = core.EventError
+type ProviderEvent = core.ProviderEvent
+type ProviderResponseStart = core.ProviderResponseStart
+type ProviderTextDelta = core.ProviderTextDelta
+type ProviderThinkingDelta = core.ProviderThinkingDelta
+type ProviderToolCall = core.ProviderToolCall
+type ProviderResponseEnd = core.ProviderResponseEnd
+type ProviderErrorEvent = core.ProviderError
+type ProviderRetryEvent = core.ProviderRetryEvent
+type ProviderEventStream = core.ProviderEventStream
+type ProviderEventStreamResult = core.ProviderEventStreamResult
 
 // ============================================================
 // Constants (re-export from core)
@@ -238,6 +248,12 @@ func GenerateImages(ctx context.Context, model ImagesModel, msgs []Message, opts
 
 func NewEventStream[T any, R any]() *core.EventStream[T, R] {
 	return core.NewEventStream[T, R]()
+}
+func NewProviderEventStream() *core.ProviderEventStream {
+	return core.NewProviderEventStream()
+}
+func CanonicalizeProviderStream(providerStream *core.ProviderEventStream, api core.KnownAPI, provider core.KnownProvider, model string) *core.AssistantMessageEventStream {
+	return core.CanonicalizeProviderStream(providerStream, api, provider, model)
 }
 func CalculateCost(model Model, usage Usage) CostBreakdown {
 	return core.CalculateCost(model, usage)

@@ -1,13 +1,18 @@
 package ui
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,17 +22,12 @@ import (
 
 // toolResult creates a successful tool result.
 func toolResult(text string) agent.AgentToolResult {
-	return agent.AgentToolResult{
-		Content: text,
-	}
+	return agent.ToolResult(text)
 }
 
 // toolError creates an error tool result.
 func toolError(text string) agent.AgentToolResult {
-	return agent.AgentToolResult{
-		Content: text,
-		IsError: true,
-	}
+	return agent.ToolError(text)
 }
 
 // allTools returns all available coding tools.
@@ -40,19 +40,19 @@ func allTools() []agent.AgentTool {
 	}{
 		{
 			name:        "bash",
-			description: "Execute a shell command and return its output. On Windows, runs PowerShell. Use for running code, installing packages, git operations, etc.",
+			description: bashDescription(),
 			params:      `{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"timeout":{"type":"integer","description":"Timeout in seconds (default: 60)"}},"required":["command"]}`,
 			exec:        executeBash,
 		},
 		{
 			name:        "read_file",
-			description: "Read the contents of a file. Returns file content with line numbers for easy reference.",
+			description: readDescription(),
 			params:      `{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to read"},"offset":{"type":"integer","description":"Start from this line number (1-based, default: 1)"},"limit":{"type":"integer","description":"Max lines to read (default: all)"}},"required":["path"]}`,
 			exec:        executeReadFile,
 		},
 		{
 			name:        "write_file",
-			description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Creates parent directories as needed.",
+			description: writeDescription(),
 			params:      `{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"content":{"type":"string","description":"Content to write"}},"required":["path","content"]}`,
 			exec:        executeWriteFile,
 		},
@@ -67,6 +67,24 @@ func allTools() []agent.AgentTool {
 			description: "Edit a file by replacing a specific text with new text. The search text must be unique in the file.",
 			params:      `{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"old_text":{"type":"string","description":"Text to search for (must be unique in file)"},"new_text":{"type":"string","description":"Text to replace with"}},"required":["path","old_text","new_text"]}`,
 			exec:        executeEditFile,
+		},
+		{
+			name:        "glob",
+			description: globDescription(),
+			params:      `{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern to match files (e.g., '**/*.go', '*.txt')."},"path":{"type":"string","description":"Directory to search in (default: current directory)."}},"required":["pattern"]}`,
+			exec:        executeGlob,
+		},
+		{
+			name:        "grep",
+			description: grepDescription(),
+			params:      `{"type":"object","properties":{"pattern":{"type":"string","description":"Search pattern (substring or regex)."},"path":{"type":"string","description":"Directory or file to search in (default: current directory)."},"include":{"type":"string","description":"File pattern to include (e.g., '*.go')."},"regex":{"type":"boolean","description":"If true, treat pattern as regex (default false)."}},"required":["pattern"]}`,
+			exec:        executeGrep,
+		},
+		{
+			name:        "web_fetch",
+			description: webFetchDescription(),
+			params:      `{"type":"object","properties":{"url":{"type":"string","description":"The URL to fetch. Must be a valid HTTP(S) URL."},"max_length":{"type":"integer","description":"Maximum number of characters to return (default 10000)."}},"required":["url"]}`,
+			exec:        executeWebFetch,
 		},
 	}
 
@@ -134,7 +152,9 @@ func executeBash(ctx context.Context, id string, params json.RawMessage, onUpdat
 				outputBuf.Write(chunk)
 				mu.Unlock()
 				if onUpdate != nil {
-					onUpdate(json.RawMessage(chunk))
+					// Wrap the raw output in a JSON string so the partial result
+					// is always valid JSON (raw command output bytes are not).
+					onUpdate(json.RawMessage(`{"output":`+strconv.Quote(string(chunk))+`}`))
 				}
 			}
 			if err != nil {
@@ -332,4 +352,323 @@ func executeEditFile(ctx context.Context, id string, params json.RawMessage, onU
 	idx := strings.Index(content, args.OldText)
 	lineNum := strings.Count(content[:idx], "\n") + 1
 	return toolResult(fmt.Sprintf("Successfully edited %s at line %d (%+d lines)", args.Path, lineNum, added)), nil
+}
+
+// ── Cross-platform descriptions ──────────────────────────────────────────────
+
+func bashDescription() string {
+	switch runtime.GOOS {
+	case "windows":
+		return `Run a shell command and return its output.
+
+CURRENT OS: Windows.
+- Default shell: PowerShell. Most Unix commands (ls=Get-ChildItem, cat=Get-Content, pwd=Get-Location, rm=Remove-Item, cp=Copy-Item, mv=Move-Item) work via PowerShell aliases.
+- Use '.\' prefix for executables in the current directory.
+- Environment variables: $env:VAR_NAME (PowerShell) or %VAR_NAME% (cmd).`
+	default:
+		return `Run a shell command and return its output.
+
+CURRENT OS: Unix (Linux/macOS).
+- Default shell: sh (POSIX).
+- Standard Unix commands (ls, cat, grep, find, git, etc.) are available.
+- Use ./ prefix for executables in the current directory.
+- Environment variables: $VAR_NAME.`
+	}
+}
+
+func readDescription() string {
+	if runtime.GOOS == "windows" {
+		return "Read the contents of a file. Use Windows backslash paths (e.g. C:\\Users\\file.txt). Optionally limit by offset/line."
+	}
+	return "Read the contents of a file. Optionally limit by offset/line."
+}
+
+func writeDescription() string {
+	if runtime.GOOS == "windows" {
+		return "Write content to a file. Use Windows backslash paths. Creates parent directories as needed."
+	}
+	return "Write content to a file. Creates parent directories as needed."
+}
+
+func globDescription() string {
+	if runtime.GOOS == "windows" {
+		return "List files matching a glob pattern. Use backslash paths. Supports patterns like *.go, **/*.txt."
+	}
+	return "List files matching a glob pattern. Supports patterns like *.go, **/*.txt."
+}
+
+func grepDescription() string {
+	if runtime.GOOS == "windows" {
+		return "Search file contents for a pattern (substring or regex). Uses Go built-in file search (no external grep command). Use backslash paths."
+	}
+	return "Search file contents for a pattern (substring or regex). Uses Go built-in file search (no external grep command)."
+}
+
+func webFetchDescription() string {
+	return "Fetch a URL and return its content as plain text. Strips HTML tags and truncates long pages."
+}
+
+// ── glob ─────────────────────────────────────────────────────────────────────
+
+type globArgs struct {
+	Pattern string `json:"pattern"`
+	Path    string `json:"path"`
+}
+
+func executeGlob(ctx context.Context, toolCallID string, params json.RawMessage, onUpdate func(json.RawMessage)) (agent.AgentToolResult, error) {
+	var args globArgs
+	if err := json.Unmarshal(params, &args); err != nil {
+		return toolError("invalid arguments: " + err.Error()), nil
+	}
+	if args.Pattern == "" {
+		return toolError("pattern is required"), nil
+	}
+
+	root := "."
+	if args.Path != "" {
+		root = args.Path
+	}
+
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return toolError(fmt.Sprintf("glob: %v", err)), nil
+	}
+
+	var matches []string
+	const maxMatches = 1000
+
+	err = filepath.Walk(absRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if len(matches) >= maxMatches {
+			return filepath.SkipDir
+		}
+
+		relPath, err := filepath.Rel(absRoot, path)
+		if err != nil {
+			return nil
+		}
+
+		matched, err := filepath.Match(args.Pattern, info.Name())
+		if err != nil {
+			return nil
+		}
+		if matched {
+			matches = append(matches, relPath)
+		}
+
+		if strings.Contains(args.Pattern, "**") {
+			pattern := strings.ReplaceAll(args.Pattern, "**", "*")
+			matched, _ = filepath.Match(pattern, relPath)
+			if matched {
+				matches = append(matches, relPath)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return toolError(fmt.Sprintf("glob: %v", err)), nil
+	}
+
+	result := strings.Join(matches, "\n")
+	if len(matches) == 0 {
+		result = "No files found matching pattern: " + args.Pattern
+	} else if len(matches) >= maxMatches {
+		result += fmt.Sprintf("\n[... truncated at %d results ...]", maxMatches)
+	}
+
+	return toolResult(result), nil
+}
+
+// ── grep ─────────────────────────────────────────────────────────────────────
+
+type grepArgs struct {
+	Pattern string `json:"pattern"`
+	Path    string `json:"path"`
+	Include string `json:"include"`
+	Regex   bool   `json:"regex"`
+}
+
+func executeGrep(ctx context.Context, toolCallID string, params json.RawMessage, onUpdate func(json.RawMessage)) (agent.AgentToolResult, error) {
+	var args grepArgs
+	if err := json.Unmarshal(params, &args); err != nil {
+		return toolError("invalid arguments: " + err.Error()), nil
+	}
+	if args.Pattern == "" {
+		return toolError("pattern is required"), nil
+	}
+
+	root := "."
+	if args.Path != "" {
+		root = args.Path
+	}
+
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return toolError(fmt.Sprintf("grep: %v", err)), nil
+	}
+
+	var re *regexp.Regexp
+	if args.Regex {
+		re, err = regexp.Compile(args.Pattern)
+		if err != nil {
+			return toolError(fmt.Sprintf("grep: invalid regex: %v", err)), nil
+		}
+	}
+
+	var results []string
+	const maxResults = 500
+	const maxLineLength = 500
+
+	err = filepath.Walk(absRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if len(results) >= maxResults {
+			return filepath.SkipDir
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		if args.Include != "" {
+			matched, _ := filepath.Match(args.Include, info.Name())
+			if !matched {
+				return nil
+			}
+		}
+
+		f, err := os.Open(path)
+		if err != nil {
+			return nil
+		}
+		defer f.Close()
+
+		relPath, _ := filepath.Rel(absRoot, path)
+		scanner := bufio.NewScanner(f)
+		lineNum := 0
+		for scanner.Scan() {
+			if len(results) >= maxResults {
+				break
+			}
+			lineNum++
+			line := scanner.Text()
+
+			matched := false
+			if args.Regex {
+				matched = re.MatchString(line)
+			} else {
+				matched = strings.Contains(line, args.Pattern)
+			}
+
+			if matched {
+				displayLine := line
+				if len(displayLine) > maxLineLength {
+					displayLine = displayLine[:maxLineLength] + "..."
+				}
+				results = append(results, fmt.Sprintf("%s:%d:%s", relPath, lineNum, displayLine))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return toolError(fmt.Sprintf("grep: %v", err)), nil
+	}
+
+	result := strings.Join(results, "\n")
+	if len(results) == 0 {
+		result = "No matches found for pattern: " + args.Pattern
+	} else if len(results) >= maxResults {
+		result += fmt.Sprintf("\n[... truncated at %d results ...]", maxResults)
+	}
+
+	return toolResult(result), nil
+}
+
+// ── web_fetch ────────────────────────────────────────────────────────────────
+
+type webFetchArgs struct {
+	URL       string `json:"url"`
+	MaxLength int    `json:"max_length"`
+}
+
+func executeWebFetch(ctx context.Context, toolCallID string, params json.RawMessage, onUpdate func(json.RawMessage)) (agent.AgentToolResult, error) {
+	var args webFetchArgs
+	if err := json.Unmarshal(params, &args); err != nil {
+		return toolError("invalid arguments: " + err.Error()), nil
+	}
+	if args.URL == "" {
+		return toolError("url is required"), nil
+	}
+
+	maxLen := args.MaxLength
+	if maxLen <= 0 {
+		maxLen = 10000
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, args.URL, nil)
+	if err != nil {
+		return toolError(fmt.Sprintf("web_fetch: %v", err)), nil
+	}
+	httpReq.Header.Set("User-Agent", "CruxAgent/1.0")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return toolError(fmt.Sprintf("web_fetch: HTTP request failed: %v", err)), nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return toolError(fmt.Sprintf("web_fetch: HTTP %d %s", resp.StatusCode, resp.Status)), nil
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxLen*3)))
+	if err != nil {
+		return toolError(fmt.Sprintf("web_fetch: read error: %v", err)), nil
+	}
+
+	text := stripHTML(string(body))
+	if len(text) > maxLen {
+		text = text[:maxLen] + "\n[...truncated]"
+	}
+
+	return toolResult(text), nil
+}
+
+// ── HTML helpers (for web_fetch) ──────────────────────────────────────────────
+
+var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
+
+func stripHTML(html string) string {
+	scriptRe := regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`)
+	html = scriptRe.ReplaceAllString(html, "")
+	styleRe := regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`)
+	html = styleRe.ReplaceAllString(html, "")
+
+	text := htmlTagRe.ReplaceAllString(html, " ")
+
+	text = strings.ReplaceAll(text, "&amp;", "&")
+	text = strings.ReplaceAll(text, "&lt;", "<")
+	text = strings.ReplaceAll(text, "&gt;", ">")
+	text = strings.ReplaceAll(text, "&quot;", "\"")
+	text = strings.ReplaceAll(text, "&#39;", "'")
+	text = strings.ReplaceAll(text, "&nbsp;", " ")
+
+	spaceRe := regexp.MustCompile(`[ \t]+`)
+	text = spaceRe.ReplaceAllString(text, " ")
+	nlRe := regexp.MustCompile(`\n{3,}`)
+	text = nlRe.ReplaceAllString(text, "\n\n")
+
+	return strings.TrimSpace(text)
 }

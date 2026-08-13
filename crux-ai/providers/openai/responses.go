@@ -2,12 +2,10 @@ package openai
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 	"time"
 
@@ -50,6 +48,8 @@ func streamResponses(ctx context.Context, model core.Model, c core.Context, opts
 		baseURL = defaultResponsesURL
 	}
 
+	c.Messages = core.TransformMessages(c.Messages, model, nil)
+
 	body, err := buildResponsesBody(model, c, opts, responsesOpts)
 	if err != nil {
 		return nil, fmt.Errorf("openai-responses: failed to build request: %w", err)
@@ -58,23 +58,24 @@ func streamResponses(ctx context.Context, model core.Model, c core.Context, opts
 		opts.OnPayload(body)
 	}
 
-	stream := core.NewEventStream[core.AssistantMessageEvent, core.AssistantMessage]()
+	ps := core.NewProviderEventStream()
 
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				stream.Error(fmt.Errorf("openai-responses: panic: %v", r))
+				ps.Error(fmt.Errorf("openai-responses: panic: %v", r))
 			}
 		}()
-		msg, err := doResponsesStream(ctx, baseURL, apiKey, model, body, stream, opts)
+		err := doResponsesStream(ctx, baseURL, apiKey, model, body, ps, opts)
 		if err != nil {
-			stream.Error(err)
+			ps.Error(err)
 			return
 		}
-		stream.End(msg)
+		ps.End(core.ProviderEventStreamResult{})
 	}()
 
-	return stream, nil
+	out := core.CanonicalizeProviderStream(ps, model.API, model.Provider, model.ID)
+	return out, nil
 }
 
 func buildResponsesBody(model core.Model, c core.Context, opts core.StreamOptions, responsesOpts ResponsesOptions) (map[string]any, error) {
@@ -186,61 +187,49 @@ func convertResponsesTools(tools []core.Tool) []map[string]any {
 	return result
 }
 
-func doResponsesStream(ctx context.Context, baseURL, apiKey string, model core.Model, body map[string]any, stream *core.AssistantMessageEventStream, opts core.StreamOptions) (core.AssistantMessage, error) {
+func doResponsesStream(ctx context.Context, baseURL, apiKey string, model core.Model, body map[string]any, ps *core.ProviderEventStream, opts core.StreamOptions) error {
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-		return core.AssistantMessage{}, err
+		return err
 	}
 	url := baseURL + "/responses"
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return core.AssistantMessage{}, err
+	headers := map[string]string{
+		"Content-Type":  "application/json",
+		"Authorization": "Bearer " + apiKey,
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
 	for k, v := range core.ProviderHeadersToRecord(core.MergeProviderHeaders(model.Headers, opts.Headers)) {
-		req.Header.Set(k, v)
+		headers[k] = v
 	}
 
 	client := core.NewTimeoutClient(opts.TimeoutMs)
-	resp, err := client.Do(req)
+	resp, err := core.DoWithRetry(ctx, client, "POST", url, bodyBytes, headers, model.Provider, opts)
 	if err != nil {
-		return core.AssistantMessage{}, err
+		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return core.AssistantMessage{}, fmt.Errorf("openai-responses: API error %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-	return processResponsesSSE(resp.Body, stream, model, opts)
+	return processResponsesSSE(resp.Body, ps, model, opts)
 }
 
-func processResponsesSSE(body io.Reader, stream *core.AssistantMessageEventStream, model core.Model, opts core.StreamOptions) (core.AssistantMessage, error) {
+func processResponsesSSE(body io.Reader, ps *core.ProviderEventStream, model core.Model, opts core.StreamOptions) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
 	var (
-		msg         core.AssistantMessage
-		textBuf     strings.Builder
-		textOpen    bool
-		thinkBufs   map[int]*strings.Builder
-		thinkOpen   map[int]bool
-		toolCalls   map[string]*core.ToolCall
-		nextBlockIx int
+		textBuf    strings.Builder
+		textOpen   bool
+		thinkBufs  map[int]*strings.Builder
+		thinkOpen  map[int]bool
+		toolCalls  map[string]*core.ToolCall
+		usage      core.Usage
+		stopReason core.StopReason
 	)
-
-	msg.API = model.API
-	msg.Provider = model.Provider
-	msg.Model = model.ID
-	msg.Role = "assistant"
-	msg.Timestamp = time.Now()
 	toolCalls = make(map[string]*core.ToolCall)
 	thinkBufs = make(map[int]*strings.Builder)
 	thinkOpen = make(map[int]bool)
 
-	stream.Push(core.EventStart{Type: "start", API: model.API, Provider: model.Provider, Model: model.ID, Timestamp: time.Now()})
+	ps.Push(core.ProviderResponseStart{Type: "response_start", Model: model.ID, Timestamp: time.Now()})
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -264,9 +253,9 @@ func processResponsesSSE(body io.Reader, stream *core.AssistantMessageEventStrea
 		case "response.created":
 			response, _ := event["response"].(map[string]any)
 			if response != nil {
-				if usage, ok := response["usage"].(map[string]any); ok {
-					msg.Usage.Input = conv.GetInt(usage, "input_tokens")
-					msg.Usage.Output = conv.GetInt(usage, "output_tokens")
+				if u, ok := response["usage"].(map[string]any); ok {
+					usage.Input = conv.GetInt(u, "input_tokens")
+					usage.Output = conv.GetInt(u, "output_tokens")
 				}
 			}
 		case "response.output_item.added":
@@ -280,24 +269,17 @@ func processResponsesSSE(body io.Reader, stream *core.AssistantMessageEventStrea
 				id, _ := item["id"].(string)
 				name, _ := item["name"].(string)
 				callID, _ := item["call_id"].(string)
-				idx := nextBlockIx
-				nextBlockIx++
-				toolCalls[callID] = &core.ToolCall{Type: "toolCall", ID: id, Name: name}
-				stream.Push(core.EventToolCallStart{Type: "toolcall_start", ContentIndex: idx, ID: id, Name: name})
+				tc := &core.ToolCall{Type: "toolCall", ID: id, Name: name}
+				if args, ok := item["arguments"].(string); ok && args != "" {
+					tc.Arguments = []byte(args)
+				}
+				toolCalls[callID] = tc
 			case "reasoning":
-				// OpenAI Responses: reasoning item is a separate block emitted
-				// before the assistant message. We allocate a content index so
-				// downstream consumers can interleave text/thinking deltas
-				// correctly.
-				idx := nextBlockIx
-				nextBlockIx++
+				idx := len(thinkBufs)
 				thinkBufs[idx] = &strings.Builder{}
 				thinkOpen[idx] = true
-				stream.Push(core.EventThinkingStart{Type: "thinking_start", ContentIndex: idx})
 			}
 		case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
-			// Use explicit `output_index` when present, else fall back to
-			// the first allocated thinking block.
 			idx := -1
 			if _, ok := event["output_index"]; ok {
 				idx = conv.GetInt(event, "output_index")
@@ -314,24 +296,14 @@ func processResponsesSSE(body io.Reader, stream *core.AssistantMessageEventStrea
 			}
 			buf, ok := thinkBufs[idx]
 			if !ok {
-				idx = nextBlockIx
-				nextBlockIx++
+				idx = len(thinkBufs)
 				buf = &strings.Builder{}
 				thinkBufs[idx] = buf
-			}
-			if !thinkOpen[idx] {
-				stream.Push(core.EventThinkingStart{Type: "thinking_start", ContentIndex: idx})
-				thinkOpen[idx] = true
+				thinkOpen[idx] = false
 			}
 			buf.WriteString(delta)
-			stream.Push(core.EventThinkingDelta{Type: "thinking_delta", ContentIndex: idx, Delta: delta})
+			ps.Push(core.ProviderThinkingDelta{Type: "thinking_delta", Delta: delta})
 		case "response.reasoning_text.done", "response.reasoning_summary_text.done", "response.output_item.done":
-			// Determine which block to close.
-			//   - Explicit `reasoning_text.done` events carry a specific
-			//     `output_index`. Use that directly.
-			//   - Generic `output_item.done` does NOT carry `output_index`
-			//     in some OpenAI Responses implementations. We fall back
-			//     to the first still-open block.
 			idx := -1
 			if _, ok := event["output_index"]; ok {
 				idx = conv.GetInt(event, "output_index")
@@ -344,76 +316,70 @@ func processResponsesSSE(body io.Reader, stream *core.AssistantMessageEventStrea
 					}
 				}
 			}
-			if idx < 0 {
-				continue
-			}
-			if thinkOpen[idx] {
-				buf := thinkBufs[idx]
-				if buf != nil {
-					msg.Content = append(msg.Content, core.ThinkingContent{
-						Type:     "thinking",
-						Thinking: buf.String(),
-					})
-				}
-				stream.Push(core.EventThinkingEnd{Type: "thinking_end", ContentIndex: idx, Content: buf.String()})
+			if idx >= 0 && thinkOpen[idx] {
+				ps.Push(core.ProviderContentBlockStop{
+					Type: "content_block_stop",
+				})
 				thinkOpen[idx] = false
 			}
 		case "response.output_text.delta":
 			delta, _ := event["delta"].(string)
 			if delta != "" {
 				if !textOpen {
-					idx := nextBlockIx
-					nextBlockIx++
-					stream.Push(core.EventTextStart{Type: "text_start", ContentIndex: idx})
 					textOpen = true
 				}
 				textBuf.WriteString(delta)
-				stream.Push(core.EventTextDelta{Type: "text_delta", Delta: delta})
+				ps.Push(core.ProviderTextDelta{Type: "text_delta", Delta: delta})
 			}
 		case "response.function_call_arguments.delta":
 			callID, _ := event["call_id"].(string)
 			delta, _ := event["delta"].(string)
 			if tc, ok := toolCalls[callID]; ok && delta != "" {
 				tc.Arguments = append(tc.Arguments, []byte(delta)...)
-				stream.Push(core.EventToolCallDelta{Type: "toolcall_delta", ID: tc.ID, ArgumentsDelta: delta})
 			}
 		case "response.function_call_arguments.done":
 			callID, _ := event["call_id"].(string)
 			if tc, ok := toolCalls[callID]; ok {
-				stream.Push(core.EventToolCallEnd{Type: "toolcall_end", ID: tc.ID, Arguments: tc.Arguments})
-				msg.Content = append(msg.Content, *tc)
+				ps.Push(core.ProviderToolCall{
+					Type: "tool_call", ID: tc.ID, Name: tc.Name,
+					Arguments: tc.Arguments,
+				})
 			}
 		case "response.completed":
 			response, _ := event["response"].(map[string]any)
 			if response != nil {
-				if usage, ok := response["usage"].(map[string]any); ok {
-					msg.Usage.Input = conv.GetInt(usage, "input_tokens")
-					msg.Usage.Output = conv.GetInt(usage, "output_tokens")
-					if cached, ok := usage["input_tokens_details"].(map[string]any); ok {
-						msg.Usage.CacheRead = conv.GetInt(cached, "cached_tokens")
+				if u, ok := response["usage"].(map[string]any); ok {
+					usage.Input = conv.GetInt(u, "input_tokens")
+					usage.Output = conv.GetInt(u, "output_tokens")
+					if cached, ok := u["input_tokens_details"].(map[string]any); ok {
+						usage.CacheRead = conv.GetInt(cached, "cached_tokens")
 					}
 				}
 				if status, ok := response["status"].(string); ok {
-					msg.StopReason = mapResponseStatus(status)
+					stopReason = mapResponseStatus(status)
 				}
 			}
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return msg, fmt.Errorf("openai-responses: SSE read error: %w", err)
+		return fmt.Errorf("openai-responses: SSE read error: %w", err)
 	}
 
-	if textOpen {
-		msg.Content = append(msg.Content, core.TextContent{Type: "text", Text: textBuf.String()})
-		stream.Push(core.EventTextEnd{Type: "text_end", Content: textBuf.String()})
+	usage.TotalTokens = usage.Input + usage.Output
+	usage.Cost = core.CalculateCost(model, usage)
+
+	final := core.AssistantMessage{
+		Role: "assistant", API: model.API, Provider: model.Provider, Model: model.ID,
+		Usage: usage, StopReason: stopReason, Timestamp: time.Now(),
 	}
 
-	msg.Usage.TotalTokens = msg.Usage.Input + msg.Usage.Output
-	msg.Usage.Cost = core.CalculateCost(model, msg.Usage)
-	stream.Push(core.EventDone{Type: "done", Reason: msg.StopReason, Message: msg})
+	ps.Push(core.ProviderResponseEnd{
+		Type: "response_end", Message: final,
+		FinishReason: string(stopReason),
+	})
 
-	return msg, nil
+	return nil
 }
 
 func mapResponseStatus(status string) core.StopReason {

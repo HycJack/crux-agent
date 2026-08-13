@@ -4,6 +4,7 @@ package core
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 )
@@ -204,6 +205,8 @@ type Message interface {
 }
 
 // UserMessage represents a user message.
+// Content is always UserContent (string or []ContentBlock).
+// At runtime it may arrive as any; use AsUserContent to convert safely.
 type UserMessage struct {
 	Role      MessageRole `json:"role"`
 	Content   any         `json:"content"`
@@ -212,6 +215,22 @@ type UserMessage struct {
 
 func (UserMessage) messageTag()               {}
 func (m UserMessage) GetTimestamp() time.Time { return m.Timestamp }
+
+// AsUserContent safely converts a UserMessage.Content value to a
+// typed content value. Returns the string or []ContentBlock if the
+// value matches, otherwise falls back to fmt.Sprintf representation.
+func AsUserContent(v any) any {
+	switch c := v.(type) {
+	case string:
+		return c
+	case []ContentBlock:
+		return c
+	case nil:
+		return nil
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
 
 // AssistantMessage represents a model response.
 type AssistantMessage struct {

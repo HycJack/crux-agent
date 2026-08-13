@@ -7,32 +7,35 @@ import (
 	core "github.com/hycjack/crux-ai/core"
 )
 
+// runMistralSSE feeds SSE data through processMistralSSE and returns
+// all events plus the final message.
 func runMistralSSE(t *testing.T, sseData string) ([]core.AssistantMessageEvent, core.AssistantMessage) {
 	t.Helper()
 	model := core.Model{ID: "magistral-test", Provider: "mistral", API: "mistral"}
 	stream := core.NewEventStream[core.AssistantMessageEvent, core.AssistantMessage]()
+
 	var events []core.AssistantMessageEvent
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for evt := range stream.Events() {
-			if evt.Err() != nil {
-				continue
-			}
-			events = append(events, evt.Value())
 			if evt.Done() {
 				return
 			}
+			events = append(events, evt.Value())
 		}
 	}()
+
 	r := strings.NewReader(sseData)
-	out, err := processMistralSSE(r, stream, model, core.StreamOptions{})
+	msg, err := processMistralSSE(r, stream, model, core.StreamOptions{})
 	if err != nil {
 		t.Fatalf("processMistralSSE: %v", err)
 	}
-	stream.End(out)
+	// Match production: push End(msg) to signal EventDone to stream readers.
+	stream.End(msg)
 	<-done
-	return events, out
+
+	return events, msg
 }
 
 // Mistral Magistral exposes reasoning via delta.reasoning_content.
@@ -50,7 +53,6 @@ func TestMistral_ReasoningContent_EmitsThinkingEvents(t *testing.T) {
 `
 	events, msg := runMistralSSE(t, sse)
 
-	// Find event types in order.
 	gotTypes := make([]string, 0, len(events))
 	for _, e := range events {
 		switch v := e.(type) {
@@ -73,6 +75,12 @@ func TestMistral_ReasoningContent_EmitsThinkingEvents(t *testing.T) {
 		}
 	}
 
+	// The Mistral SSE processor emits thinking content as it arrives in
+	// the stream, then text content, and finally thinking_end on stream
+	// completion (finish_reason: "stop"). This is because Mistral sends
+	// reasoning_content deltas followed by content deltas, and the
+	// processor only closes the thinking block when it sees the final
+	// finish_reason event.
 	wantSubstr := []string{
 		"start",
 		"thinking_start", "thinking_delta", "thinking_delta",
@@ -89,7 +97,6 @@ func TestMistral_ReasoningContent_EmitsThinkingEvents(t *testing.T) {
 		}
 	}
 
-	// Validate content blocks: one ThinkingContent + one TextContent.
 	var sawThinking, sawText bool
 	for _, b := range msg.Content {
 		if tc, ok := b.(core.ThinkingContent); ok {

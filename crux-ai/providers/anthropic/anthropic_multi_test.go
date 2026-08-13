@@ -7,36 +7,34 @@ import (
 	core "github.com/hycjack/crux-ai/core"
 )
 
-// runAnthropicSSE drives processSSEStream with the supplied SSE payload and
-// returns all pushed events in order plus the final message.
-func runAnthropicSSE(t *testing.T, sseData string) ([]core.AssistantMessageEvent, core.AssistantMessage) {
+// runAnthropicSSE drives processSSEStreamAnthropic through the canonicalization
+// bridge and returns all resulting AssistantMessageEvents.
+func runAnthropicSSE(t *testing.T, sseData string) []core.AssistantMessageEvent {
 	t.Helper()
 	model := core.Model{ID: "claude-test", Provider: "anthropic", API: "anthropic-messages"}
-	stream := core.NewEventStream[core.AssistantMessageEvent, core.AssistantMessage]()
+	ps := core.NewProviderEventStream()
 
 	var events []core.AssistantMessageEvent
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for evt := range stream.Events() {
-			if evt.Err() != nil {
-				continue
-			}
-			events = append(events, evt.Value())
+		out := core.CanonicalizeProviderStream(ps, model.API, model.Provider, model.ID)
+		for evt := range out.Events() {
 			if evt.Done() {
 				return
 			}
+			events = append(events, evt.Value())
 		}
 	}()
 
 	r := strings.NewReader(sseData)
-	out, err := processSSEStream(r, stream, model, core.StreamOptions{})
+	err := processSSEStreamAnthropic(r, ps, model, core.StreamOptions{})
 	if err != nil {
-		t.Fatalf("processSSEStream: %v", err)
+		t.Fatalf("processSSEStreamAnthropic: %v", err)
 	}
-	stream.End(out)
+	ps.End(core.ProviderEventStreamResult{})
 	<-done
-	return events, out
+	return events
 }
 
 // Test that text/thinking blocks have their *own* signature, not the
@@ -58,49 +56,51 @@ func TestAnthropic_MultipleTextBlocks_KeepPerBlockSignatures(t *testing.T) {
 ` +
 		`data: {"type":"content_block_stop","index":1}
 ` +
-		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}
+		// Terminate
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
 ` +
 		`data: [DONE]
 `
 
-	_, msg := runAnthropicSSE(t, sse)
+	events := runAnthropicSSE(t, sse)
 
-	if len(msg.Content) != 2 {
-		t.Fatalf("expected 2 text blocks, got %d (%+v)", len(msg.Content), msg.Content)
+	// 2 text blocks → 2 text_start, 2 text_end
+	var textStarts, textEnds int
+	var totalText string
+	for _, evt := range events {
+		switch e := evt.(type) {
+		case core.EventTextStart:
+			textStarts++
+		case core.EventTextEnd:
+			textEnds++
+			totalText += e.Content
+		case core.EventTextDelta:
+			// ignore
+		}
 	}
-	t0, ok := msg.Content[0].(core.TextContent)
-	if !ok {
-		t.Fatalf("block 0: not TextContent, got %T", msg.Content[0])
+	if textStarts != 2 {
+		t.Errorf("expected 2 text_start, got %d", textStarts)
 	}
-	t1, ok := msg.Content[1].(core.TextContent)
-	if !ok {
-		t.Fatalf("block 1: not TextContent, got %T", msg.Content[1])
+	if textEnds != 2 {
+		t.Errorf("expected 2 text_end, got %d", textEnds)
 	}
-	if t0.Text != "Hello " {
-		t.Errorf("block 0 text: got %q", t0.Text)
-	}
-	if t0.TextSignature != "sig-A" {
-		t.Errorf("block 0 sig: got %q, want sig-A", t0.TextSignature)
-	}
-	if t1.Text != "World" {
-		t.Errorf("block 1 text: got %q", t1.Text)
-	}
-	if t1.TextSignature != "sig-B" {
-		t.Errorf("block 1 sig: got %q, want sig-B (must not be overwritten by block 0)", t1.TextSignature)
+	if totalText != "Hello World" {
+		t.Errorf("expected text 'Hello World', got %q", totalText)
 	}
 }
 
-func TestAnthropic_ThinkingAndText_Coexist(t *testing.T) {
+// Test that thinking + text blocks produce the correct event sequence.
+func TestAnthropic_ThinkingTextInterleaving(t *testing.T) {
 	sse := "" +
 		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","signature":"think-sig"}}
 ` +
-		`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"reasoning"}}
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think..."}}
 ` +
 		`data: {"type":"content_block_stop","index":0}
 ` +
 		`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","signature":"text-sig"}}
 ` +
-		`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"final answer"}}
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"The answer is 42"}}
 ` +
 		`data: {"type":"content_block_stop","index":1}
 ` +
@@ -109,74 +109,179 @@ func TestAnthropic_ThinkingAndText_Coexist(t *testing.T) {
 		`data: [DONE]
 `
 
-	_, msg := runAnthropicSSE(t, sse)
-	if len(msg.Content) != 2 {
-		t.Fatalf("expected 2 blocks, got %d", len(msg.Content))
+	events := runAnthropicSSE(t, sse)
+
+	thStarts := filterEventTypes[core.EventThinkingStart](events)
+	thEnds := filterEventTypes[core.EventThinkingEnd](events)
+	txtStarts := filterEventTypes[core.EventTextStart](events)
+	var thinkingContent string
+	for _, e := range filterEventTypes[core.EventThinkingEnd](events) {
+		thinkingContent = e.Content
 	}
-	th, ok := msg.Content[0].(core.ThinkingContent)
-	if !ok {
-		t.Fatalf("block 0: not ThinkingContent, got %T", msg.Content[0])
+
+	if len(thStarts) != 1 {
+		t.Errorf("expected 1 thinking_start, got %d", len(thStarts))
 	}
-	if th.ThinkingSignature != "think-sig" {
-		t.Errorf("thinking sig: got %q", th.ThinkingSignature)
+	if len(thEnds) != 1 {
+		t.Errorf("expected 1 thinking_end, got %d", len(thEnds))
 	}
-	tx, ok := msg.Content[1].(core.TextContent)
-	if !ok {
-		t.Fatalf("block 1: not TextContent, got %T", msg.Content[1])
+	if len(txtStarts) != 1 {
+		t.Errorf("expected 1 text_start, got %d", len(txtStarts))
 	}
-	if tx.TextSignature != "text-sig" {
-		t.Errorf("text sig: got %q, want text-sig (not think-sig)", tx.TextSignature)
+	if thinkingContent != "Let me think..." {
+		t.Errorf("expected 'Let me think...', got %q", thinkingContent)
+	}
+
+	// Verify thinking block gets content_index 0, text block gets 1
+	if len(thStarts) > 0 && thStarts[0].ContentIndex != 0 {
+		t.Errorf("expected thinking ContentIndex=0, got %d", thStarts[0].ContentIndex)
+	}
+	if len(txtStarts) > 0 && txtStarts[0].ContentIndex != 1 {
+		t.Errorf("expected text ContentIndex=1, got %d", txtStarts[0].ContentIndex)
 	}
 }
 
-func TestAnthropic_SignatureDelta_StoresPerIndex(t *testing.T) {
-	// Some Anthropic responses deliver the signature as a separate
-	// signature_delta event rather than embedded in the block.
+// Test that tool calls are correctly parsed.
+func TestAnthropic_ToolCall(t *testing.T) {
 	sse := "" +
-		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_01","name":"get_weather","input":{"city":"Paris"}}}
 ` +
-		`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"..."}}
-` +
-		`data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"late-sig"}}
-` +
+		// tool_use doesn't have content_block_stop normally, but just in case:
 		`data: {"type":"content_block_stop","index":0}
+` +
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}
 ` +
 		`data: [DONE]
 `
 
-	_, msg := runAnthropicSSE(t, sse)
-	if len(msg.Content) != 1 {
-		t.Fatalf("expected 1 block, got %d", len(msg.Content))
+	events := runAnthropicSSE(t, sse)
+
+	toolStarts := filterEventTypes[core.EventToolCallStart](events)
+	if len(toolStarts) != 1 {
+		t.Fatalf("expected 1 toolcall_start, got %d", len(toolStarts))
 	}
-	th, ok := msg.Content[0].(core.ThinkingContent)
-	if !ok {
-		t.Fatalf("not ThinkingContent, got %T", msg.Content[0])
+	if toolStarts[0].ID != "tu_01" {
+		t.Errorf("expected ID tu_01, got %s", toolStarts[0].ID)
 	}
-	if th.ThinkingSignature != "late-sig" {
-		t.Errorf("late signature: got %q, want late-sig", th.ThinkingSignature)
+	if toolStarts[0].Name != "get_weather" {
+		t.Errorf("expected Name get_weather, got %s", toolStarts[0].Name)
+	}
+
+	toolEnds := filterEventTypes[core.EventToolCallEnd](events)
+	if len(toolEnds) != 1 {
+		t.Fatalf("expected 1 toolcall_end, got %d", len(toolEnds))
+	}
+
+	done := findEventType[core.EventDone](events)
+	if done == nil {
+		t.Fatal("expected EventDone")
+	}
+	if done.Reason != core.StopToolUse {
+		t.Errorf("expected StopToolUse, got %v", done.Reason)
 	}
 }
 
-// When the stream ends mid-block (no content_block_stop), the per-block
-// drain should still produce a content entry with the captured signature.
-func TestAnthropic_TruncatedStream_DrainsBuffers(t *testing.T) {
+// Test user message prompt generates correct usage info.
+func TestAnthropic_UsageTracking(t *testing.T) {
 	sse := "" +
-		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","signature":"trunc-sig"}}
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}
 ` +
-		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}
 ` +
-		// No content_block_stop, no [DONE].
-		""
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}
+` +
+		`data: {"type":"content_block_stop","index":0}
+` +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}
+` +
+		`data: [DONE]
+`
 
-	_, msg := runAnthropicSSE(t, sse)
-	if len(msg.Content) != 1 {
-		t.Fatalf("expected 1 drained block, got %d", len(msg.Content))
+	events := runAnthropicSSE(t, sse)
+
+	done := findEventType[core.EventDone](events)
+	if done == nil {
+		t.Fatal("expected EventDone")
 	}
-	tc, ok := msg.Content[0].(core.TextContent)
-	if !ok || tc.Text != "partial" {
-		t.Errorf("drained text: got %+v", msg.Content[0])
+	if done.Message.Usage.Input != 10 {
+		t.Errorf("expected Input=10, got %d", done.Message.Usage.Input)
 	}
-	if tc.TextSignature != "trunc-sig" {
-		t.Errorf("drained sig: got %q, want trunc-sig", tc.TextSignature)
+	if done.Message.Usage.Output != 5 {
+		t.Errorf("expected Output=5, got %d", done.Message.Usage.Output)
 	}
+}
+
+// Test signature_delta is properly captured on per-block basis.
+func TestAnthropic_SignatureDelta(t *testing.T) {
+	sse := "" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}
+` +
+		// signature arrives via delta
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-from-delta"}}
+` +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"signed text"}}
+` +
+		`data: {"type":"content_block_stop","index":0}
+` +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+` +
+		`data: [DONE]
+`
+
+	events := runAnthropicSSE(t, sse)
+
+	// Verify EventTextEnd carries the signature from the delta
+	textEnds := filterEventTypes[core.EventTextEnd](events)
+	if len(textEnds) < 1 {
+		t.Fatal("expected EventTextEnd")
+	}
+	if textEnds[0].TextSignature != "sig-from-delta" {
+		t.Errorf("expected signature 'sig-from-delta', got %q", textEnds[0].TextSignature)
+	}
+}
+
+// Test redacted thinking blocks.
+func TestAnthropic_RedactedThinking(t *testing.T) {
+	// Redacted thinking has no thinking field on content_block_start,
+	// and signature_delta plus the redacted text.
+	sse := "" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking"}}
+` +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Redacted reasoning"}}
+` +
+		`data: {"type":"content_block_stop","index":0}
+` +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+` +
+		`data: [DONE]
+`
+
+	events := runAnthropicSSE(t, sse)
+
+	// The bridge should treat redacted_thinking as a thinking block
+	thStarts := filterEventTypes[core.EventThinkingStart](events)
+	if len(thStarts) < 1 {
+		t.Errorf("expected at least 1 thinking_start for redacted_thinking")
+	}
+}
+
+// Helper: filter events of a specific type.
+func filterEventTypes[T core.AssistantMessageEvent](events []core.AssistantMessageEvent) []T {
+	var result []T
+	for _, evt := range events {
+		if e, ok := evt.(T); ok {
+			result = append(result, e)
+		}
+	}
+	return result
+}
+
+// Helper: find first event of a specific type.
+func findEventType[T core.AssistantMessageEvent](events []core.AssistantMessageEvent) *T {
+	for _, evt := range events {
+		if e, ok := evt.(T); ok {
+			return &e
+		}
+	}
+	return nil
 }

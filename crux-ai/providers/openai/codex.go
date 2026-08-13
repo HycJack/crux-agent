@@ -56,21 +56,23 @@ func streamCodex(ctx context.Context, model core.Model, c core.Context, opts cor
 		opts.OnPayload(body)
 	}
 
-	stream := core.NewEventStream[core.AssistantMessageEvent, core.AssistantMessage]()
+	ps := core.NewProviderEventStream()
 
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				stream.Error(fmt.Errorf("openai-codex: panic: %v", r))
+				ps.Error(fmt.Errorf("openai-codex: panic: %v", r))
 			}
 		}()
-		msg, err := doResponsesStream(ctx, baseURL, apiKey, model, body, stream, opts)
+		err := doResponsesStream(ctx, baseURL, apiKey, model, body, ps, opts)
 		if err != nil {
-			stream.Error(err)
+			ps.Error(err)
 			return
 		}
-		stream.End(msg)
+		ps.End(core.ProviderEventStreamResult{})
 	}()
 
-	return stream, nil
+	out := core.CanonicalizeProviderStream(ps, model.API, model.Provider, model.ID)
+	return out, nil
 }
+

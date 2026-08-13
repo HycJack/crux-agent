@@ -1,0 +1,2 @@
+Hello from the plugin file tool.
+This file is read by the adapted file.read plugin tool.

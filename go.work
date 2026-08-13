@@ -1,10 +1,13 @@
 go 1.25.0
 
 use (
+	./agent-engine
+	./agent-engine/examples/crux-plugin-tool
 	./chat-app
-	./crux-agent-harness
 	./crux-agent-chat
+	./crux-agent-harness
 	./crux-agent-runtime
 	./crux-agent-tui
 	./crux-ai
+	./crux-plugin
 )

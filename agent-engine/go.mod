@@ -1,0 +1,17 @@
+// Module agent-engine — 可嵌入的 Agent 运行时库
+module github.com/hycjack/agent-engine
+
+go 1.23.0
+
+require (
+	github.com/hycjack/crux-ai v0.0.1
+	github.com/pkoukk/tiktoken-go v0.1.6
+)
+
+require (
+	github.com/dlclark/regexp2 v1.11.0 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/stretchr/testify v1.10.0 // indirect
+)
+
+replace github.com/hycjack/crux-ai => ../crux-ai

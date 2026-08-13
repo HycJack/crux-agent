@@ -3,12 +3,10 @@ package anthropic
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 	"time"
 
@@ -55,6 +53,9 @@ func streamAnthropic(ctx context.Context, model core.Model, c core.Context, opts
 	}
 	baseURL := core.ResolveBaseURL(model, defaultBaseURL)
 
+	// Apply TransformMessages before building request.
+	c.Messages = core.TransformMessages(c.Messages, model, nil)
+
 	body, err := buildRequestBody(model, c, opts, anthropicOpts)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: failed to build request: %w", err)
@@ -63,23 +64,24 @@ func streamAnthropic(ctx context.Context, model core.Model, c core.Context, opts
 		opts.OnPayload(body)
 	}
 
-	stream := core.NewEventStream[core.AssistantMessageEvent, core.AssistantMessage]()
+	ps := core.NewProviderEventStream()
 
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				stream.Error(fmt.Errorf("anthropic: panic: %v", r))
+				ps.Error(fmt.Errorf("anthropic: panic: %v", r))
 			}
 		}()
-		msg, err := doStream(ctx, baseURL, apiKey, model, body, stream, opts)
+		err := doStreamAnthropic(ctx, baseURL, apiKey, model, body, ps, opts)
 		if err != nil {
-			stream.Error(err)
+			ps.Error(err)
 			return
 		}
-		stream.End(msg)
+		ps.End(core.ProviderEventStreamResult{})
 	}()
 
-	return stream, nil
+	out := core.CanonicalizeProviderStream(ps, model.API, model.Provider, model.ID)
+	return out, nil
 }
 
 func buildRequestBody(model core.Model, c core.Context, opts core.StreamOptions, anthropicOpts Options) (map[string]any, error) {
@@ -252,67 +254,58 @@ func convertTools(tools []core.Tool, eagerStreaming bool) []map[string]any {
 	return result
 }
 
-func doStream(ctx context.Context, baseURL, apiKey string, model core.Model, body map[string]any, stream *core.AssistantMessageEventStream, opts core.StreamOptions) (core.AssistantMessage, error) {
+func doStreamAnthropic(ctx context.Context, baseURL, apiKey string, model core.Model, body map[string]any, ps *core.ProviderEventStream, opts core.StreamOptions) error {
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-		return core.AssistantMessage{}, err
+		return err
 	}
 	url := baseURL + "/v1/messages"
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return core.AssistantMessage{}, err
+	// Build headers for DoWithRetry
+	headers := map[string]string{
+		"Content-Type":     "application/json",
+		"x-api-key":        apiKey,
+		"anthropic-version": "2023-06-01",
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
 	if anthropicOpts, ok := body["thinking"]; ok {
 		if thinkingMap, ok := anthropicOpts.(map[string]any); ok && thinkingMap["type"] == "enabled" {
-			req.Header.Set("anthropic-beta", "interleaved-thinking-2025-05-14")
+			headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
 		}
 	}
 	for k, v := range core.ProviderHeadersToRecord(core.MergeProviderHeaders(model.Headers, opts.Headers)) {
-		req.Header.Set(k, v)
+		headers[k] = v
 	}
 
 	client := core.NewTimeoutClient(opts.TimeoutMs)
-	resp, err := client.Do(req)
+	resp, err := core.DoWithRetry(ctx, client, "POST", url, bodyBytes, headers, model.Provider, opts)
 	if err != nil {
-		return core.AssistantMessage{}, err
+		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return core.AssistantMessage{}, fmt.Errorf("anthropic: API error %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-	return processSSEStream(resp.Body, stream, model, opts)
+	return processSSEStreamAnthropic(resp.Body, ps, model, opts)
 }
 
-func processSSEStream(body io.Reader, stream *core.AssistantMessageEventStream, model core.Model, opts core.StreamOptions) (core.AssistantMessage, error) {
+func processSSEStreamAnthropic(body io.Reader, ps *core.ProviderEventStream, model core.Model, opts core.StreamOptions) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
 	var (
-		msg        core.AssistantMessage
 		textBufs   map[int]*strings.Builder
 		thinkBufs  map[int]*strings.Builder
 		toolCalls  map[int]*core.ToolCall
 		blockTypes map[int]string
 		blockSigs  map[int]string
+		usage      core.Usage
+		stopReason core.StopReason
 	)
-	msg.API = model.API
-	msg.Provider = model.Provider
-	msg.Model = model.ID
-	msg.Role = "assistant"
-	msg.Timestamp = time.Now()
 	toolCalls = make(map[int]*core.ToolCall)
 	textBufs = make(map[int]*strings.Builder)
 	thinkBufs = make(map[int]*strings.Builder)
 	blockTypes = make(map[int]string)
 	blockSigs = make(map[int]string)
 
-	stream.Push(core.EventStart{Type: "start", API: model.API, Provider: model.Provider, Model: model.ID, Timestamp: time.Now()})
+	ps.Push(core.ProviderResponseStart{Type: "response_start", Model: model.ID, Timestamp: time.Now()})
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -339,26 +332,29 @@ func processSSEStream(body io.Reader, stream *core.AssistantMessageEventStream, 
 			index, _ := event["index"].(float64)
 			idx := int(index)
 			blockTypes[idx] = blockType
+			if sig, ok := block["signature"].(string); ok && sig != "" {
+				blockSigs[idx] = sig
+			}
 			switch blockType {
 			case "text":
-				// Anthropic delivers the signature on the *content_block*
-				// inside content_block_start, not on the outer event.
-				if sig, ok := block["signature"].(string); ok && sig != "" {
-					blockSigs[idx] = sig
-				}
 				textBufs[idx] = &strings.Builder{}
-				stream.Push(core.EventTextStart{Type: "text_start", ContentIndex: idx})
 			case "thinking":
-				if sig, ok := block["signature"].(string); ok && sig != "" {
-					blockSigs[idx] = sig
-				}
 				thinkBufs[idx] = &strings.Builder{}
-				stream.Push(core.EventThinkingStart{Type: "thinking_start", ContentIndex: idx})
 			case "tool_use":
 				id, _ := block["id"].(string)
 				name, _ := block["name"].(string)
-				toolCalls[idx] = &core.ToolCall{Type: "toolCall", ID: id, Name: name}
-				stream.Push(core.EventToolCallStart{Type: "toolcall_start", ContentIndex: idx, ID: id, Name: name})
+				// Emit the full tool call now — the bridge needs one
+				// ProviderToolCall to produce toolcall_start + toolcall_end.
+				// For Anthropic, tool_use fields arrive fully on
+				// content_block_start, but input_json_delta may follow.
+				// We emit a partial tool call now; input_json_delta appends
+				// to Arguments.
+				tc := &core.ToolCall{Type: "toolCall", ID: id, Name: name}
+				if input, ok := block["input"].(map[string]any); ok {
+					inputBytes, _ := json.Marshal(input)
+					tc.Arguments = inputBytes
+				}
+				toolCalls[idx] = tc
 			}
 
 		case "content_block_delta":
@@ -372,24 +368,25 @@ func processSSEStream(body io.Reader, stream *core.AssistantMessageEventStream, 
 				if buf, ok := textBufs[idx]; ok {
 					buf.WriteString(text)
 				}
-				stream.Push(core.EventTextDelta{Type: "text_delta", ContentIndex: idx, Delta: text})
+				ps.Push(core.ProviderTextDelta{Type: "text_delta", Delta: text})
 			case "thinking_delta":
 				thinking, _ := delta["thinking"].(string)
 				if buf, ok := thinkBufs[idx]; ok {
 					buf.WriteString(thinking)
 				}
-				stream.Push(core.EventThinkingDelta{Type: "thinking_delta", ContentIndex: idx, Delta: thinking})
+				ps.Push(core.ProviderThinkingDelta{Type: "thinking_delta", Delta: thinking})
 			case "signature_delta":
-				// Some Anthropic responses deliver the signature as a
-				// separate delta event rather than embedded in the block.
 				if sig, ok := delta["signature"].(string); ok && sig != "" {
 					blockSigs[idx] = sig
 				}
 			case "input_json_delta":
 				partial, _ := delta["partial_json"].(string)
 				if tc, ok := toolCalls[idx]; ok {
-					tc.Arguments = append(tc.Arguments, []byte(partial)...)
-					stream.Push(core.EventToolCallDelta{Type: "toolcall_delta", ContentIndex: idx, ID: tc.ID, ArgumentsDelta: partial})
+					if len(tc.Arguments) == 0 {
+						tc.Arguments = []byte(partial)
+					} else {
+						tc.Arguments = append(tc.Arguments, []byte(partial)...)
+					}
 				}
 			}
 
@@ -401,61 +398,63 @@ func processSSEStream(body io.Reader, stream *core.AssistantMessageEventStream, 
 			switch blockType {
 			case "tool_use":
 				if tc, ok := toolCalls[idx]; ok {
-					stream.Push(core.EventToolCallEnd{Type: "toolcall_end", ContentIndex: idx, ID: tc.ID, Arguments: tc.Arguments})
-					msg.Content = append(msg.Content, *tc)
+					ps.Push(core.ProviderToolCall{
+						Type: "tool_call", ID: tc.ID, Name: tc.Name,
+						Arguments: tc.Arguments,
+					})
 				}
 			case "text":
-				content := ""
-				if buf, ok := textBufs[idx]; ok {
-					content = buf.String()
+				if sig != "" {
+					ps.Push(core.ProviderContentBlockStop{
+						Type:          "content_block_stop",
+						TextSignature: sig,
+					})
 				}
-				stream.Push(core.EventTextEnd{Type: "text_end", ContentIndex: idx, Content: content, TextSignature: sig})
-				msg.Content = append(msg.Content, core.TextContent{Type: "text", Text: content, TextSignature: sig})
-				delete(textBufs, idx)
 			case "thinking":
-				content := ""
-				if buf, ok := thinkBufs[idx]; ok {
-					content = buf.String()
+				if sig != "" {
+					ps.Push(core.ProviderContentBlockStop{
+						Type:              "content_block_stop",
+						ThinkingSignature: sig,
+					})
 				}
-				stream.Push(core.EventThinkingEnd{Type: "thinking_end", ContentIndex: idx, Content: content, ThinkingSignature: sig})
-				msg.Content = append(msg.Content, core.ThinkingContent{Type: "thinking", Thinking: content, ThinkingSignature: sig})
-				delete(thinkBufs, idx)
 			}
 
 		case "message_start":
 			message, _ := event["message"].(map[string]any)
 			if message != nil {
-				if usage, ok := message["usage"].(map[string]any); ok {
-					msg.Usage.Input = conv.GetInt(usage, "input_tokens")
-					msg.Usage.Output = conv.GetInt(usage, "output_tokens")
-					msg.Usage.CacheRead = conv.GetInt(usage, "cache_read_input_tokens")
-					msg.Usage.CacheWrite = conv.GetInt(usage, "cache_creation_input_tokens")
+				if u, ok := message["usage"].(map[string]any); ok {
+					usage.Input = conv.GetInt(u, "input_tokens")
+					usage.Output = conv.GetInt(u, "output_tokens")
+					usage.CacheRead = conv.GetInt(u, "cache_read_input_tokens")
+					usage.CacheWrite = conv.GetInt(u, "cache_creation_input_tokens")
 				}
 			}
 
 		case "message_delta":
 			delta, _ := event["delta"].(map[string]any)
-			if stopReason, ok := delta["stop_reason"].(string); ok {
-				msg.StopReason = mapStopReason(stopReason)
+			if reason, ok := delta["stop_reason"].(string); ok {
+				stopReason = mapStopReason(reason)
 			}
-			if usage, ok := event["usage"].(map[string]any); ok {
-				msg.Usage.Output = conv.GetInt(usage, "output_tokens")
+			if u, ok := event["usage"].(map[string]any); ok {
+				usage.Output = conv.GetInt(u, "output_tokens")
 			}
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return msg, fmt.Errorf("anthropic: SSE read error: %w", err)
+		return fmt.Errorf("anthropic: SSE read error: %w", err)
 	}
 
-	// Drain any per-block buffers whose content_block_stop never arrived
-	// (e.g. provider stream ended mid-block). We append as anonymous text
-	// blocks with the captured signature, if any.
+	usage.TotalTokens = usage.Input + usage.Output + usage.CacheRead + usage.CacheWrite
+	usage.Cost = core.CalculateCost(model, usage)
+
+	// Build final message with Content blocks containing signatures
+	var finalContent []core.ContentBlock
 	for idx, buf := range textBufs {
 		if buf.Len() == 0 {
 			continue
 		}
-		msg.Content = append(msg.Content, core.TextContent{
+		finalContent = append(finalContent, core.TextContent{
 			Type: "text", Text: buf.String(), TextSignature: blockSigs[idx],
 		})
 	}
@@ -463,17 +462,23 @@ func processSSEStream(body io.Reader, stream *core.AssistantMessageEventStream, 
 		if buf.Len() == 0 {
 			continue
 		}
-		msg.Content = append(msg.Content, core.ThinkingContent{
+		finalContent = append(finalContent, core.ThinkingContent{
 			Type: "thinking", Thinking: buf.String(), ThinkingSignature: blockSigs[idx],
 		})
 	}
 
-	msg.Usage.TotalTokens = msg.Usage.Input + msg.Usage.Output + msg.Usage.CacheRead + msg.Usage.CacheWrite
-	msg.Usage.Cost = core.CalculateCost(model, msg.Usage)
+	final := core.AssistantMessage{
+		Role: "assistant", API: model.API, Provider: model.Provider, Model: model.ID,
+		Usage: usage, StopReason: stopReason, Timestamp: time.Now(),
+		Content: finalContent,
+	}
 
-	stream.Push(core.EventDone{Type: "done", Reason: msg.StopReason, Message: msg})
+	ps.Push(core.ProviderResponseEnd{
+		Type: "response_end", Message: final,
+		FinishReason: string(stopReason),
+	})
 
-	return msg, nil
+	return nil
 }
 
 func mapStopReason(reason string) core.StopReason {

@@ -2,12 +2,10 @@ package openai
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 	"time"
 
@@ -61,6 +59,8 @@ func streamCompletions(ctx context.Context, model core.Model, c core.Context, op
 	}
 	baseURL := core.ResolveBaseURL(model, defaultCompletionsURL)
 
+	c.Messages = core.TransformMessages(c.Messages, model, nil)
+
 	body, err := buildCompletionsBody(model, c, opts, completionsOpts)
 	if err != nil {
 		return nil, fmt.Errorf("openai: failed to build request: %w", err)
@@ -69,23 +69,24 @@ func streamCompletions(ctx context.Context, model core.Model, c core.Context, op
 		opts.OnPayload(body)
 	}
 
-	stream := core.NewEventStream[core.AssistantMessageEvent, core.AssistantMessage]()
+	ps := core.NewProviderEventStream()
 
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				stream.Error(fmt.Errorf("openai: panic: %v", r))
+				ps.Error(fmt.Errorf("openai: panic: %v", r))
 			}
 		}()
-		msg, err := doCompletionsStream(ctx, baseURL, apiKey, model, body, stream, opts)
+		err := doCompletionsStream(ctx, baseURL, apiKey, model, body, ps, opts)
 		if err != nil {
-			stream.Error(err)
+			ps.Error(err)
 			return
 		}
-		stream.End(msg)
+		ps.End(core.ProviderEventStreamResult{})
 	}()
 
-	return stream, nil
+	out := core.CanonicalizeProviderStream(ps, model.API, model.Provider, model.ID)
+	return out, nil
 }
 
 func buildCompletionsBody(model core.Model, c core.Context, opts core.StreamOptions, completionsOpts CompletionsOptions) (map[string]any, error) {
@@ -128,61 +129,48 @@ func buildCompletionsBody(model core.Model, c core.Context, opts core.StreamOpti
 	return body, nil
 }
 
-func doCompletionsStream(ctx context.Context, baseURL, apiKey string, model core.Model, body map[string]any, stream *core.AssistantMessageEventStream, opts core.StreamOptions) (core.AssistantMessage, error) {
+func doCompletionsStream(ctx context.Context, baseURL, apiKey string, model core.Model, body map[string]any, ps *core.ProviderEventStream, opts core.StreamOptions) error {
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-		return core.AssistantMessage{}, err
+		return err
 	}
 	url := baseURL + "/chat/completions"
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return core.AssistantMessage{}, err
+	headers := map[string]string{
+		"Content-Type":  "application/json",
+		"Authorization": "Bearer " + apiKey,
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
 	for k, v := range core.ProviderHeadersToRecord(core.MergeProviderHeaders(model.Headers, opts.Headers)) {
-		req.Header.Set(k, v)
+		headers[k] = v
 	}
 
 	client := core.NewTimeoutClient(opts.TimeoutMs)
-	resp, err := client.Do(req)
+	resp, err := core.DoWithRetry(ctx, client, "POST", url, bodyBytes, headers, model.Provider, opts)
 	if err != nil {
-		return core.AssistantMessage{}, err
+		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return core.AssistantMessage{}, fmt.Errorf("openai: API error %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-	return processCompletionsSSE(resp.Body, stream, model, opts)
+	return processCompletionsSSE(resp.Body, ps, model, opts)
 }
 
-func processCompletionsSSE(body io.Reader, stream *core.AssistantMessageEventStream, model core.Model, opts core.StreamOptions) (core.AssistantMessage, error) {
+func processCompletionsSSE(body io.Reader, ps *core.ProviderEventStream, model core.Model, opts core.StreamOptions) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
 	var (
-		msg          core.AssistantMessage
-		textBuf      strings.Builder
-		textOpen     bool
-		textStartIx  int // -1 until first text delta; smaller = opened earlier
-		thinkingBuf  strings.Builder
-		thinkOpen    bool
-		thinkStartIx int // -1 until first reasoning delta
-		toolCalls    map[int]*core.ToolCall
-		toolIndices  []int
-		nextBlockIx  int
+		textBuf     strings.Builder
+		textOpen    bool
+		thinkingBuf strings.Builder
+		thinkOpen   bool
+		toolCalls   map[int]*core.ToolCall
+		toolIndices []int
+		usage       core.Usage
+		stopReason  core.StopReason
 	)
-	msg.API = model.API
-	msg.Provider = model.Provider
-	msg.Model = model.ID
-	msg.Role = "assistant"
-	msg.Timestamp = time.Now()
 	toolCalls = make(map[int]*core.ToolCall)
 
-	stream.Push(core.EventStart{Type: "start", API: model.API, Provider: model.Provider, Model: model.ID, Timestamp: time.Now()})
+	ps.Push(core.ProviderResponseStart{Type: "response_start", Model: model.ID, Timestamp: time.Now()})
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -208,18 +196,19 @@ func processCompletionsSSE(body io.Reader, stream *core.AssistantMessageEventStr
 		if !ok {
 			continue
 		}
+
+		// Track finish_reason as stop reason
 		if finishReason, ok := choice["finish_reason"].(string); ok && finishReason != "" {
-			msg.StopReason = MapStopReason(finishReason)
+			stopReason = MapStopReason(finishReason)
 		}
 
 		// Parse usage from the last chunk (when stream_options.include_usage is set).
-		if usage, ok := chunk["usage"].(map[string]any); ok {
-			msg.Usage.Input = conv.GetInt(usage, "prompt_tokens")
-			msg.Usage.Output = conv.GetInt(usage, "completion_tokens")
-			msg.Usage.TotalTokens = conv.GetInt(usage, "total_tokens")
-			// OpenAI returns cached_tokens inside prompt_tokens_details.
-			if details, ok := usage["prompt_tokens_details"].(map[string]any); ok {
-				msg.Usage.CacheRead = conv.GetInt(details, "cached_tokens")
+		if u, ok := chunk["usage"].(map[string]any); ok {
+			usage.Input = conv.GetInt(u, "prompt_tokens")
+			usage.Output = conv.GetInt(u, "completion_tokens")
+			usage.TotalTokens = conv.GetInt(u, "total_tokens")
+			if details, ok := u["prompt_tokens_details"].(map[string]any); ok {
+				usage.CacheRead = conv.GetInt(details, "cached_tokens")
 			}
 		}
 
@@ -227,27 +216,20 @@ func processCompletionsSSE(body io.Reader, stream *core.AssistantMessageEventStr
 		if !ok {
 			continue
 		}
+
 		if content, ok := delta["content"].(string); ok && content != "" {
 			if !textOpen {
-				idx := nextBlockIx
-				nextBlockIx++
-				stream.Push(core.EventTextStart{Type: "text_start", ContentIndex: idx})
 				textOpen = true
-				textStartIx = idx
 			}
 			textBuf.WriteString(content)
-			stream.Push(core.EventTextDelta{Type: "text_delta", ContentIndex: textStartIx, Delta: content})
+			ps.Push(core.ProviderTextDelta{Type: "text_delta", Delta: content})
 		}
 		if reasoning, ok := delta["reasoning_content"].(string); ok && reasoning != "" {
 			if !thinkOpen {
-				idx := nextBlockIx
-				nextBlockIx++
-				stream.Push(core.EventThinkingStart{Type: "thinking_start", ContentIndex: idx})
 				thinkOpen = true
-				thinkStartIx = idx
 			}
 			thinkingBuf.WriteString(reasoning)
-			stream.Push(core.EventThinkingDelta{Type: "thinking_delta", ContentIndex: thinkStartIx, Delta: reasoning})
+			ps.Push(core.ProviderThinkingDelta{Type: "thinking_delta", Delta: reasoning})
 		}
 		if calls, ok := delta["tool_calls"].([]any); ok {
 			for _, call := range calls {
@@ -262,58 +244,59 @@ func processCompletionsSSE(body io.Reader, stream *core.AssistantMessageEventStr
 				args, _ := function["arguments"].(string)
 
 				if id != "" {
-					idx := nextBlockIx
-					nextBlockIx++
-					toolCalls[index] = &core.ToolCall{Type: "toolCall", ID: id, Name: name}
+					tc := &core.ToolCall{Type: "toolCall", ID: id, Name: name}
+					if args != "" {
+						tc.Arguments = []byte(args)
+					}
+					toolCalls[index] = tc
 					toolIndices = append(toolIndices, index)
-					stream.Push(core.EventToolCallStart{Type: "toolcall_start", ContentIndex: idx, ID: id, Name: name})
 				}
-				if tc, ok := toolCalls[index]; ok && args != "" {
+				if tc, ok := toolCalls[index]; ok && args != "" && id == "" {
 					tc.Arguments = append(tc.Arguments, []byte(args)...)
-					stream.Push(core.EventToolCallDelta{Type: "toolcall_delta", ID: tc.ID, ArgumentsDelta: args})
+				}
+			}
+		}
+
+		// When finish_reason is set, close all active blocks
+		if fr, ok := choice["finish_reason"].(string); ok && fr != "" && fr != "null" {
+			if textOpen {
+				ps.Push(core.ProviderContentBlockStop{Type: "content_block_stop"})
+				textOpen = false
+			}
+			if thinkOpen {
+				ps.Push(core.ProviderContentBlockStop{Type: "content_block_stop"})
+				thinkOpen = false
+			}
+			// Emit tool calls (OpenAI sends full tool calls before finish_reason)
+			for _, index := range toolIndices {
+				if tc, ok := toolCalls[index]; ok {
+					ps.Push(core.ProviderToolCall{
+						Type: "tool_call", ID: tc.ID, Name: tc.Name,
+						Arguments: tc.Arguments,
+					})
 				}
 			}
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return msg, fmt.Errorf("openai: SSE read error: %w", err)
+		return fmt.Errorf("openai: SSE read error: %w", err)
 	}
 
-	// Send end events for all collected content. We close in stream-order
-	// (i.e. by the contentIndex each block was opened with) so msg.Content
-	// matches the order in which the model emitted the parts. This is
-	// critical when reasoning comes before visible text: callers expect
-	// the thinking block at index 0, not after the text block.
-	textFirst := textOpen && (!thinkOpen || textStartIx <= thinkStartIx)
-	thinkFirst := thinkOpen && (!textOpen || thinkStartIx < textStartIx)
-	if textFirst {
-		msg.Content = append(msg.Content, core.TextContent{Type: "text", Text: textBuf.String()})
-		stream.Push(core.EventTextEnd{Type: "text_end", ContentIndex: textStartIx, Content: textBuf.String()})
-	}
-	if thinkFirst || (thinkOpen && !textOpen) {
-		// OpenAI's `reasoning_content` is reasoning, not user-visible text.
-		// Store as ThinkingContent so downstream consumers can render it
-		// distinctly (mirrors Mistral/Responses/Claude behaviour).
-		msg.Content = append(msg.Content, core.ThinkingContent{Type: "thinking", Thinking: thinkingBuf.String()})
-		stream.Push(core.EventThinkingEnd{Type: "thinking_end", ContentIndex: thinkStartIx, Content: thinkingBuf.String()})
-	}
-	if !textFirst && textOpen {
-		msg.Content = append(msg.Content, core.TextContent{Type: "text", Text: textBuf.String()})
-		stream.Push(core.EventTextEnd{Type: "text_end", ContentIndex: textStartIx, Content: textBuf.String()})
-	}
-	for _, index := range toolIndices {
-		if tc, ok := toolCalls[index]; ok {
-			stream.Push(core.EventToolCallEnd{Type: "toolcall_end", ID: tc.ID, Arguments: tc.Arguments})
-			msg.Content = append(msg.Content, *tc)
-		}
+	usage.TotalTokens = usage.Input + usage.Output + usage.CacheRead
+	usage.Cost = core.CalculateCost(model, usage)
+
+	final := core.AssistantMessage{
+		Role: "assistant", API: model.API, Provider: model.Provider, Model: model.ID,
+		Usage: usage, StopReason: stopReason, Timestamp: time.Now(),
 	}
 
-	msg.Usage.TotalTokens = msg.Usage.Input + msg.Usage.Output + msg.Usage.CacheRead
-	msg.Usage.Cost = core.CalculateCost(model, msg.Usage)
-	stream.Push(core.EventDone{Type: "done", Reason: msg.StopReason, Message: msg})
+	ps.Push(core.ProviderResponseEnd{
+		Type: "response_end", Message: final,
+		FinishReason: string(stopReason),
+	})
 
-	return msg, nil
+	return nil
 }
 
 func clampEffort(effort core.ThinkingLevel) core.ThinkingLevel {

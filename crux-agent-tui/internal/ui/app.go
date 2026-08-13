@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,10 +15,14 @@ import (
 	"time"
 
 	"crux-agent-tui/internal/agent"
-	"crux-agent-tui/internal/openai"
-	"crux-agent-tui/internal/provider"
+
+	// Force provider registration (crux-ai built-in providers) via init(),
+	// mirroring demo-agent. Without this, core.GetProvider returns no provider
+	// and streaming fails at runtime.
+	_ "github.com/hycjack/crux-ai/providers"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/hycjack/crux-ai/core"
 )
 
 // ── Mode constants ────────────────────────────────────────────────────────────
@@ -121,18 +126,21 @@ func (a *App) SetProgram(p *tea.Program) {
 
 // NewApp creates a new TUI agent application.
 func NewApp() (*App, error) {
+	var err error
 	cfg, err := loadConfig()
 	if err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
 
-	var llmProvider provider.LLMProvider
-	if !cfg.mustUseOpenAIProtocol() {
-		return nil, fmt.Errorf("provider %q not supported. Use AI_BASE_URL + OPENAI_API_KEY instead.\n", cfg.ProviderName)
+	// Resolve the LLM model via crux-ai's model table (or the
+	// openai-compatible virtual provider), mirroring demo-agent.
+	if _, err := agent.ResolveModel(cfg.ProviderName, cfg.ModelID, cfg.BaseURL); err != nil {
+		return nil, fmt.Errorf("model %q/%q: %w", cfg.ProviderName, cfg.ModelID, err)
 	}
-	llmProvider = openai.New()
 
-	agentInst := newAgent(cfg, llmProvider)
+	// No hand-rolled provider needed: the engine's built-in StreamFn streams
+	// through crux-ai's compat/router for every resolved provider.
+	agentInst := newAgent(cfg)
 
 	app := &App{
 		chat:   NewChatView(),
@@ -155,7 +163,9 @@ func NewApp() (*App, error) {
 	return app, nil
 }
 
-func newAgent(cfg *tuiConfig, llmProvider provider.LLMProvider) *agent.Agent {
+// ── Agent Runner ───────────────────────────────────────────────────────────
+
+func newAgent(cfg *tuiConfig) *agent.Agent {
 	systemPrompt := cfg.SystemPrompt
 	if systemPrompt == "" {
 		systemPrompt = defaultSystemPrompt
@@ -165,41 +175,48 @@ func newAgent(cfg *tuiConfig, llmProvider provider.LLMProvider) *agent.Agent {
 	systemPrompt += fmt.Sprintf("\nCurrent time: %s", time.Now().Format(time.RFC3339))
 	systemPrompt += fmt.Sprintf("\nOperating system: %s/%s", runtime.GOOS, runtime.GOARCH)
 
-	state := agent.AgentState{
-		Model:        cfg.ModelID,
-		BaseURL:      cfg.BaseURL,
-		APIKey:       cfg.APIKey,
-		SystemPrompt: systemPrompt,
-		Tools:        allTools(),
-		MaxTokens:    cfg.MaxTokens,
-		Headers:      make(map[string]string),
+	model, err := agent.ResolveModel(cfg.ProviderName, cfg.ModelID, cfg.BaseURL)
+	if err != nil {
+		// Defensive: NewApp already validated, but keep the signature safe.
+		model = core.Model{ID: cfg.ModelID, BaseURL: cfg.BaseURL}
 	}
-	return agent.New(state, llmProvider, agent.CompactionConfig{MaxTokens: 100000, TokenBudget: 50})
+
+	return agent.New(agent.AgentConfig{
+		Model:               model,
+		SystemPrompt:        systemPrompt,
+		Tools:               allTools(),
+		APIKey:              cfg.APIKey,
+		Temperature:         cfg.Temperature,
+		MaxTokens:           cfg.MaxTokens,
+		Headers:             make(map[string]string),
+		CompactionMaxTokens: 100000,
+	})
 }
 
 // handleAgentEvent routes agent events to the event loop.
+// Uses engine.AgentEvent types directly (via type aliases in agent package).
 func (a *App) handleAgentEvent(evt agent.AgentEvent) {
 	switch e := evt.(type) {
 	case agent.EventMessageUpdate:
-		if e.Type == "reasoning" || e.Type == "thinking" {
-			// First response packet → confirm the bubble as sent
-			a.confirmBubbleSent()
-			a.publish(agentReasoningMsg{delta: e.Delta})
-		} else {
-			a.confirmBubbleSent()
-			a.publish(agentStreamMsg{text: e.Delta})
+		a.confirmBubbleSent()
+		switch evt := e.AssistantEvent.(type) {
+		case core.EventThinkingDelta:
+			a.publish(agentReasoningMsg{delta: evt.Delta})
+		case core.EventTextDelta:
+			a.publish(agentStreamMsg{text: evt.Delta})
 		}
 	case agent.EventToolExecStart:
 		a.confirmBubbleSent()
-		args := extractPrimaryArg(e.ToolName, e.Args)
-		a.publish(agentToolStartMsg{name: e.ToolName, args: args, rawArgs: e.Args, toolID: e.ToolID})
+		argsStr := string(e.Args)
+		args := extractPrimaryArg(e.ToolName, argsStr)
+		a.publish(agentToolStartMsg{name: e.ToolName, args: args, rawArgs: argsStr, toolID: e.ToolCallID})
 	case agent.EventToolExecEnd:
-		a.publish(agentToolEndMsg{name: e.ToolName, result: e.Result, isErr: e.IsError, toolID: e.ToolID})
+		resultStr := string(e.Result)
+		a.publish(agentToolEndMsg{name: e.ToolName, result: resultStr, isErr: e.IsError, toolID: e.ToolCallID})
 	case agent.EventTurnEnd:
-		if e.ErrorMessage != "" {
-			a.publish(agentStreamMsg{text: "\n\nError: " + e.ErrorMessage})
+		if e.Message.ErrorMessage != "" {
+			a.publish(agentStreamMsg{text: "\n\nError: " + e.Message.ErrorMessage})
 		}
-		a.publish(agentResponseMsg{err: nil})
 	}
 }
 
@@ -310,12 +327,28 @@ func (a *App) handleStreamMsg(msg agentStreamMsg) (tea.Model, tea.Cmd) {
 	a.closeReasoning()
 
 	if len(a.chat.messages) == 0 || a.chat.messages[len(a.chat.messages)-1].Role != "assistant" {
-		a.chat.AddMessage(ChatMessage{Role: "assistant", Content: msg.text})
+		a.chat.AddMessage(ChatMessage{Role: "assistant", Content: msg.text, Streaming: true})
 	} else {
-		last := a.chat.messages[len(a.chat.messages)-1].Content
-		a.chat.UpdateLastMessage(last + msg.text)
+		last := a.chat.messages[len(a.chat.messages)-1]
+		last.Content += msg.text
+		last.Streaming = true
+		a.chat.UpdateLastMessage(last.Content)
 	}
 	return a, nil
+}
+
+// finalizeLastAssistant marks the most recent assistant message as finalized
+// so it is re-rendered once with full markdown + syntax highlighting instead
+// of the lightweight streaming render.
+func (a *App) finalizeLastAssistant() {
+	if len(a.chat.messages) == 0 {
+		return
+	}
+	last := &a.chat.messages[len(a.chat.messages)-1]
+	if last.Role == "assistant" && last.Streaming {
+		last.Streaming = false
+		a.chat.ReplaceLastMessage(*last)
+	}
 }
 
 func (a *App) handleReasoningMsg(msg agentReasoningMsg) (tea.Model, tea.Cmd) {
@@ -351,7 +384,7 @@ func (a *App) handleToolStartMsg(msg agentToolStartMsg) (tea.Model, tea.Cmd) {
 			Args:      msg.args,
 			RawArgs:   msg.rawArgs,
 			Streaming: true,
-			StartTime: "0",
+			StartTime: fmt.Sprintf("%d", a.runElapsed),
 		},
 	})
 	return a, nil
@@ -392,11 +425,17 @@ func (a *App) handleToolEndMsg(msg agentToolEndMsg) (tea.Model, tea.Cmd) {
 }
 
 func (a *App) handleResponseMsg(msg agentResponseMsg) (tea.Model, tea.Cmd) {
+	// If the run was already cancelled by the user (Esc/Ctrl+C), the abort path
+	// has already reset the UI state. Skip redundant cleanup and error noise.
+	if !a.querying {
+		return a, nil
+	}
 	a.querying = false
 	a.bubblePending = false
 	a.runElapsed = 0
 	a.input.Enable()
 	a.activeToolID = ""
+	a.finalizeLastAssistant()
 	if msg.err != nil {
 		a.chat.AddMessage(ChatMessage{Role: "error", Content: msg.err.Error()})
 	}
@@ -459,28 +498,68 @@ func pasteFromClipboard() tea.Cmd {
 }
 
 // readClipboard attempts to read text from the clipboard using platform tools.
-// This is a best-effort implementation that tries PowerShell on Windows.
 func readClipboard() (string, error) {
-	// Use PowerShell Get-Clipboard on Windows
-	cmd := exec.Command("powershell", "-NoProfile", "-Command", "Get-Clipboard")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("clipboard: %w", err)
+	switch runtime.GOOS {
+	case "windows":
+		cmd := exec.Command("powershell", "-NoProfile", "-Command", "Get-Clipboard")
+		out, err := cmd.Output()
+		if err != nil {
+			return "", fmt.Errorf("clipboard: %w", err)
+		}
+		return strings.TrimRight(string(out), "\r\n"), nil
+	case "darwin":
+		out, err := exec.Command("pbpaste").Output()
+		if err != nil {
+			return "", fmt.Errorf("clipboard: %w", err)
+		}
+		return strings.TrimRight(string(out), "\n"), nil
+	default: // linux and other unix
+		for _, cmdName := range []string{"xclip", "xsel", "wl-paste"} {
+			var cmd *exec.Cmd
+			switch cmdName {
+			case "xclip":
+				cmd = exec.Command("xclip", "-selection", "clipboard", "-o")
+			case "xsel":
+				cmd = exec.Command("xsel", "--clipboard", "--output")
+			case "wl-paste":
+				cmd = exec.Command("wl-paste")
+			}
+			if out, err := cmd.Output(); err == nil {
+				return strings.TrimRight(string(out), "\n"), nil
+			}
+		}
+		return "", fmt.Errorf("clipboard: no supported clipboard tool found (install xclip, xsel or wl-clipboard)")
 	}
-	return strings.TrimRight(string(out), "\r\n"), nil
 }
 
 // copyToClipboard writes text to the clipboard using platform tools.
 func copyToClipboard(text string) tea.Cmd {
 	return func() tea.Msg {
-		// Use PowerShell Set-Clipboard on Windows
-		cmd := exec.Command("powershell", "-NoProfile", "-Command", "Set-Clipboard")
-		cmd.Stdin = strings.NewReader(text)
-		if err := cmd.Run(); err != nil {
-			// Fallback: try clip.exe
-			cmd2 := exec.Command("clip")
-			cmd2.Stdin = strings.NewReader(text)
-			_ = cmd2.Run()
+		switch runtime.GOOS {
+		case "windows":
+			cmd := exec.Command("powershell", "-NoProfile", "-Command", "Set-Clipboard")
+			cmd.Stdin = strings.NewReader(text)
+			if err := cmd.Run(); err != nil {
+				// Fallback: try clip.exe
+				cmd2 := exec.Command("clip")
+				cmd2.Stdin = strings.NewReader(text)
+				_ = cmd2.Run()
+			}
+		case "darwin":
+			cmd := exec.Command("pbcopy")
+			cmd.Stdin = strings.NewReader(text)
+			_ = cmd.Run()
+		default: // linux and other unix
+			for _, cmd := range []*exec.Cmd{
+				exec.Command("xclip", "-selection", "clipboard"),
+				exec.Command("xsel", "--clipboard", "--input"),
+				exec.Command("wl-copy"),
+			} {
+				cmd.Stdin = strings.NewReader(text)
+				if err := cmd.Run(); err == nil {
+					break
+				}
+			}
 		}
 		return nil // no message needed; copy is fire-and-forget
 	}
@@ -519,6 +598,7 @@ func (a *App) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.input.Enable()
 			a.reasoningAccum.Reset()
 			a.reasoningOpen = false
+			a.finalizeLastAssistant()
 			return a, nil
 		}
 		// Idle: double Ctrl+C quits
@@ -686,6 +766,7 @@ func (a *App) handleEsc() (tea.Model, tea.Cmd) {
 		a.input.Enable()
 		a.reasoningAccum.Reset()
 		a.reasoningOpen = false
+		a.finalizeLastAssistant()
 		return a, nil
 	}
 
@@ -794,8 +875,7 @@ func (a *App) handleCommand(cmd string) (tea.Model, tea.Cmd) {
 		a.reasoningOpen = false
 		a.todoArgs = ""
 		a.agent.Reset()
-		llmProvider := openai.New()
-		a.agent = newAgent(a.cfg, llmProvider)
+		a.agent = newAgent(a.cfg)
 		a.agent.Subscribe(func(evt agent.AgentEvent) { a.handleAgentEvent(evt) })
 		a.chat.AddMessage(ChatMessage{Role: "system", Content: "Conversation cleared"})
 		return a, nil
@@ -843,8 +923,7 @@ Keys:
 		a.reasoningOpen = false
 		a.todoArgs = ""
 		a.agent.Reset()
-		llmProvider := openai.New()
-		a.agent = newAgent(a.cfg, llmProvider)
+		a.agent = newAgent(a.cfg)
 		a.agent.Subscribe(func(evt agent.AgentEvent) { a.handleAgentEvent(evt) })
 		a.chat.AddMessage(ChatMessage{Role: "system", Content: "New session started"})
 		return a, nil
@@ -867,6 +946,12 @@ func (a *App) runAgent(prompt string) tea.Cmd {
 		defer cancel()
 		_, err := a.agent.Run(ctx, prompt)
 		if err != nil {
+			// A cancelled context means the user actively aborted (Esc/Ctrl+C);
+			// the UI already shows a "Canceled"/"Aborted" message, so don't
+			// surface the underlying context error as an error bubble.
+			if errors.Is(err, context.Canceled) {
+				return agentResponseMsg{err: nil}
+			}
 			return agentResponseMsg{err: err}
 		}
 		return agentResponseMsg{err: nil}
@@ -1180,7 +1265,7 @@ func (a *App) View() string {
 	modeInfo := ""
 	switch a.mode {
 	case modePlan:
-		modeInfo = dimLine(" · plan: read-only")
+		modeInfo = modePlanInfoStyle.Render(" · plan: read-only")
 	case modeYOLO:
 		modeInfo = modeYOLOInfoStyle.Render(" · approvals: skipped")
 	}
@@ -1270,8 +1355,52 @@ func spinnerFrame(elapsed int) string {
 
 func extractPrimaryArg(name, rawArgs string) string {
 	arg := strings.TrimSpace(rawArgs)
+
+	// Try to parse JSON args and extract the primary human-readable argument.
+	if parsed, ok := primaryArgFromJSON(arg); ok {
+		arg = parsed
+	}
+
 	if len(arg) > 60 {
 		arg = arg[:60] + "…"
 	}
 	return arg
+}
+
+// primaryArgFromJSON extracts the primary argument value from a JSON tool-call
+// payload. It prefers the most meaningful field for each tool so the tool card
+// shows e.g. "Read(path/to/file)" instead of the raw JSON object.
+func primaryArgFromJSON(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw[0] != '{' {
+		return "", false
+	}
+
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return "", false
+	}
+
+	// Priority order of fields to display as the primary argument, per tool.
+	preferred := []string{
+		"command", "path", "url", "pattern", "old_text",
+	}
+	for _, key := range preferred {
+		if v, ok := m[key]; ok {
+			var s string
+			if err := json.Unmarshal(v, &s); err == nil && s != "" {
+				return s, true
+			}
+		}
+	}
+
+	// Fallback: return the first non-empty string value in the map.
+	for _, v := range m {
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil && s != "" {
+			return s, true
+		}
+	}
+
+	return "", false
 }

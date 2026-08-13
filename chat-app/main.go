@@ -41,6 +41,19 @@ func main() {
 func (a *App) shutdown(ctx context.Context) {
 	logutil.Infof("Crux Agent Chat shutting down")
 
+	// Stop subprocess plugin(s) gracefully.
+	a.mu.RLock()
+	mgr := a.pluginMgr
+	a.mu.RUnlock()
+	if mgr != nil {
+		mgr.StopAll()
+	}
+	a.mu.Lock()
+	if a.pluginCnl != nil {
+		a.pluginCnl()
+	}
+	a.mu.Unlock()
+
 	// Save memory
 	a.mu.RLock()
 	mem := a.mem

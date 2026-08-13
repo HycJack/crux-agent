@@ -43,7 +43,8 @@ func NewEventStream[T any, R any]() *EventStream[T, R] {
 	}
 }
 
-// Push sends an event to the stream.
+// Push sends an event to the stream (non-blocking).
+// Returns false if the stream is closed or buffer is full.
 func (s *EventStream[T, R]) Push(event T) bool {
 	s.mu.Lock()
 	if s.closed {
@@ -61,6 +62,28 @@ func (s *EventStream[T, R]) Push(event T) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// PushBlocking sends an event to the stream, blocking if the buffer is full.
+// Use this in provider goroutines where dropping events is unacceptable
+// (e.g., long-running thinking deltas from large-context streams).
+// Returns false only if the stream is closed or stopped.
+func (s *EventStream[T, R]) PushBlocking(event T) bool {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return false
+	}
+	stop := s.stop
+	ch := s.ch
+	s.mu.Unlock()
+
+	select {
+	case <-stop:
+		return false
+	case ch <- streamEvt[T]{value: event}:
+		return true
 	}
 }
 

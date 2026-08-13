@@ -1,8 +1,8 @@
 // Module crux-ai — version v0.0.1
 module github.com/hycjack/crux-ai
 
-go 1.23.0
+go 1.25.0
 
 require github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 
-require golang.org/x/text v0.14.0 // indirect
+require golang.org/x/text v0.38.0 // indirect

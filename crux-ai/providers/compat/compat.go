@@ -10,13 +10,10 @@
 package compat
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -151,6 +148,13 @@ func runStream(ctx context.Context, cfg Config, model core.Model, c core.Context
 	if apiKey == "" && requireKey {
 		return nil, fmt.Errorf("%s: no API key provided", cfg.Provider)
 	}
+
+	// Apply TransformMessages before building HTTP request body.
+	// This normalizes tool call IDs across provider boundaries, handles
+	// thinking blocks, downgrades images for non-vision models, etc.
+	// Source: pi-mono packages/ai/src/api/transform-messages.ts
+	c.Messages = core.TransformMessages(c.Messages, model, nil)
+
 	if cfg.BuildBody != nil {
 		if err := cfg.BuildBody(model, c, opts, body); err != nil {
 			return nil, fmt.Errorf("%s: failed to build request: %w", cfg.Provider, err)
@@ -198,42 +202,24 @@ func doRequest(
 	baseURL := core.ResolveBaseURL(model, cfg.DefaultBaseURL)
 	url := baseURL + cfg.Path
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return core.AssistantMessage{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
+	headers := map[string]string{"Content-Type": "application/json"}
 	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
+		headers["Authorization"] = "Bearer " + apiKey
 	}
 	for k, v := range cfg.ExtraHeaders {
-		req.Header.Set(k, v)
+		headers[k] = v
 	}
 	for k, v := range core.ProviderHeadersToRecord(core.MergeProviderHeaders(model.Headers, opts.Headers)) {
-		req.Header.Set(k, v)
+		headers[k] = v
 	}
 
-	resp, err := core.SSEClient.Do(req)
+	client := core.NewTimeoutClient(opts.TimeoutMs)
+	resp, err := core.DoWithRetry(ctx, client, "POST", url, bodyBytes, headers, cfg.Provider, opts)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			d := time.Duration(opts.TimeoutMs) * time.Millisecond
-			if d <= 0 {
-				d = 5 * time.Minute // matches SSEClient default
-			}
-			return core.AssistantMessage{}, core.WrapHTTPTimeout(model.Provider, d, err)
-		}
 		return core.AssistantMessage{}, err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		errBody, _ := io.ReadAll(resp.Body)
-		if classified := core.ClassifyHTTPError(cfg.Provider, resp.StatusCode, string(errBody)); classified != nil {
-			return core.AssistantMessage{}, classified
-		}
-		return core.AssistantMessage{}, fmt.Errorf("%s: API error %d: %s", cfg.Provider, resp.StatusCode, string(errBody))
-	}
-	return processSSE(ctx, cfg, resp.Body, stream, model, opts)
+	return processSSE(ctx, cfg, resp.Body, stream, bodyBytes, model, opts)
 }
 
 func processSSE(
@@ -241,6 +227,7 @@ func processSSE(
 	cfg Config,
 	body io.Reader,
 	stream *core.EventStream[core.AssistantMessageEvent, core.AssistantMessage],
+	reqBody []byte,
 	model core.Model,
 	opts core.StreamOptions,
 ) (core.AssistantMessage, error) {
@@ -250,6 +237,7 @@ func processSSE(
 		thinkBuf    strings.Builder
 		toolCalls   = make(map[int]*core.ToolCall)
 		toolIndices []int
+		realIDs     = make(map[int]bool) // index -> true once a real id arrived
 	)
 	msg.API = model.API
 	msg.Provider = model.Provider
@@ -324,12 +312,40 @@ func processSSE(
 				name, _ := function["name"].(string)
 				args, _ := function["arguments"].(string)
 
-				if id != "" {
-					toolCalls[index] = &core.ToolCall{Type: "toolCall", ID: id, Name: name}
+				// Some providers re-emit the same tool_call delta across
+				// multiple chunks (with the id/name repeated). Never recreate
+				// an existing ToolCall here — doing so would wipe out the
+				// arguments accumulated so far and produce a broken call.
+				tc, exists := toolCalls[index]
+				if !exists {
+					if id == "" {
+						// No id yet and no prior state: allocate a placeholder
+						// so subsequent argument deltas are not dropped. A
+						// placeholder does NOT count as a real id, so a later
+						// chunk carrying the true id can still overwrite it.
+						id = fmt.Sprintf("call_%d", index)
+					} else {
+						// Real id arrived on first sight.
+						realIDs[index] = true
+					}
+					tc = &core.ToolCall{Type: "toolCall", ID: id, Name: name}
+					toolCalls[index] = tc
 					toolIndices = append(toolIndices, index)
 					stream.Push(core.EventToolCallStart{Type: "toolcall_start", ID: id, Name: name})
+				} else {
+					// Already tracked: fill in any missing id/name without
+					// clobbering the accumulated Arguments. A placeholder id
+					// (allocated before the real one arrived) is replaced by
+					// the real id when it eventually shows up.
+					if !realIDs[index] && id != "" {
+						tc.ID = id
+						realIDs[index] = true
+					}
+					if tc.Name == "" && name != "" {
+						tc.Name = name
+					}
 				}
-				if tc, ok := toolCalls[index]; ok && args != "" {
+				if args != "" {
 					tc.Arguments = append(tc.Arguments, []byte(args)...)
 					stream.Push(core.EventToolCallDelta{Type: "toolcall_delta", ID: tc.ID, ArgumentsDelta: args})
 				}
@@ -369,37 +385,34 @@ func processSSE(
 	msg.Usage.Cost = core.CalculateCost(model, msg.Usage)
 
 	if cfg.FinalizeResponse != nil {
-		cfg.FinalizeResponse(model, nil, &msg)
+		var bodyMap map[string]any
+		if len(reqBody) > 0 {
+			_ = json.Unmarshal(reqBody, &bodyMap)
+		}
+		cfg.FinalizeResponse(model, bodyMap, &msg)
 	}
 	stream.Push(core.EventDone{Type: "done", Message: msg})
 	return msg, nil
 }
 
 // mergeUsage merges token usage from a provider's JSON map into the
-// core.Usage struct. It only overwrites fields that are currently zero,
-// so the first non-empty usage source wins.
+// core.Usage struct. It accumulates values: later chunks with higher
+// token counts overwrite earlier ones, ensuring the final usage reflects
+// the complete stream (since some providers send usage incrementally).
 func mergeUsage(dst *core.Usage, src map[string]any) {
-	if dst.Input == 0 {
-		if v := getFloat(src, "prompt_tokens"); v > 0 {
-			dst.Input = int(v)
-		}
+	if v := getFloat(src, "prompt_tokens"); v > 0 {
+		dst.Input = int(v)
 	}
-	if dst.Output == 0 {
-		if v := getFloat(src, "completion_tokens"); v > 0 {
-			dst.Output = int(v)
-		}
+	if v := getFloat(src, "completion_tokens"); v > 0 {
+		dst.Output = int(v)
 	}
-	if dst.CacheRead == 0 {
-		if v := getFloat(src, "prompt_tokens_details.cached_tokens"); v > 0 {
-			dst.CacheRead = int(v)
-		} else if v := getFloat(src, "cached_tokens"); v > 0 {
-			dst.CacheRead = int(v)
-		}
+	if v := getFloat(src, "prompt_tokens_details.cached_tokens"); v > 0 {
+		dst.CacheRead = int(v)
+	} else if v := getFloat(src, "cached_tokens"); v > 0 {
+		dst.CacheRead = int(v)
 	}
-	if dst.TotalTokens == 0 {
-		if v := getFloat(src, "total_tokens"); v > 0 {
-			dst.TotalTokens = int(v)
-		}
+	if v := getFloat(src, "total_tokens"); v > 0 {
+		dst.TotalTokens = int(v)
 	}
 }
 
