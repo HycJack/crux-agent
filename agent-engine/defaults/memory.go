@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hycjack/agent-engine/plugin"
+	"github.com/hycjack/crux-kernel/plugin"
 )
 
 // Memory is a cross-session long-term memory KV store backed by JSON.

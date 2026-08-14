@@ -15,8 +15,8 @@ import (
 	"crux-agent-chat/config"
 	"crux-agent-chat/harness"
 	"crux-agent-chat/tools"
-	"crux-agent-harness/approval"
-	agentruntime "crux-agent-runtime/agent"
+	"github.com/hycjack/agent-engine/harness/approval"
+	agentruntime "github.com/hycjack/agent-engine/engine"
 	"github.com/hycjack/crux-ai/core"
 )
 

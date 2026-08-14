@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"crux-agent-chat/config"
-	runtime "crux-agent-runtime/agent"
+	runtime "github.com/hycjack/agent-engine/engine"
 	"github.com/hycjack/crux-ai/core"
 	_ "github.com/hycjack/crux-ai/providers"
 )

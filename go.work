@@ -5,9 +5,8 @@ use (
 	./agent-engine/examples/crux-plugin-tool
 	./chat-app
 	./crux-agent-chat
-	./crux-agent-harness
-	./crux-agent-runtime
 	./crux-agent-tui
 	./crux-ai
+	./crux-kernel
 	./crux-plugin
 )

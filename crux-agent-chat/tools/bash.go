@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"crux-agent-runtime/agent"
+	agent "github.com/hycjack/agent-engine/engine"
 )
 
 // BashTool executes shell commands in a cross-platform way.

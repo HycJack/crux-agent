@@ -5,7 +5,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/hycjack/agent-engine/plugin"
+	"github.com/hycjack/crux-kernel/plugin"
 )
 
 // ─── ApprovalGate ───────────────────────────────────────────────────────────

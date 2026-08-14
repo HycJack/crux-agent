@@ -5,6 +5,7 @@ go 1.23.0
 
 require (
 	github.com/hycjack/crux-ai v0.0.1
+	github.com/hycjack/crux-kernel v0.0.1
 	github.com/pkoukk/tiktoken-go v0.1.6
 )
 
@@ -14,4 +15,7 @@ require (
 	github.com/stretchr/testify v1.10.0 // indirect
 )
 
-replace github.com/hycjack/crux-ai => ../crux-ai
+replace (
+	github.com/hycjack/crux-ai => ../crux-ai
+	github.com/hycjack/crux-kernel => ../crux-kernel
+)

@@ -4,7 +4,7 @@ package tools
 import (
 	"encoding/json"
 
-	"crux-agent-runtime/agent"
+	agent "github.com/hycjack/agent-engine/engine"
 	"github.com/hycjack/crux-ai/core"
 )
 

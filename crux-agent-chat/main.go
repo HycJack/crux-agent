@@ -22,7 +22,7 @@ import (
 	"crux-agent-chat/tools"
 	"crux-agent-chat/ui"
 
-	agentruntime "crux-agent-runtime/agent"
+	agentruntime "github.com/hycjack/agent-engine/engine"
 	"github.com/hycjack/crux-ai/core"
 
 	"golang.org/x/term"

@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/hycjack/agent-engine/plugin"
+	"github.com/hycjack/crux-kernel/plugin"
 	core "github.com/hycjack/crux-ai/core"
 )
 

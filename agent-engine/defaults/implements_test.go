@@ -9,7 +9,7 @@ package defaults
 import (
 	"testing"
 
-	"github.com/hycjack/agent-engine/plugin"
+	"github.com/hycjack/crux-kernel/plugin"
 )
 
 // Compile-time interface checks (zero-cost, removed by compiler inlining).

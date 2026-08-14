@@ -32,7 +32,7 @@ import (
 	"time"
 
 	"github.com/hycjack/agent-engine/engine"
-	"github.com/hycjack/agent-engine/plugin"
+	"github.com/hycjack/crux-kernel/plugin"
 	cp "github.com/hycjack/crux-plugin"
 	"github.com/hycjack/crux-ai/ai"
 	"github.com/hycjack/crux-ai/core"
@@ -119,7 +119,7 @@ func mockFileTool() cp.ToolAdapter {
 // 第 1 步：crux-plugin.ToolAdapter → plugin.ToolPlugin（本示例核心）。
 //
 // 这就是「把 crux-plugin 适配成 ToolPlugin」的粘合层。ToolPlugin 是
-// agent-engine 的抽象接口（agent-engine/plugin/types.go），适配器把
+// agent-engine 的抽象接口（crux-kernel/plugin/types.go），适配器把
 // 子进程的 Execute 包装成进程内接口，这样引擎/上层代码只依赖抽象契约，
 // 不依赖具体的 crux-plugin 模块。
 // ─────────────────────────────────────────────────────────────────────────

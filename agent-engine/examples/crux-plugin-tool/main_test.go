@@ -7,7 +7,7 @@ import (
 
 	cp "github.com/hycjack/crux-plugin"
 
-	"github.com/hycjack/agent-engine/plugin"
+	"github.com/hycjack/crux-kernel/plugin"
 )
 
 // TestAdaptToToolPlugin 验证 crux-plugin.ToolAdapter → plugin.ToolPlugin 的适配。

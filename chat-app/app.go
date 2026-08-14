@@ -18,7 +18,7 @@ import (
 
 	"github.com/hycjack/agent-engine/defaults"
 	"github.com/hycjack/agent-engine/engine"
-	pluginsession "github.com/hycjack/agent-engine/plugin"
+	pluginsession "github.com/hycjack/crux-kernel/plugin"
 	"github.com/hycjack/crux-ai/ai"
 	core "github.com/hycjack/crux-ai/core"
 	plugin "github.com/hycjack/crux-plugin"
@@ -1379,7 +1379,7 @@ func toEngineTool(tp engineToolPlugin) engine.AgentTool {
 }
 
 // engineToolPlugin is the minimal crux-plugin tool contract used by the
-// in-process adapter. It mirrors agent-engine/plugin.ToolPlugin so we don't
+// in-process adapter. It mirrors crux-kernel/plugin.ToolPlugin so we don't
 // need to depend on that package here; only the pieces needed by the
 // chat app's agent are kept.
 type engineToolPlugin interface {

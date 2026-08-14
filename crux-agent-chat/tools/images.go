@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/hycjack/crux-ai/core"
-	"crux-agent-runtime/agent"
+	agent "github.com/hycjack/agent-engine/engine"
 )
 
 // maxImageBytes is the largest image file the agent will read into memory.

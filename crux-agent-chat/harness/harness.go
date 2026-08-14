@@ -24,13 +24,13 @@ import (
 	"sync"
 	"time"
 
-	"crux-agent-harness/approval"
-	hcontext "crux-agent-harness/context"
-	"crux-agent-harness/observe"
-	"crux-agent-harness/session"
-	"crux-agent-harness/skills"
+	"github.com/hycjack/agent-engine/harness/approval"
+	hcontext "github.com/hycjack/agent-engine/harness/context"
+	"github.com/hycjack/agent-engine/harness/observe"
+	"github.com/hycjack/agent-engine/harness/session"
+	"github.com/hycjack/agent-engine/harness/skills"
 
-	agentruntime "crux-agent-runtime/agent"
+	agentruntime "github.com/hycjack/agent-engine/engine"
 
 	"github.com/hycjack/crux-ai/core"
 )

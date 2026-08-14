@@ -1,7 +1,7 @@
 package harness
 
 import (
-	agentruntime "crux-agent-runtime/agent"
+	agentruntime "github.com/hycjack/agent-engine/engine"
 	"github.com/hycjack/crux-ai/core"
 )
 
