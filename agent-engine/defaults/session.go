@@ -6,6 +6,7 @@
 package defaults
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -180,6 +181,8 @@ func (s *JSONLSession) buildContextLocked(leafID string) plugin.SessionContext {
 // Handles compaction entries by replacing replaced entry IDs with summary messages.
 func (s *JSONLSession) replayEntries(entries []plugin.SessionTreeEntry) plugin.SessionContext {
 	var thinkingLevel string
+	var model *plugin.SessionModel
+	var systemPrompt string
 	type messageRow struct {
 		id   string
 		msg  core.Message
@@ -192,6 +195,14 @@ func (s *JSONLSession) replayEntries(entries []plugin.SessionTreeEntry) plugin.S
 			if entry.Message != nil {
 				messageRows = append(messageRows, messageRow{id: entry.ID, msg: entry.Message})
 			}
+		case plugin.EntryModelChange:
+			if entry.Provider != "" || entry.ModelID != "" {
+				model = &plugin.SessionModel{Provider: entry.Provider, ModelID: entry.ModelID}
+			}
+		case plugin.EntrySystemPrompt:
+			if p, ok := entry.Metadata["prompt"].(string); ok {
+				systemPrompt = p
+			}
 		case plugin.EntryBranchSummary:
 			summary := fmt.Sprintf(
 				"The following is a summary of a branch that this conversation came back from:\n%s",
@@ -202,7 +213,9 @@ func (s *JSONLSession) replayEntries(entries []plugin.SessionTreeEntry) plugin.S
 				msg: core.UserMessage{Role: "user", Content: summary},
 			})
 		case plugin.EntryCompaction:
-			// Apply compaction: remove replaced entries, insert summary
+			// Apply compaction: replace the referenced entries with a summary
+			// message carrying the raw compaction summary (aligned with
+			// crux-agent-runtime/session).
 			replacedIDs := entry.ReplacedEntryIDs
 			replacedSet := make(map[string]bool, len(replacedIDs))
 			for _, rid := range replacedIDs {
@@ -216,19 +229,17 @@ func (s *JSONLSession) replayEntries(entries []plugin.SessionTreeEntry) plugin.S
 					continue
 				}
 				if !insertedSummary {
-					summary := fmt.Sprintf("Previous conversation summary:\n%s", entry.CompactionSummary)
 					retained = append(retained, messageRow{
 						id: entry.ID,
-						msg: core.UserMessage{Role: "user", Content: summary},
+						msg: core.UserMessage{Role: "user", Content: entry.CompactionSummary},
 					})
 					insertedSummary = true
 				}
 			}
 			if !insertedSummary {
-				summary := fmt.Sprintf("Previous conversation summary:\n%s", entry.CompactionSummary)
 				retained = append(retained, messageRow{
 					id: entry.ID,
-					msg: core.UserMessage{Role: "user", Content: summary},
+					msg: core.UserMessage{Role: "user", Content: entry.CompactionSummary},
 				})
 			}
 			messageRows = retained
@@ -245,6 +256,8 @@ func (s *JSONLSession) replayEntries(entries []plugin.SessionTreeEntry) plugin.S
 	return plugin.SessionContext{
 		Messages:      messages,
 		ThinkingLevel: thinkingLevel,
+		Model:         model,
+		SystemPrompt:  systemPrompt,
 	}
 }
 
@@ -480,6 +493,10 @@ func entryToRaw(entry plugin.SessionTreeEntry) map[string]any {
 	case plugin.EntrySessionInfo:
 		m["sessionId"] = entry.SessionID
 		m["description"] = entry.Description
+	case plugin.EntrySystemPrompt:
+		if len(entry.Metadata) > 0 {
+			m["metadata"] = entry.Metadata
+		}
 	case plugin.EntryLabel, plugin.EntryBranchSummary:
 		m["summary"] = entry.Summary
 		m["fromId"] = entry.FromID
@@ -551,7 +568,70 @@ func rawToEntry(raw map[string]json.RawMessage) plugin.SessionTreeEntry {
 	if v, ok := raw["metadata"]; ok {
 		json.Unmarshal(v, &e.Metadata)
 	}
+	if msg := rawToMessage(raw); msg != nil {
+		e.Message = msg
+	}
 	return e
+}
+
+// rawToMessage reconstructs a typed core.Message from a persisted "message"
+// entry, dispatching on the stored messageRole. Returns nil if no usable
+// message payload is present.
+func rawToMessage(raw map[string]json.RawMessage) core.Message {
+	msgRaw, ok := raw["message"]
+	if !ok {
+		return nil
+	}
+	var role string
+	if r, ok := raw["messageRole"]; ok {
+		json.Unmarshal(r, &role)
+	}
+	switch role {
+	case "assistant":
+		var m core.AssistantMessage
+		if err := json.Unmarshal(msgRaw, &m); err != nil {
+			return nil
+		}
+		return m
+	case "toolResult":
+		var m core.ToolResultMessage
+		if err := json.Unmarshal(msgRaw, &m); err != nil {
+			return nil
+		}
+		return m
+	default: // "user" or unknown
+		var m core.UserMessage
+		if err := json.Unmarshal(msgRaw, &m); err != nil {
+			return nil
+		}
+		m.Content = userContentFromRaw(msgRaw)
+		return m
+	}
+}
+
+// userContentFromRaw decodes a user message's "content" into either a string
+// or []ContentBlock, matching the shape used when the message was persisted.
+func userContentFromRaw(msgRaw json.RawMessage) any {
+	var probe struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(msgRaw, &probe); err != nil {
+		return nil
+	}
+	trimmed := bytes.TrimSpace(probe.Content)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return nil
+	}
+	if trimmed[0] == '[' {
+		if blocks, err := core.UnmarshalContentBlocks(trimmed); err == nil {
+			return blocks
+		}
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err == nil {
+		return s
+	}
+	return nil
 }
 
 func entryToMessage(entry plugin.SessionTreeEntry) core.Message {
@@ -577,3 +657,68 @@ func msgRole(msg core.Message) string {
 
 // compile-time interface check
 var _ plugin.SessionPlugin = (*JSONLSession)(nil)
+
+// GenerateEntryID returns a unique session entry ID.
+func GenerateEntryID(prefix string) string {
+	if prefix == "" {
+		prefix = "e"
+	}
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
+
+// NewMessageEntry creates a message entry with the given ID (unified
+// "message" entry type; role is carried by the core.Message itself).
+func NewMessageEntry(id string, msg core.Message) plugin.SessionTreeEntry {
+	if id == "" {
+		id = GenerateEntryID("msg")
+	}
+	return plugin.SessionTreeEntry{
+		ID:        id,
+		Type:      plugin.EntryMessage,
+		Timestamp: time.Now(),
+		Message:   msg,
+	}
+}
+
+// NewSystemPromptEntry creates a system prompt entry whose prompt is stored
+// in Metadata["prompt"] (aligned with crux-agent-runtime/session).
+func NewSystemPromptEntry(id string, prompt string) plugin.SessionTreeEntry {
+	if id == "" {
+		id = GenerateEntryID("sys")
+	}
+	return plugin.SessionTreeEntry{
+		ID:        id,
+		Type:      plugin.EntrySystemPrompt,
+		Timestamp: time.Now(),
+		Metadata:  map[string]any{"prompt": prompt},
+	}
+}
+
+// NewModelChangeEntry records a model switch in the session.
+func NewModelChangeEntry(id, provider, modelID string) plugin.SessionTreeEntry {
+	if id == "" {
+		id = GenerateEntryID("model")
+	}
+	return plugin.SessionTreeEntry{
+		ID:        id,
+		Type:      plugin.EntryModelChange,
+		Timestamp: time.Now(),
+		Provider:  provider,
+		ModelID:   modelID,
+	}
+}
+
+// NewCompactionEntry records a compaction in the session.
+func NewCompactionEntry(id string, summary string, replacedIDs []string, tokensBefore int) plugin.SessionTreeEntry {
+	if id == "" {
+		id = GenerateEntryID("cmp")
+	}
+	return plugin.SessionTreeEntry{
+		ID:                id,
+		Type:              plugin.EntryCompaction,
+		Timestamp:         time.Now(),
+		CompactionSummary: summary,
+		TokensBefore:      tokensBefore,
+		ReplacedEntryIDs:  replacedIDs,
+	}
+}

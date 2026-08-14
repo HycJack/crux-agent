@@ -18,6 +18,7 @@ import (
 
 	"github.com/hycjack/agent-engine/defaults"
 	"github.com/hycjack/agent-engine/engine"
+	pluginsession "github.com/hycjack/agent-engine/plugin"
 	"github.com/hycjack/crux-ai/ai"
 	core "github.com/hycjack/crux-ai/core"
 	plugin "github.com/hycjack/crux-plugin"
@@ -44,6 +45,10 @@ type App struct {
 	// Cross-session long-term memory
 	mem    *defaults.Memory
 	memDir string
+
+	// Persistent conversation session (JSONL), aligned with runtime session.
+	// sess holds entry history for cross-restart conversation recovery.
+	sess *defaults.JSONLSession
 
 	// Skill loader
 	skillLoader *skillutil.Loader
@@ -112,6 +117,16 @@ func (a *App) startup(ctx context.Context) {
 		} else {
 			a.mem = mem
 			logutil.Infof("Memory loaded (%d entries)", mem.Size())
+		}
+	}
+
+	// Persistent conversation session (JSONL).
+	if appDir, err := appDataDir(); err == nil {
+		if sess, err := defaults.NewJSONLSession(filepath.Join(appDir, "session.jsonl")); err != nil {
+			logutil.Warnf("Failed to init session: %v", err)
+		} else {
+			a.sess = sess
+			logutil.Infof("Session loaded (%d entries)", len(sess.Entries()))
 		}
 	}
 
@@ -314,6 +329,92 @@ func (a *App) ClearMemory() {
 		_ = mem.Save()
 		logutil.Infof("All memory cleared")
 	}
+}
+
+// ─── Persistent session (aligned with runtime session) ─────────────────────
+
+// sessionMessages returns the conversation history persisted in the session,
+// or nil if no session is available.
+func (a *App) sessionMessages() []core.Message {
+	a.mu.RLock()
+	sess := a.sess
+	a.mu.RUnlock()
+	if sess == nil {
+		return nil
+	}
+	return sess.BuildContext().Messages
+}
+
+// persistTurnDelta appends the messages added to the agent since baseline to
+// the persistent session. Each call only writes the delta, so repeated turns
+// accumulate history without duplicates.
+func (a *App) persistTurnDelta(msgs []core.Message, baseline int) {
+	a.mu.RLock()
+	sess := a.sess
+	a.mu.RUnlock()
+	if sess == nil {
+		return
+	}
+	if baseline < 0 {
+		baseline = 0
+	}
+	if baseline >= len(msgs) {
+		return
+	}
+	entries := make([]pluginsession.SessionTreeEntry, 0, len(msgs)-baseline)
+	for _, msg := range msgs[baseline:] {
+		entries = append(entries, defaults.NewMessageEntry("", msg))
+	}
+	if err := sess.Append(entries...); err != nil {
+		logutil.Warnf("Failed to persist session: %v", err)
+	}
+}
+
+// ClearSession wipes the persisted conversation so a new conversation starts
+// fresh. Returns the number of entries removed.
+func (a *App) ClearSession() int {
+	a.mu.RLock()
+	sess := a.sess
+	a.mu.RUnlock()
+	if sess == nil {
+		return 0
+	}
+	n := len(sess.Entries())
+	if err := a.resetSessionFile(); err != nil {
+		logutil.Warnf("Failed to clear session: %v", err)
+	}
+	return n
+}
+
+// resetSessionFile reopens an empty JSONL session file, discarding all entries.
+func (a *App) resetSessionFile() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.sess == nil {
+		return nil
+	}
+	_ = a.sess.Close()
+	appDir, err := appDataDir()
+	if err != nil {
+		return err
+	}
+	sess, err := defaults.NewJSONLSession(filepath.Join(appDir, "session.jsonl"))
+	if err != nil {
+		return err
+	}
+	a.sess = sess
+	return nil
+}
+
+// SessionMessageCount returns how many messages are persisted in the session
+// (for the frontend to know whether history recovery is available).
+func (a *App) SessionMessageCount() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.sess == nil {
+		return 0
+	}
+	return len(a.sess.Entries())
 }
 
 // GetToolList returns the list of currently available agent tool names.
@@ -1023,6 +1124,10 @@ func (a *App) StreamMessage(params map[string]interface{}) error {
 	a.cancelFn = cancel
 	a.mu.Unlock()
 
+	// Capture the agent's message count before this turn so only the newly
+	// added messages are persisted to the session (avoids duplicates).
+	baseline := len(agt.Messages())
+
 	go func() {
 		defer func() {
 			a.mu.Lock()
@@ -1051,6 +1156,10 @@ func (a *App) StreamMessage(params map[string]interface{}) error {
 			Content:   p.Message,
 			Timestamp: time.Now(),
 		})
+
+		// Persist this turn's new messages to the persistent session so the
+		// conversation can be recovered after restart.
+		a.persistTurnDelta(agt.Messages(), baseline)
 
 		// Persist memory after each turn
 		a.mu.RLock()
@@ -1336,11 +1445,16 @@ func (a *App) getOrCreateAgent(model core.Model, cwd, apiKey string, thinkingLev
 
 	compaction := buildCompactionConfig(model, apiKey)
 
+	// Restore previously-persisted conversation history from the session so
+	// the conversation survives an app restart.
+	restored := a.sessionMessages()
+
 	agt := engine.New(engine.AgentOptions{
 		InitialState: &engine.AgentState{
 			Model:         model,
 			SystemPrompt:  a.buildSystemPrompt(cwd),
 			Tools:         toolsAll,
+			Messages:      restored,
 			ToolExecution: engine.ToolExecSequential,
 			SimpleStreamOptions: core.SimpleStreamOptions{
 				StreamOptions: core.StreamOptions{

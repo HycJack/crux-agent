@@ -57,6 +57,7 @@ const (
 	EntryModelChange    EntryType = "model_change"
 	EntryThinkingChange EntryType = "thinking_level_change"
 	EntrySessionInfo    EntryType = "session_info"
+	EntrySystemPrompt   EntryType = "system_prompt"
 	EntryLabel          EntryType = "label"
 	EntryLeaf           EntryType = "leaf"
 )
@@ -100,9 +101,18 @@ type SessionTreeEntry struct {
 }
 
 // SessionContext is the rebuilt context from session entries.
+// Model/SystemPrompt are aligned with crux-agent-runtime/session.SessionContext.
 type SessionContext struct {
 	Messages      []core.Message
 	ThinkingLevel string
+	Model         *SessionModel         // active model at context point
+	SystemPrompt  string                // latest system prompt entry
+}
+
+// SessionModel represents the active model in a session.
+type SessionModel struct {
+	Provider string
+	ModelID  string
 }
 
 // ─── ContextPlugin 上下文管理 ─────────────────────────────────────────────
