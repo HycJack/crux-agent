@@ -1,7 +1,7 @@
 // Module agent-engine — 可嵌入的 Agent 运行时库
 module github.com/hycjack/agent-engine
 
-go 1.23.0
+go 1.25.0
 
 require (
 	github.com/hycjack/crux-ai v0.0.1

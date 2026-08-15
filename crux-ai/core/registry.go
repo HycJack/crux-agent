@@ -24,7 +24,21 @@ func RegisterProvider(api KnownAPI, provider APIProvider, sourceID ...string) {
 	defer apiProvidersMu.Unlock()
 	apiProviders[api] = provider
 	if len(sourceID) > 0 {
-		apiProviderSrc[sourceID[0]] = append(apiProviderSrc[sourceID[0]], api)
+		// L5: dedupe so the source -> API index doesn't accumulate
+		// duplicates when the same source registers the same API more
+		// than once. Without this, UnregisterProviders would attempt to
+		// delete(apiProviders, api) multiple times for the same key.
+		existing := apiProviderSrc[sourceID[0]]
+		found := false
+		for _, a := range existing {
+			if a == api {
+				found = true
+				break
+			}
+		}
+		if !found {
+			apiProviderSrc[sourceID[0]] = append(existing, api)
+		}
 	}
 }
 
@@ -91,7 +105,17 @@ func RegisterImagesProvider(api KnownAPI, provider ImagesAPIProvider, sourceID .
 	defer imagesProvidersMu.Unlock()
 	imagesProviders[api] = provider
 	if len(sourceID) > 0 {
-		imagesProviderSrc[sourceID[0]] = append(imagesProviderSrc[sourceID[0]], api)
+		existing := imagesProviderSrc[sourceID[0]]
+		found := false
+		for _, a := range existing {
+			if a == api {
+				found = true
+				break
+			}
+		}
+		if !found {
+			imagesProviderSrc[sourceID[0]] = append(existing, api)
+		}
 	}
 }
 

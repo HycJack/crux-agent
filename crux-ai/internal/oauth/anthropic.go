@@ -27,6 +27,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -34,14 +35,24 @@ import (
 const (
 	anthropicAuthURL  = "https://console.anthropic.com/oauth/authorize" // 认证端点
 	anthropicTokenURL = "https://console.anthropic.com/oauth/token"     // 令牌端点
-	anthropicPort     = 53692                                           // 本地回调端口
+	// AnthropicClientIDEnv lets deployers override the OAuth client ID
+	// without recompiling. When unset, we fall back to the historical
+	// hard-coded base64 value so existing call-sites keep working.
+	// H2: avoid embedding a secret in the binary if not strictly needed.
+	AnthropicClientIDEnv = "CRUX_ANTHROPIC_OAUTH_CLIENT_ID"
 	// Client ID is base64 encoded
 	anthropicClientIDB64 = "ZGNfZWY0OGNhMzktNjZhYi00YTIwLWFhYjktOTMxYmI0ZGI1ZTY5" // base64 编码的客户端 ID
 )
 
-// getAnthropicClientID decodes the base64-encoded client ID.
-// || 解码 base64 编码的客户端 ID
+// getAnthropicClientID returns the OAuth client ID, preferring the
+// CRUX_ANTHROPIC_OAUTH_CLIENT_ID environment variable over the
+// compile-time default. Returns "" if neither is usable so callers
+// can surface a clear configuration error rather than panicking on
+// a bad base64.
 func getAnthropicClientID() string {
+	if v := strings.TrimSpace(os.Getenv(AnthropicClientIDEnv)); v != "" {
+		return v
+	}
 	b, _ := base64.StdEncoding.DecodeString(anthropicClientIDB64)
 	return string(b)
 }
@@ -64,9 +75,16 @@ func loginAnthropic(ctx context.Context, callbacks LoginCallbacks) (Credentials,
 		return Credentials{}, fmt.Errorf("failed to generate PKCE: %w", err)
 	}
 
-	// Build redirect URI
-	// || 构建重定向 URI
-	redirectURI := fmt.Sprintf("http://localhost:%d/callback", anthropicPort)
+	// H3: bind to a free port the OS hands us instead of a hard-coded one.
+	// This avoids collisions when multiple OAuth logins run concurrently
+	// (e.g. multi-tenant CLI invocations, parallel tests).
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return Credentials{}, fmt.Errorf("failed to bind local callback listener: %w", err)
+	}
+	// Build redirect URI against the actual port the OS picked.
+	// || 构建重定向 URI（基于系统实际分配的端口）
+	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", listener.Addr().(*net.TCPAddr).Port)
 
 	// Generate state for CSRF protection
 	// || 生成 state 用于 CSRF 保护
@@ -124,17 +142,16 @@ func loginAnthropic(ctx context.Context, callbacks LoginCallbacks) (Credentials,
 	})
 
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", anthropicPort),
 		Handler: mux,
 		BaseContext: func(l net.Listener) context.Context {
 			return ctx
 		},
 	}
 
-	// Start server in background
-	// || 在后台启动服务器
+	// Start server bound to the OS-assigned listener.
+	// || 在后台启动服务器（绑定到系统分配端口）
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			select {
 			case errCh <- err:
 			default:

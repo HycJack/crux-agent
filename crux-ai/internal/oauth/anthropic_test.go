@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"os"
 	"testing"
 )
 
@@ -18,15 +19,22 @@ func TestAnthropicConstants(t *testing.T) {
 	if anthropicTokenURL == "" {
 		t.Error("expected non-empty token URL")
 	}
-	if anthropicPort == 0 {
-		t.Error("expected non-zero port")
+	// H3: callback port is now OS-assigned at runtime, so there is no
+	// compile-time constant to assert. Verify the env var name is wired.
+	if AnthropicClientIDEnv == "" {
+		t.Error("expected non-empty AnthropicClientIDEnv")
 	}
 }
 
 func TestAnthropicClientIDDecodable(t *testing.T) {
-	// The client ID should be base64 decodable
-	clientID := getAnthropicClientID()
-	if len(clientID) == 0 {
-		t.Error("expected non-empty decoded client ID")
+	// The default client ID should be base64 decodable, and
+	// CRUX_ANTHROPIC_OAUTH_CLIENT_ID should override the default when set.
+	t.Setenv(AnthropicClientIDEnv, "override-id")
+	if got := getAnthropicClientID(); got != "override-id" {
+		t.Errorf("env override: got %q, want %q", got, "override-id")
+	}
+	os.Unsetenv(AnthropicClientIDEnv)
+	if len(getAnthropicClientID()) == 0 {
+		t.Error("expected non-empty fallback client ID")
 	}
 }

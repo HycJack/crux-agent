@@ -597,7 +597,7 @@ func bridgeProviderStreamFn(model core.Model, apiKey string) engine.ProviderStre
 					}
 				case core.EventError:
 					ps.Push(core.ProviderError{Message: e.ErrorMessage})
-					ps.Error(fmt.Errorf(e.ErrorMessage))
+					ps.Error(fmt.Errorf("%s", e.ErrorMessage))
 				}
 				return nil
 			})
