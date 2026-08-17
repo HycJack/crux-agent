@@ -157,8 +157,8 @@ func prepareAndExecuteToolCall(ctx context.Context, config AgentLoopConfig, assi
 		}, nil
 	}
 
-	if config.BeforeToolCall != nil {
-		block := config.BeforeToolCall(BeforeToolCallContext{
+	if before := config.hooks().BeforeToolCall; before != nil {
+		block := before(BeforeToolCallContext{
 			AssistantMessage: assistantMsg, ToolCall: tc, Args: tc.Arguments, Messages: messages,
 		})
 		if block != nil && block.Block {
@@ -190,10 +190,11 @@ func prepareAndExecuteToolCall(ctx context.Context, config AgentLoopConfig, assi
 }
 
 func finalizeToolCall(config AgentLoopConfig, assistantMsg core.AssistantMessage, tc core.ToolCall, messages []core.Message, result AgentToolResult) AgentToolResult {
-	if config.AfterToolCall == nil {
+	after := config.hooks().AfterToolCall
+	if after == nil {
 		return result
 	}
-	override := config.AfterToolCall(AfterToolCallContext{
+	override := after(AfterToolCallContext{
 		AssistantMessage: assistantMsg, ToolCall: tc, Args: tc.Arguments,
 		Result: result, IsError: result.IsError, Messages: messages,
 	})

@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	core "github.com/hycjack/crux-ai/core"
+	"github.com/hycjack/crux-kernel/plugin"
 )
 
 // AgentState holds the agent's mutable state.
@@ -31,6 +32,10 @@ type AgentState struct {
 
 	// GetFollowUpMessages returns messages to inject after the current turn.
 	GetFollowUpMessages func() []core.Message
+
+	// Hooks 是统一扩展主干。若非空，buildConfig 会把 Hooks 交给 AgentLoopConfig；
+	// 上方 legacy func 字段仍可用，经 config.hooks() 归一化到 Hooks。
+	Hooks plugin.Hooks
 }
 
 // AgentOptions configures a new Agent.
@@ -125,6 +130,21 @@ func (a *Agent) SetProviderStreamFn(fn ProviderStreamFn) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.state.ProviderStreamFn = fn
+}
+
+// AttachHooks 注入统一扩展主干（plugin.Hooks）。
+// 这是应用层装配插件能力的入口：ctx.Mount 聚合各插件 Hooks 后调用本方法。
+func (a *Agent) AttachHooks(h plugin.Hooks) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.state.Hooks = h
+}
+
+// Hooks 返回当前注入的扩展主干副本。
+func (a *Agent) Hooks() plugin.Hooks {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.state.Hooks
 }
 
 // ─── Message history management ─────────────────────────────────────────────
@@ -378,6 +398,7 @@ func (a *Agent) buildConfig() AgentLoopConfig {
 		ProviderStreamFn:    a.state.ProviderStreamFn,
 		GetFollowUpMessages: a.state.GetFollowUpMessages,
 		Compaction:          a.compaction,
+		Hooks:               a.state.Hooks,
 	}
 }
 

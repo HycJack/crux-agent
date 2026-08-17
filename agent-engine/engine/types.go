@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	stdctx "context"
 
+	"github.com/hycjack/crux-kernel/plugin"
 	core "github.com/hycjack/crux-ai/core"
 )
 
@@ -151,61 +152,36 @@ type AgentTool struct {
 type ToolExecuteFunc func(ctx stdctx.Context, toolCallID string, params json.RawMessage, onUpdate func(json.RawMessage)) (AgentToolResult, error)
 
 // AgentToolResult is the result of a tool execution.
-type AgentToolResult struct {
-	Content   []core.ContentBlock
-	Details   json.RawMessage
-	IsError   bool
-	Terminate bool
-}
+// 类型别名，收敛到 plugin.AgentToolResult（消除双轨定义）。
+type AgentToolResult = plugin.AgentToolResult
 
 // ─── Hook contexts for tool lifecycle ───────────────────────────────────────
 
 // BeforeToolCallContext is passed to the beforeToolCall hook.
-type BeforeToolCallContext struct {
-	AssistantMessage core.AssistantMessage
-	ToolCall         core.ToolCall
-	Args             json.RawMessage
-	Messages         []core.Message
-}
+// 类型别名，收敛到 plugin.BeforeToolCallCtx。
+type BeforeToolCallContext = plugin.BeforeToolCallCtx
 
 // ToolCallBlock is returned by beforeToolCall to block execution.
-type ToolCallBlock struct {
-	Block  bool
-	Reason string
-}
+// 类型别名，收敛到 plugin.ToolCallBlock。
+type ToolCallBlock = plugin.ToolCallBlock
 
 // AfterToolCallContext is passed to the afterToolCall hook.
-type AfterToolCallContext struct {
-	AssistantMessage core.AssistantMessage
-	ToolCall         core.ToolCall
-	Args             json.RawMessage
-	Result           AgentToolResult
-	IsError          bool
-	Messages         []core.Message
-}
+// 类型别名，收敛到 plugin.AfterToolCallCtx。
+type AfterToolCallContext = plugin.AfterToolCallCtx
 
 // ToolCallOverride is returned by afterToolCall to override the result.
-type ToolCallOverride struct {
-	Content   []core.ContentBlock
-	Details   json.RawMessage
-	IsError   *bool
-	Terminate *bool
-}
+// 类型别名，收敛到 plugin.ToolCallOverride。
+type ToolCallOverride = plugin.ToolCallOverride
 
 // ─── Streaming function type ────────────────────────────────────────────────
 
 // StreamFn is the type for custom streaming functions.
-// If nil, the default crux-ai StreamSimpleWithContext is used.
-type StreamFn func(ctx stdctx.Context, model core.Model, llmCtx core.Context, opts core.SimpleStreamOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error)
+// 类型别名，收敛到 plugin.StreamFn。
+type StreamFn = plugin.StreamFn
 
 // ProviderStreamFn is a streaming function that produces ProviderEvent.
-// When set, the engine automatically canonicalizes it to AssistantMessageEvent
-// via core.CanonicalizeProviderStream, so adapters can emit simple deltas
-// without managing content_index or block boundaries.
-//
-// ProviderStreamFn and StreamFn are mutually exclusive. If both are set,
-// ProviderStreamFn takes priority.
-type ProviderStreamFn func(ctx stdctx.Context, model core.Model, llmCtx core.Context, opts core.SimpleStreamOptions) (*core.ProviderEventStream, error)
+// 类型别名，收敛到 plugin.ProviderStreamFn。
+type ProviderStreamFn = plugin.ProviderStreamFn
 
 // ─── CompactionConfig ───────────────────────────────────────────────────────
 
@@ -252,6 +228,12 @@ type CompactionConfig struct {
 // ─── AgentLoopConfig ────────────────────────────────────────────────────────
 
 // AgentLoopConfig configures the agent loop.
+//
+// 扩展点统一收敛到 Hooks（plugin.Hooks 是唯一扩展主干）。
+// 下方 12 个 func 字段为 legacy 过渡字段（Deprecated）：
+// engine 内部只读 config.Hooks（经 hooks() 归一化），
+// legacy 字段在 hooks() 中被复制进 Hooks，保证既有调用方零迁移成本。
+// 后续阶段（P5）将删除这些 legacy 字段，收敛为 Hooks 单轨。
 type AgentLoopConfig struct {
 	core.SimpleStreamOptions
 
@@ -259,6 +241,9 @@ type AgentLoopConfig struct {
 	SystemPrompt  string
 	Tools         []AgentTool
 	ToolExecution ToolExecutionMode
+
+	// Hooks 是唯一扩展主干。engine 内部只读此字段（经 hooks() 归一化）。
+	Hooks plugin.Hooks
 
 	// ConvertToLlm transforms messages before each LLM call.
 	// If nil, default conversion (filter to user/assistant/toolResult) is used.
@@ -300,6 +285,66 @@ type AgentLoopConfig struct {
 	// Compaction, if set, enables automatic context-window compaction.
 	// See CompactionConfig for details.
 	Compaction CompactionConfig
+}
+
+// hooks 归一化 Hooks 与 legacy 字段，返回 config.Hooks 的一个副本。
+//
+// 规则：Hooks 字段优先；若某 Hooks 字段为 nil 而对应 legacy 字段非 nil，
+// 则把 legacy 复制进 Hooks（PrepareNextTurn 已做签名桥接）。
+// engine 内部一律通过 config.hooks() 读取扩展点，保证单轨读。
+func (c *AgentLoopConfig) hooks() plugin.Hooks {
+	h := c.Hooks
+	if h.ConvertToLlm == nil && c.ConvertToLlm != nil {
+		h.ConvertToLlm = c.ConvertToLlm
+	}
+	if h.TransformContext == nil && c.TransformContext != nil {
+		h.TransformContext = c.TransformContext
+	}
+	if h.GetApiKey == nil && c.GetApiKey != nil {
+		h.GetApiKey = c.GetApiKey
+	}
+	if h.ShouldStopAfterTurn == nil && c.ShouldStopAfterTurn != nil {
+		h.ShouldStopAfterTurn = c.ShouldStopAfterTurn
+	}
+	if h.GetSteeringMessages == nil && c.GetSteeringMessages != nil {
+		h.GetSteeringMessages = c.GetSteeringMessages
+	}
+	if h.GetFollowUpMessages == nil && c.GetFollowUpMessages != nil {
+		h.GetFollowUpMessages = c.GetFollowUpMessages
+	}
+	if h.BeforeToolCall == nil && c.BeforeToolCall != nil {
+		h.BeforeToolCall = c.BeforeToolCall
+	}
+	if h.AfterToolCall == nil && c.AfterToolCall != nil {
+		h.AfterToolCall = c.AfterToolCall
+	}
+	if h.StreamFn == nil && c.StreamFn != nil {
+		h.StreamFn = c.StreamFn
+	}
+	if h.ProviderStreamFn == nil && c.ProviderStreamFn != nil {
+		h.ProviderStreamFn = c.ProviderStreamFn
+	}
+	if c.Compaction.Compactor != nil {
+		if h.Compaction.Compactor == nil {
+			h.Compaction.Compactor = c.Compaction.Compactor
+		}
+		if h.Compaction.TokenCounter == nil {
+			h.Compaction.TokenCounter = c.Compaction.TokenCounter
+		}
+		if h.Compaction.MaxTokens == 0 {
+			h.Compaction.MaxTokens = c.Compaction.MaxTokens
+		}
+		if h.Compaction.ReserveTokens == 0 {
+			h.Compaction.ReserveTokens = c.Compaction.ReserveTokens
+		}
+		if h.Compaction.OverflowRetries == 0 {
+			h.Compaction.OverflowRetries = c.Compaction.OverflowRetries
+		}
+		if h.Compaction.OnCompact == nil {
+			h.Compaction.OnCompact = c.Compaction.OnCompact
+		}
+	}
+	return h
 }
 
 // ─── Helper functions ───────────────────────────────────────────────────────

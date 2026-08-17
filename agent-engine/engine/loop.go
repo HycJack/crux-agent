@@ -8,6 +8,7 @@ import (
 
 	"github.com/hycjack/crux-ai/ai"
 	core "github.com/hycjack/crux-ai/core"
+	"github.com/hycjack/crux-kernel/plugin"
 )
 
 // AgentEventStream is the event stream type for agent runs.
@@ -133,10 +134,22 @@ func runInnerLoop(ctx context.Context, config AgentLoopConfig, messages []core.M
 		if shouldTerminate {
 			return false, messages
 		}
-		if config.PrepareNextTurn != nil {
+		// PrepareNextTurn：优先新式 Hooks（写 ptc.Hooks），legacy 保留原语义（写 *AgentLoopConfig）。
+		if config.Hooks.PrepareNextTurn != nil {
+			config.Hooks.PrepareNextTurn(&plugin.PrepareTurnCtx{
+				Hooks:            &config.Hooks,
+				AssistantMessage: assistantMsg,
+				ToolResults:      toolResults,
+				Messages:         messages,
+			})
+		} else if config.PrepareNextTurn != nil {
 			config.PrepareNextTurn(&config, assistantMsg, toolResults, messages)
 		}
-		if config.ShouldStopAfterTurn != nil && config.ShouldStopAfterTurn(assistantMsg, toolResults) {
+		if config.Hooks.ShouldStopAfterTurn != nil {
+			if config.Hooks.ShouldStopAfterTurn(assistantMsg, toolResults) {
+				return false, messages
+			}
+		} else if config.ShouldStopAfterTurn != nil && config.ShouldStopAfterTurn(assistantMsg, toolResults) {
 			return false, messages
 		}
 
@@ -167,46 +180,44 @@ func isTerminalStop(reason core.StopReason) bool {
 }
 
 func injectSteeringMessages(config *AgentLoopConfig, messages []core.Message) ([]core.Message, bool) {
-	if config.GetSteeringMessages == nil {
+	if get := config.hooks().GetSteeringMessages; get == nil {
 		return messages, false
-	}
-	steering := config.GetSteeringMessages()
-	if len(steering) == 0 {
+	} else if steering := get(); len(steering) == 0 {
 		return messages, false
+	} else {
+		return append(messages, steering...), true
 	}
-	return append(messages, steering...), true
 }
 
 func injectFollowUpMessages(config *AgentLoopConfig, messages []core.Message) ([]core.Message, bool) {
-	if config.GetFollowUpMessages == nil {
+	if get := config.hooks().GetFollowUpMessages; get == nil {
 		return messages, false
-	}
-	followUp := config.GetFollowUpMessages()
-	if len(followUp) == 0 {
+	} else if followUp := get(); len(followUp) == 0 {
 		return messages, false
+	} else {
+		return append(messages, followUp...), true
 	}
-	return append(messages, followUp...), true
 }
 
 func transformContext(ctx context.Context, config AgentLoopConfig, messages []core.Message) []core.Message {
-	if config.TransformContext != nil {
-		return config.TransformContext(messages)
+	if fn := config.hooks().TransformContext; fn != nil {
+		return fn(messages)
 	}
 	return messages
 }
 
 func convertToLLM(config AgentLoopConfig, messages []core.Message) []core.Message {
-	if config.ConvertToLlm != nil {
-		return config.ConvertToLlm(messages)
+	if fn := config.hooks().ConvertToLlm; fn != nil {
+		return fn(messages)
 	}
 	return defaultConvertToLlm(messages)
 }
 
 func resolveStreamOptions(config *AgentLoopConfig) core.SimpleStreamOptions {
 	opts := config.SimpleStreamOptions
-	if config.GetApiKey != nil {
-		if key := config.GetApiKey(); key != "" {
-			opts.APIKey = key
+	if key := config.hooks().GetApiKey; key != nil {
+		if k := key(); k != "" {
+			opts.APIKey = k
 		}
 	}
 	// Write back so the caller sees the resolved options
@@ -215,9 +226,10 @@ func resolveStreamOptions(config *AgentLoopConfig) core.SimpleStreamOptions {
 }
 
 func invokeStreamFn(ctx context.Context, config AgentLoopConfig, llmCtx core.Context, opts core.SimpleStreamOptions) (*core.EventStream[core.AssistantMessageEvent, core.AssistantMessage], error) {
+	h := config.hooks()
 	// ProviderStreamFn takes priority: produce ProviderEvent, canonicalize to AssistantMessageEvent
-	if config.ProviderStreamFn != nil {
-		providerStream, err := config.ProviderStreamFn(ctx, config.Model, llmCtx, opts)
+	if h.ProviderStreamFn != nil {
+		providerStream, err := h.ProviderStreamFn(ctx, config.Model, llmCtx, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -232,8 +244,8 @@ func invokeStreamFn(ctx context.Context, config AgentLoopConfig, llmCtx core.Con
 		), nil
 	}
 
-	if config.StreamFn != nil {
-		return config.StreamFn(ctx, config.Model, llmCtx, opts)
+	if h.StreamFn != nil {
+		return h.StreamFn(ctx, config.Model, llmCtx, opts)
 	}
 	return ai.StreamSimpleWithContext(ctx, config.Model, llmCtx, opts)
 }

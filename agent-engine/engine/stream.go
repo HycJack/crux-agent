@@ -57,20 +57,20 @@ func streamAssistantResponse(ctx context.Context, config AgentLoopConfig, messag
 
 // maybeCompactPreCall runs the compactor if the configured budget is exceeded.
 func maybeCompactPreCall(ctx context.Context, config AgentLoopConfig, messages []core.Message) []core.Message {
-	comp := config.Compaction.Compactor
-	if comp == nil {
+	comp := config.hooks().Compaction
+	if comp.Compactor == nil {
 		return messages
 	}
-	maxTokens := config.Compaction.MaxTokens
+	maxTokens := comp.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = 100000
 	}
-	reserveTokens := config.Compaction.ReserveTokens
+	reserveTokens := comp.ReserveTokens
 	if reserveTokens < 0 {
 		reserveTokens = 0
 	}
 
-	counter := config.Compaction.TokenCounter
+	counter := comp.TokenCounter
 	if counter == nil {
 		counter = defaultTokenCounter
 	}
@@ -82,13 +82,13 @@ func maybeCompactPreCall(ctx context.Context, config AgentLoopConfig, messages [
 
 	prevTokens := tokens
 	prevCount := len(messages)
-	newMsgs, changed, err := comp(ctx, messages)
+	newMsgs, changed, err := comp.Compactor(ctx, messages)
 	if err != nil || !changed {
 		return messages
 	}
-	if config.Compaction.OnCompact != nil {
+	if comp.OnCompact != nil {
 		newTokens := counter(config.SystemPrompt, newMsgs, toCoreTools(config.Tools))
-		config.Compaction.OnCompact(prevTokens, newTokens, prevCount, len(newMsgs))
+		comp.OnCompact(prevTokens, newTokens, prevCount, len(newMsgs))
 	}
 	log.Printf("agent: pre-call compaction: %d tokens → ? tokens, %d msgs → %d msgs",
 		prevTokens, prevCount, len(newMsgs))
@@ -98,16 +98,16 @@ func maybeCompactPreCall(ctx context.Context, config AgentLoopConfig, messages [
 // retryWithCompaction is the overflow-error fallback: force-compact and
 // retry the LLM call.
 func retryWithCompaction(ctx context.Context, config AgentLoopConfig, messages *[]core.Message, stream *AgentEventStream) (core.AssistantMessage, error) {
-	comp := config.Compaction.Compactor
-	if comp == nil {
+	comp := config.hooks().Compaction
+	if comp.Compactor == nil {
 		return core.AssistantMessage{}, &core.OverflowError{Message: "compaction not configured"}
 	}
-	retries := config.Compaction.OverflowRetries
+	retries := comp.OverflowRetries
 	if retries <= 0 {
 		retries = 1
 	}
 
-	counter := config.Compaction.TokenCounter
+	counter := comp.TokenCounter
 	if counter == nil {
 		counter = defaultTokenCounter
 	}
@@ -124,7 +124,7 @@ func retryWithCompaction(ctx context.Context, config AgentLoopConfig, messages *
 		prevTokens := counter(config.SystemPrompt, *messages, toCoreTools(config.Tools))
 		prevCount := len(*messages)
 
-		newMsgs, changed, err := comp(ctx, *messages)
+		newMsgs, changed, err := comp.Compactor(ctx, *messages)
 		if err != nil {
 			lastErr = err
 			break
@@ -136,9 +136,9 @@ func retryWithCompaction(ctx context.Context, config AgentLoopConfig, messages *
 		*messages = newMsgs
 		log.Printf("agent: overflow retry %d/%d — compacted %d tokens, %d → %d msgs",
 			i+1, retries, prevTokens, prevCount, len(newMsgs))
-		if config.Compaction.OnCompact != nil {
+		if comp.OnCompact != nil {
 			newTokens := counter(config.SystemPrompt, *messages, toCoreTools(config.Tools))
-			config.Compaction.OnCompact(prevTokens, newTokens, prevCount, len(newMsgs))
+			comp.OnCompact(prevTokens, newTokens, prevCount, len(newMsgs))
 		}
 
 		llmMessages := convertToLLM(config, *messages)
