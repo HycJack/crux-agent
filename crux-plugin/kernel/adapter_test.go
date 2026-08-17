@@ -1,4 +1,4 @@
-package cruxplugin
+package kernel
 
 import (
 	"context"
@@ -19,7 +19,7 @@ func buildFakePlugin(t *testing.T) string {
 	t.Helper()
 	_, testFile, _, _ := runtime.Caller(0)
 	srcDir := filepath.Dir(testFile)
-	srcPath := filepath.Join(srcDir, "..", "..", "examples", "fake_plugin", "main.go")
+	srcPath := filepath.Join(srcDir, "..", "examples", "fake_plugin", "main.go")
 	if _, err := os.Stat(srcPath); err != nil {
 		t.Fatalf("fake_plugin 源码不存在: %v", err)
 	}

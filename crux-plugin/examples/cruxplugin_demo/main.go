@@ -21,7 +21,7 @@ import (
 
 	cruxplugin "github.com/hycjack/crux-plugin"
 	"github.com/hycjack/crux-kernel/fiber"
-	cruxrtplugin "github.com/hycjack/crux-kernel/integration/cruxplugin"
+	kernelbridge "github.com/hycjack/crux-plugin/kernel"
 )
 
 func main() {
@@ -40,7 +40,7 @@ func main() {
 	}
 
 	// 3. 创建 ProcessFiber（不带 AutoRestart）
-	pf := cruxrtplugin.NewProcessFiber(manifest, map[string]any{"key": "value"}, nil)
+	pf := kernelbridge.NewProcessFiber(manifest, map[string]any{"key": "value"}, nil)
 	f := fiber.New("demo-plugin", pf, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -58,7 +58,7 @@ func main() {
 	// 5. Reload（热重载）
 	fmt.Fprintf(os.Stderr, "\n=== Reload ===\n")
 	newCfg := map[string]any{"reloaded": true, "ts": time.Now().Unix()}
-	if err := cruxrtplugin.Reload(ctx, f, newCfg); err != nil {
+	if err := kernelbridge.Reload(ctx, f, newCfg); err != nil {
 		fmt.Fprintf(os.Stderr, "Reload 失败: %v\n", err)
 	} else {
 		fmt.Fprintf(os.Stderr, "Reload 后 State: %s\n", f.State())
@@ -74,8 +74,8 @@ func main() {
 
 	// 7. 演示 AutoRestart
 	fmt.Fprintf(os.Stderr, "\n=== AutoRestart 演示 ===\n")
-	pf2 := cruxrtplugin.NewProcessFiber(manifest, nil, nil)
-	loader := cruxrtplugin.AutoRestart(pf2, cruxrtplugin.AutoRestartOpts{
+	pf2 := kernelbridge.NewProcessFiber(manifest, nil, nil)
+	loader := kernelbridge.AutoRestart(pf2, kernelbridge.AutoRestartOpts{
 		MaxRestarts:    3,
 		InitialBackoff: 100 * time.Millisecond,
 		MaxBackoff:     1 * time.Second,

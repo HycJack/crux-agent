@@ -178,9 +178,9 @@ crux-ai  ←  crux-kernel  ←  agent-engine  ←  crux-agent-tui / chat-app
 ### 阶段 2：桥接包迁出 kernel（1 天，让 kernel 纯净）✅ 已完成
 - [x] `integration/agentengine`（engine 事件 → EventBus、approval 注入）→ 迁到 `agent-engine/integration/agentengine`，**kernel 不再依赖 engine**。
 - [x] `integration/harness`（注册 harness concern）→ **迁到 `crux-agent-harness/integration`**（采纳「kernel 不依赖 harness」的决定，随 harness 走；harness 退役并入 defaults 时再收敛）。
-- [x] `integration/cruxplugin`（进程生命周期适配）：保留在 kernel（只依赖 fiber + crux-plugin）。
-- [x] 验证：`crux-kernel` 的 `container/fiber/events/plugin` 不再 import `agent-engine / crux-agent-harness / crux-agent-runtime`，只依赖 `crux-ai/core` + `crux-plugin`。
-  - 相关 demo 归属：`agentengine_demo` → `agent-engine/examples/`；`harness_demo` → `crux-agent-harness/examples/`；`cruxplugin_demo`/`multitenant_demo`/`fake_plugin` 留在 `crux-kernel/examples/`。
+- [x] `integration/cruxplugin`（进程生命周期适配）：**已迁到 `crux-plugin/kernel/`**（在插件侧反向依赖 kernel 的 fiber，而非 kernel 依赖 plugin）。因此 `crux-kernel` **不再依赖 `crux-plugin`**；依赖方向反转为 `crux-plugin → crux-kernel`（底座层），符合「kernel = 通用底座，谁都能反向依赖」的定位。相关 demo（`cruxplugin_demo`）与夹具（`fake_plugin`）随之迁到 `crux-plugin/examples/`。
+- [x] 验证：`crux-kernel` 的 `container/fiber/events/plugin` 不再 import `agent-engine / crux-agent-harness / crux-agent-runtime / crux-plugin`，只依赖 `crux-ai/core`。
+  - 相关 demo 归属：`agentengine_demo` → `agent-engine/examples/`；`harness_demo` → `crux-agent-harness/examples/`（已退役）；`cruxplugin_demo`/`fake_plugin` → `crux-plugin/examples/`；`multitenant_demo` 留在 `crux-kernel/examples/`。
 
 ### 阶段 3：去重/退役旧模块 ✅ 已完成（`crux-agent-runtime` 已删除；`crux-agent-harness` 已并入 `agent-engine/harness/`）
 - [x] 核对 `agent-engine/engine/*` 与 `crux-agent-runtime/agent/*`：**engine 是 runtime/agent 的严格超集**（同名同字段，额外多了 ProviderStreamFn / EventQueueUpdate / EventRetry / Pipeline）。

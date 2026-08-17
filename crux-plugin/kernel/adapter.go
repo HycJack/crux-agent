@@ -1,4 +1,4 @@
-// Package cruxplugin 提供 crux-kernel 与 crux-plugin 的桥接。
+// Package kernel 提供 crux-plugin 与 crux-kernel 的桥接。
 //
 // 把 crux-plugin 的 *plugin.Process 包装为 crux-kernel 的 fiber.PluginFiber，
 // 实现以下能力：
@@ -8,8 +8,9 @@
 //  2. AutoRestart — 子进程崩溃后自动重启（带指数退避）
 //  3. Reload — 配置变更后热重载（dispose 旧 process + 用新 config 启动）
 //
-// crux-plugin 本身保持零侵入，集成代码在此包中提供。
-package cruxplugin
+// 集成代码迁移自 crux-kernel/integration/cruxplugin。这样 crux-kernel 不再依赖
+// crux-plugin；依赖方向反转为 crux-plugin → crux-kernel（底座层）。
+package kernel
 
 import (
 	"context"

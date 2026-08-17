@@ -3,17 +3,12 @@
 // EventBus（多派发模式事件总线）、plugin（agent 契约接口）。
 //
 // 核心包（container/fiber/events/plugin）仅依赖 crux-ai/core，不依赖任何 agent 实现。
-// integration/cruxplugin 依赖 crux-plugin，提供 PluginFiber 包装 + 自动重启 + 热重载。
+// crux-plugin 的 fiber 桥接已迁移到 crux-plugin/kernel（插件侧反向依赖本模块），
+// 因此本模块不再依赖 crux-plugin。
 module github.com/hycjack/crux-kernel
 
 go 1.25.0
 
-require (
-	github.com/hycjack/crux-ai v0.0.1
-	github.com/hycjack/crux-plugin v0.0.0
-)
+require github.com/hycjack/crux-ai v0.0.1
 
-replace (
-	github.com/hycjack/crux-ai => ../crux-ai
-	github.com/hycjack/crux-plugin => ../crux-plugin
-)
+replace github.com/hycjack/crux-ai => ../crux-ai
