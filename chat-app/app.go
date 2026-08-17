@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hycjack/agent-engine/ctx"
 	"github.com/hycjack/agent-engine/defaults"
 	"github.com/hycjack/agent-engine/engine"
 	pluginsession "github.com/hycjack/crux-kernel/plugin"
@@ -36,6 +37,9 @@ import (
 // App is the Wails application struct bound to the frontend.
 type App struct {
 	ctx context.Context
+
+	// agent-side assembly context (P4: unified extension trunk via ctx + AttachHooks).
+	agentCtx *ctx.Ctx
 
 	mu         sync.RWMutex
 	workingDir string
@@ -1475,12 +1479,40 @@ func (a *App) getOrCreateAgent(model core.Model, cwd, apiKey string, thinkingLev
 		a.forwardAgentEvent(evt)
 	})
 
+	// P4: agent-side assembly via ctx — unify capability injection on the single
+	// plugin.Hooks trunk. GetApiKey goes through the new trunk (Hooks win over
+	// legacy fields in hooks()); Compaction stays on legacy Compaction config
+	// (left as-in, zero behavior change). Services (memory / autolearn) are
+	// registered into the container-facing Ctx. Events are additionally bridged
+	// to the Ctx event bus; the existing forwardAgentEvent subscription is kept.
+	a.agentCtx = ctx.New()
+	a.agentCtx.MergeHooks(pluginsession.Hooks{GetApiKey: func() string { return apiKey }})
+	_ = a.registerAgentServices()
+	a.agentCtx.Bridge(agt)
+	agt.AttachHooks(a.agentCtx.Hooks())
+
 	a.agt = agt
 
 	// Initialize autolearn after agent is created
 	a.initAutolearn(model, apiKey)
 
 	return agt
+}
+
+// registerAgentServices 把跨会话服务（记忆 / 自动学习）注册进 agent 装配上下文。
+// 纯注册，无 Dispose 副作用（不额外 Save/Close）。
+func (a *App) registerAgentServices() error {
+	if a.mem != nil {
+		if err := a.agentCtx.Register(a.mem); err != nil {
+			return err
+		}
+	}
+	if a.learner != nil {
+		if err := a.agentCtx.Register(a.learner); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // initAutolearn initializes the auto-learning system if memory is available.
