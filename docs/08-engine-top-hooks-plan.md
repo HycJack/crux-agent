@@ -154,6 +154,14 @@ func MapContext(cp ContextPlugin, comp CompactionHooks) (transform func([]core.M
 
 ### 模块 C：`agent-engine/ctx`（新包）— 统一上下文 + 生命周期
 
+**P3 已交付**（`ctx.go`/`plugin.go`/`events.go`）：
+- `Ctx` 包装 `crux-kernel/container`（服务注册 + fiber 生命周期），提供 `Mount` 装配插件、`Dispose` 逆序卸载、`Scoped` 子上下文（多租户）。
+- `Ctx.MergeHooks(sub plugin.Hooks)`：把各插件能力合并到**唯一扩展主干**，最终 `Hooks()` 交给 `engine.Agent.AttachHooks`。
+- `ctx.Plugin` 接口：`Name()` + `Mount(x)`，插件自持资源、Dispose 时逆序清理。
+- `BridgeEvents`：把 `engine.Agent` 事件桥接到 `Ctx` 事件总线（复用 `agentengine.WrapEvent`）。
+- `defaults/plugins.go`：`Session/Compaction/ContextPipeline/Approval/Memory/AutoLearn/Observe/Checkpoint` 八个插件包装 + `BundleDefault` 一键装配。
+- 测试：`ctx_test.go`（hooks 聚合、scoped 服务继承、Dispose 逆序）、`plugins_test.go`（压缩真实生效、审批真实拦截、服务注册/生命周期）。
+
 **新增 `agent-engine/ctx/ctx.go`**：
 
 ```go
@@ -214,7 +222,7 @@ func (x *Ctx) Dispose() error                     // → Container.Dispose（逆
 |---|---|---|---|
 | P1 | 契约层打桩 ✅ 已完成 (23a9ed8) | `plugin/hooks.go` + `plugin/adapt.go` + `adapt_test.go` | 绿（新增不影响现有） |
 | P2 | engine 内部收敛 ✅ 已完成 (81a1433) | `AgentLoopConfig` 新增 `Hooks` 字段；engine 调用点 `config.hooks()` 归一化；legacy 字段(deprecated) 双向填充；`Agent.hooks()`/`AttachHooks`；钩子类型别名收敛；`hooks_test.go` | 绿（零行为变化，legacy 全兼容） |
-| P3 | defaults 插件化 | 新增 `ctx` 包 + `defaults/*_plugin.go` + `BundleDefault` | 绿（新增不动存量） |
+| P3 | defaults 插件化 ✅ 已完成 | 新增 `agent-engine/ctx` 包（Ctx 包装 Container：Mount/Scoped/Dispose/Hooks 聚合MergeHooks/事件桥接BridgeEvents）；`defaults/plugins.go`（8 个默认组件实现 `ctx.Plugin` + `BundleDefault` 一键装配）；`ctx_test.go`（hooks聚合/scoped继承/Dispose逆序）+ `plugins_test.go`（压缩生效/审批拦截/服务注册） | 绿（新增不动存量，legacy 全兼容） |
 | P4 | 应用切 ctx | chat-app/chat/tui 改用 `ctx.New+Mount+Start`；删手工桥 | 绿（行为对照） |
 | P5 | 收尾去重 | 并入 `harness/`，删 `integration/bridge.go` 适配，删旧字段 | 绿 |
 | P6 | scope 落地 + 文档 | chat-app 每会话 Scoped；重写 DESIGN.md / docs/06；补本文档 | 绿 |
