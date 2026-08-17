@@ -4,7 +4,7 @@ package tools
 import (
 	"encoding/json"
 
-	agent "github.com/hycjack/agent-engine/engine"
+	"github.com/hycjack/agent-engine/engine"
 	"github.com/hycjack/crux-ai/core"
 )
 
@@ -13,24 +13,24 @@ type ToolDef struct {
 	Name        string
 	Description string
 	Parameters  json.RawMessage
-	Execute     agent.ToolExecuteFunc
+	Execute     engine.ToolExecuteFunc
 }
 
-func toolResult(text string) agent.AgentToolResult {
-	return agent.AgentToolResult{
+func toolResult(text string) engine.AgentToolResult {
+	return engine.AgentToolResult{
 		Content: []core.ContentBlock{core.TextContent{Type: "text", Text: text}},
 	}
 }
 
-func toolError(text string) agent.AgentToolResult {
-	return agent.AgentToolResult{
+func toolError(text string) engine.AgentToolResult {
+	return engine.AgentToolResult{
 		Content: []core.ContentBlock{core.TextContent{Type: "text", Text: text}},
 		IsError: true,
 	}
 }
 
-// AllTools returns all available coding tools as agent.AgentTool.
-func AllTools() []agent.AgentTool {
+// AllTools returns all available coding tools as engine.AgentTool.
+func AllTools() []engine.AgentTool {
 	defs := []ToolDef{
 		BashTool,
 		ReadFileTool,
@@ -40,9 +40,9 @@ func AllTools() []agent.AgentTool {
 		ReadImageTool,
 	}
 
-	tools := make([]agent.AgentTool, len(defs))
+	tools := make([]engine.AgentTool, len(defs))
 	for i, d := range defs {
-		tools[i] = agent.AgentTool{
+		tools[i] = engine.AgentTool{
 			Name:        d.Name,
 			Description: d.Description,
 			Parameters:  d.Parameters,

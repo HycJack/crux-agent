@@ -206,6 +206,29 @@ func (a *Agent) Reset() {
 	a.inner.Reset()
 }
 
+// SetModel updates the model used by the agent.
+func (a *Agent) SetModel(model core.Model) {
+	a.inner.SetModel(model)
+	a.modelID = model.ID
+}
+
+// SetTools updates the tool list used by the agent.
+func (a *Agent) SetTools(tools []AgentTool) {
+	a.inner.SetTools(tools)
+	a.tools = tools
+}
+
+// SetSystemPrompt updates the system prompt used by the agent.
+func (a *Agent) SetSystemPrompt(prompt string) {
+	a.inner.SetSystemPrompt(prompt)
+	a.systemPrompt = prompt
+}
+
+// SetMessages replaces the message history (used after compaction).
+func (a *Agent) SetMessages(msgs []core.Message) {
+	a.inner.SetMessages(msgs)
+}
+
 // Compact forces context compaction by applying the sliding-window compactor
 // to the current message history (if present). If compaction is not configured
 // it is a no-op. Mirrors demo-agent's compaction callback.

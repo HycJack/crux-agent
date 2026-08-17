@@ -3,27 +3,28 @@
 > 🌏 **语言 / Languages**: [English](./README.md) · [中文](./README.zh-CN.md)
 
 Crux is a Go-based, multi-layered framework for building AI agents and
-agent-powered applications. The repository is intentionally split into
-four small Go modules so that each layer can be adopted (or skipped)
-independently:
+agent-powered applications. The repository is organized into several
+independent Go modules:
 
 | Module | Path | Purpose |
 |---|---|---|
 | **`crux-ai`** | `crux-ai/` | Provider-agnostic AI client — types, streaming, and adapters for OpenAI / Anthropic / Google / Bedrock / Mistral / Azure / etc. |
-| **`crux-agent-runtime`** | `crux-agent-runtime/` | A reusable **agent loop** with event streams and a tool-execution framework. |
-| **`crux-agent-harness`** | `crux-agent-harness/` | Pluggable harness concerns: context compaction, approval gates, checkpoints, session persistence, skills, observability, prompts. |
+| **`crux-kernel`** | `crux-kernel/` | Core runtime container — plugin lifecycle, event bus, service registry (Cordis-inspired). |
+| **`agent-engine`** | `agent-engine/` | Lightweight, embeddable **agent loop** with event streams, tool execution, and pipeline abstraction. |
+| **`crux-plugin`** | `crux-plugin/` | Subprocess JSON-RPC 2.0 plugin framework (stdio). |
 | **`crux-agent-chat`** | `crux-agent-chat/` | A working cross-platform REPL **coding agent** built on top of everything else. |
+| **`crux-agent-tui`** | `crux-agent-tui/` | TUI terminal interface for agent interaction. |
+| **`chat-app`** | `chat-app/` | Wails v2 + React desktop chat application. |
+| **`crux-mcp`** | `crux-mcp/` | Model Context Protocol (MCP) client library. |
+| **`crux-memory`** | `crux-memory/` | 4-layer long-term memory for AI agents. |
+| **`crux-turn`** | `crux-turn/` | Standalone Turn FSM library for single agent turns. |
 
 The dependency direction is strictly one-way:
 
 ```
-crux-agent-chat  →  crux-agent-runtime  →  crux-ai
-crux-agent-harness  ───────────────────→  crux-ai
+crux-agent-chat / chat-app / crux-agent-tui  →  agent-engine  →  crux-ai
+                              crux-kernel  →  crux-ai
 ```
-
-`crux-agent-harness` knows nothing about the runtime; the runtime knows
-nothing about the harness. Each layer can be replaced or extended
-without touching the others.
 
 ---
 
@@ -70,78 +71,40 @@ the adapters that turn it into real HTTP / SSE traffic.
   `openai-responses`, `azure-openai-responses`, `openai-codex-responses`,
   `google-generative`, `google-vertex`, `mistral-conversations`).
 
-Minimal usage:
+### 2. `crux-kernel` — runtime container
 
-```go
-import (
-    "context"
-    "crux-ai/ai"
-    "crux-ai/core"
-    _ "crux-ai/providers" // register all built-in providers
-)
+Core runtime container inspired by VS Code's ServiceCollection and
+Cordis's Container/Scope architecture.
 
-model := core.Model{
-    ID:   "claude-sonnet-4-5",
-    API:  core.APIAnthropicMessages,
-    Provider: core.ProviderAnthropic,
-    Input: []core.Modality{core.ModalityText, core.ModalityImage},
-}
+- **`container`** — Service collection with lifecycle hooks (`Start` / `Stop`)
+- **`bus`** — Plugin event bus (`Register`, `Fire`, `Listen`, `Once`)
+- **`service`** — Service registry (`Service`, `ServiceFactory` interfaces)
+- **`plugin`** — Plugin lifecycle (`PluginDef`, `PluginContext`, `PluginManager`)
+- **`scope`** — Isolated dependency injection scopes
+- **`disposable`** — Resource cleanup patterns
 
-msg, err := ai.CompleteSimple(context.Background(), model,
-    []core.Message{core.UserMessage{Content: "Hello!"}},
-    core.SimpleStreamOptions{StreamOptions: core.StreamOptions{
-        APIKey:  "<your key>",
-        MaxTokens: ptr(1024),
-    }},
-)
-```
+### 3. `agent-engine` — agent loop engine
 
-The `crux-ai/cmd` directory contains a small CLI demo
-(`crux-ai.go`) and `crux-ai/testenv` provides hermetic test
-harnesses with `faux` (mock) providers.
+Lightweight, embeddable agent loop engine (164KB compiled binary).
 
-### 2. `crux-agent-runtime` — the agent loop
+- **`core`** — Core abstractions (`AgentLoop`, `Pipeline`, `TurnContext`)
+- **`engine`** — `DefaultEngine` implementation with plugin lifecycle
+- **`pipeline`** — Three-layer pipeline: SystemPrompt → History → Response
+- **`events`** — Strongly-typed event system (`EventTextDelta`, `EventToolCallEnd`, etc.)
+- **`harness`** — Optional harness services (compaction, session, observability, etc.)
+- **`memory`** — 4-layer memory integration (Hot/Warm/Cold/Archive)
 
-A small, self-contained `Agent` type that wraps `crux-ai` in an
-event-driven loop:
+### 4. `crux-plugin` — subprocess plugin framework
 
-- `agent.New(config, toolSpecs)` — construct an agent with tools.
-- `agent.Run(ctx, userMessage)` — run one or more turns until
-  the model stops or signals `StopToolUse`.
-- `agent.Subscribe(fn)` / `agent.SubscribeChan(ch)` — listen to
-  typed events (`EventText`, `EventThinkingStart`, `EventToolCallStart`,
-  `EventToolResult`, `EventDone`, `EventError`, …).
-- `agent.Abort()` — cooperative cancellation.
+Subprocess JSON-RPC 2.0 plugin framework based on VS Code's plugin architecture.
 
-The runtime ships its own tool-spec system, so you can plug in any
-custom tool without touching the core loop.
+- **`transport`** — `stdio` transport (`ReadPacket` / `WritePacket` / `PacketType`)
+- **`protocol`** — JSON-RPC 2.0 (`Request`, `Response`, `Notification`)
+- **`lifecycle`** — Plugin activation, deactivation, and status management
 
-### 3. `crux-agent-harness` — cross-cutting concerns
+### 5. `crux-agent-chat` — a working coding agent
 
-Eleven small sub-packages that solve the "stuff every serious agent
-eventually needs" problem. All packages are **independent of the
-runtime** — they consume only `crux-ai` types, so you can mix-and-match:
-
-| Package | What it does |
-|---|---|
-| `token` | Tiktoken-backed token counting with a process-wide counter pool. |
-| `token/messages` | Estimates request size from `core.Message` slices (incl. images, tool calls). |
-| `context` | Token budget, status checks, and binary-search split-point planning. |
-| `context/compactor` | `Compactor` interface + LLM / sliding-window / hybrid implementations. |
-| `context/pipeline` | `Pipeline.Check` → `ShouldCompact` → `Compact` orchestration. |
-| `approval` | Rule-based gate (`DecisionAllow` / `Block` / `Ask`) with custom matchers. |
-| `checkpoint` | Snapshot stack with undo/redo. |
-| `session` + `session/jsonl` | JSONL-persisted session tree (`Message`, `CustomMessage`, `BranchSummary`, `Compaction`, `ModelChange`, `ThinkingChange`, `SessionInfo`, `Label`). |
-| `observe` | Structured JSON-line logger + turn timer + token usage recorder. |
-| `prompt` | System-prompt builder with skills/templates XML sections. |
-| `skills` | `SKILL.md` loader (YAML frontmatter, `disable-model-invocation` support). |
-
-> The harness is **optional**. The runtime and chat work fine
-> without it; you adopt the parts you need.
-
-### 4. `crux-agent-chat` — a working coding agent
-
-A real, end-to-end REPL that uses all three lower layers:
+A real, end-to-end REPL that uses all layers:
 
 - `main.go` — REPL loop, Ctrl+C abort, command parser
   (`/help`, `/clear`, `/tools`, `/paste`, `/clearimg`, `/quit`).
@@ -160,13 +123,21 @@ A real, end-to-end REPL that uses all three lower layers:
 - `ui/terminal*.go` — ANSI rendering with a `kernel32.dll` call
   to enable Virtual Terminal Processing on Windows.
 
+### 6. Other modules
+
+- **`crux-agent-tui`** — TUI terminal interface for agent interaction
+- **`chat-app`** — Wails v2 + React desktop chat application
+- **`crux-mcp`** — Model Context Protocol (MCP) client library
+- **`crux-memory`** — 4-layer long-term memory for AI agents (Hot/Warm/Cold/Archive)
+- **`crux-turn`** — Standalone Turn FSM library for single agent turns
+
 ---
 
 ## 🚀 Quick Start
 
 ### Prerequisites
 
-- **Go 1.23+** (every module targets `go 1.23.0`)
+- **Go 1.25+** (go.work targets `go 1.25.0`)
 - A `.env` file (see [Configuration](#-configuration))
 - An API key for at least one supported provider
 
@@ -174,7 +145,7 @@ A real, end-to-end REPL that uses all three lower layers:
 
 From the repo root:
 
-```powershell
+```bash
 go build ./...
 ```
 
@@ -183,9 +154,9 @@ so the build is self-contained — no module publishing required.
 
 ### Run the chat REPL
 
-```powershell
+```bash
 cd crux-agent-chat
-copy .env.example .env
+cp .env.example .env
 # edit .env and set your API key
 go run .
 ```
@@ -201,18 +172,11 @@ Inside the REPL:
 👤 You: /quit            # exit (Ctrl+C twice also exits)
 ```
 
-### Run the harness tests
+### Run the agent-engine demo
 
-```powershell
-cd crux-agent-harness
-go test ./...
-```
-
-### Try the demo binary
-
-```powershell
-cd crux-agent-runtime
-go run ./cmd
+```bash
+cd agent-engine
+go run ./cmd/demo-agent
 ```
 
 ---
@@ -240,7 +204,7 @@ For other providers (Google, Mistral, Azure, Bedrock, …) consult
 ## 🧱 Project Layout
 
 ```
-crux/
+crux-agent/
 ├── crux-ai/                       # Core AI client
 │   ├── core/                      # Types, env, registry
 │   ├── ai/                        # Streaming entry points
@@ -248,27 +212,39 @@ crux/
 │   ├── testenv/                   # Hermetic test helpers
 │   └── cmd/                       # CLI demo
 │
-├── crux-agent-runtime/            # Agent loop
-│   ├── agent/                     # Agent, AgentLoop, event types
-│   └── cmd/                       # Demo binary
+├── crux-kernel/                   # Runtime container
+│   ├── container/                 # Service collection
+│   ├── bus/                       # Plugin event bus
+│   ├── service/                   # Service registry
+│   ├── plugin/                    # Plugin lifecycle
+│   ├── scope/                     # Isolated DI scopes
+│   └── disposable/                # Resource cleanup
 │
-├── crux-agent-harness/            # Optional harness concerns
-│   ├── token/                     # Tiktoken counting (+ pool)
-│   ├── context/                   # Budget + pipeline + compactor
-│   ├── approval/                  # Rule-based gates
-│   ├── checkpoint/                # Undo/redo snapshots
-│   ├── session/                   # JSONL session tree
-│   ├── observe/                   # JSON-line logger
-│   ├── prompt/                    # System-prompt builder
-│   └── skills/                    # SKILL.md loader
+├── agent-engine/                  # Agent loop engine
+│   ├── core/                      # Core abstractions
+│   ├── engine/                    # DefaultEngine implementation
+│   ├── pipeline/                  # Three-layer pipeline
+│   ├── events/                    # Strongly-typed event system
+│   ├── harness/                   # Optional harness services
+│   └── memory/                    # 4-layer memory integration
 │
-└── crux-agent-chat/               # End-to-end REPL coding agent
-    ├── main.go                    # REPL loop
-    ├── agent/                     # Agent factory
-    ├── config/                    # .env loader
-    ├── tools/                     # Bash, files, read_image
-    ├── ui/                        # ANSI rendering (+ Windows VT)
-    └── react-go-tutorial/         # Bundled example web app
+├── crux-plugin/                   # Subprocess plugin framework
+│   ├── transport/                 # stdio transport
+│   ├── protocol/                  # JSON-RPC 2.0
+│   └── lifecycle/                 # Plugin lifecycle
+│
+├── crux-agent-chat/               # End-to-end REPL coding agent
+│   ├── main.go                    # REPL loop
+│   ├── agent/                     # Agent factory
+│   ├── config/                    # .env loader
+│   ├── tools/                     # Bash, files, read_image
+│   └── ui/                        # ANSI rendering (+ Windows VT)
+│
+├── crux-agent-tui/                # TUI terminal interface
+├── chat-app/                      # Wails v2 + React desktop app
+├── crux-mcp/                      # MCP client library
+├── crux-memory/                   # 4-layer long-term memory
+└── crux-turn/                     # Standalone Turn FSM library
 ```
 
 ---
@@ -278,8 +254,9 @@ crux/
 | Module | Command |
 |---|---|
 | `crux-ai` | `go test ./...` (some packages have an integration test guarded by `//go:build integration`) |
-| `crux-agent-runtime` | `go test ./...` |
-| `crux-agent-harness` | `go test ./...` |
+| `crux-kernel` | `go test ./...` |
+| `agent-engine` | `go test ./...` |
+| `crux-plugin` | `go test ./...` |
 | `crux-agent-chat` | `go build ./...` (no tests by design) |
 
 The `faux` provider in `crux-ai/providers/faux` is a stub useful for
@@ -298,14 +275,16 @@ and add a `KnownProvider` constant + env-var mapping in `core/env.go`.
 `crux-agent-chat/tools/tools.go`'s `AllTools()` and it will be
 exposed to the LLM automatically.
 
-**Adopt the harness.** The harness is intentionally
-loose-coupled — pick the packages you need (e.g. only
-`context.Pipeline` for compaction) and ignore the rest.
+**Create a plugin.** Use `crux-plugin` to build a subprocess plugin
+that communicates via JSON-RPC 2.0 over stdio.
+
+**Use the agent-engine.** The engine is designed to be embedded.
+Import `agent-engine` and use `engine.NewDefaultEngine()` to create
+a fully functional agent with plugin lifecycle management.
 
 ---
 
 ## 📄 License
 
 See [`crux-agent-chat/LICENSE`](./crux-agent-chat/LICENSE) for the
-current license terms. The bundled `react-go-tutorial` retains its
-own license and is included only as a demo project.
+current license terms.

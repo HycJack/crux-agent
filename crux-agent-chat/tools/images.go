@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/hycjack/crux-ai/core"
-	agent "github.com/hycjack/agent-engine/engine"
+	"github.com/hycjack/agent-engine/engine"
 )
 
 // maxImageBytes is the largest image file the agent will read into memory.
@@ -76,7 +76,7 @@ var ReadImageTool = ToolDef{
 	Execute: executeReadImage,
 }
 
-func executeReadImage(_ context.Context, _ string, params json.RawMessage, _ func(json.RawMessage)) (agent.AgentToolResult, error) {
+func executeReadImage(_ context.Context, _ string, params json.RawMessage, _ func(json.RawMessage)) (engine.AgentToolResult, error) {
 	var args struct {
 		Path string `json:"path"`
 	}
@@ -97,7 +97,7 @@ func executeReadImage(_ context.Context, _ string, params json.RawMessage, _ fun
 	// caller that knows how to inspect AgentToolResult can lift it back
 	// into an ImageContent block. This keeps the wire format simple
 	// while still preserving the bytes for inspection.
-	return agent.AgentToolResult{
+	return engine.AgentToolResult{
 		Content: []core.ContentBlock{core.TextContent{
 			Type: "text",
 			Text: fmt.Sprintf("Loaded image %s (%s, %d bytes, base64 length %d). Use it as multimodal context for the next reasoning step.",

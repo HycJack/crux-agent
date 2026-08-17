@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	agent "github.com/hycjack/agent-engine/engine"
+	"github.com/hycjack/agent-engine/engine"
 )
 
 // BashTool executes shell commands in a cross-platform way.
@@ -24,7 +24,7 @@ var BashTool = ToolDef{
 	Execute:     executeBash,
 }
 
-func executeBash(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (agent.AgentToolResult, error) {
+func executeBash(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (engine.AgentToolResult, error) {
 	var args struct {
 		Command string `json:"command"`
 		Timeout int    `json:"timeout"`

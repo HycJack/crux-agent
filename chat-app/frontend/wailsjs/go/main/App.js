@@ -14,6 +14,10 @@ export function ClearMemory() {
   return window['go']['main']['App']['ClearMemory']();
 }
 
+export function ClearSession() {
+  return window['go']['main']['App']['ClearSession']();
+}
+
 export function DeleteMemory(arg1) {
   return window['go']['main']['App']['DeleteMemory'](arg1);
 }
@@ -100,6 +104,10 @@ export function SaveConversations(arg1) {
 
 export function SaveSettings(arg1) {
   return window['go']['main']['App']['SaveSettings'](arg1);
+}
+
+export function SessionMessageCount() {
+  return window['go']['main']['App']['SessionMessageCount']();
 }
 
 export function SetAutoLearnEnabled(arg1) {

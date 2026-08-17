@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"strings"
 
-	runtime "github.com/hycjack/agent-engine/engine"
+	"github.com/hycjack/agent-engine/engine"
 )
 
 // Context provides dependencies for command handlers.
@@ -38,7 +38,7 @@ type Handler func(ctx *Context, input string) HandlerResult
 type Agent interface {
 	ResetSubscribers()
 	SetOverride([]core.Message)
-	Subscribe(func(runtime.AgentEvent))
+	Subscribe(func(engine.AgentEvent))
 	Messages() []core.Message
 	Run(ctx context.Context, prompt core.UserMessage) ([]core.Message, error)
 	Abort()

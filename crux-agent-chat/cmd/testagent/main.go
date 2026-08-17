@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"crux-agent-chat/config"
-	runtime "github.com/hycjack/agent-engine/engine"
+	"github.com/hycjack/agent-engine/engine"
 	"github.com/hycjack/crux-ai/core"
 	_ "github.com/hycjack/crux-ai/providers"
 )
@@ -26,31 +26,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	echoTool := runtime.AgentTool{
+	echoTool := engine.AgentTool{
 		Name:        "echo",
 		Description: "Echoes back the input text",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}`),
-		Execute: func(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (runtime.AgentToolResult, error) {
+		Execute: func(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (engine.AgentToolResult, error) {
 			var args struct {
 				Text string `json:"text"`
 			}
 			if err := json.Unmarshal(params, &args); err != nil {
-				return runtime.AgentToolResult{
+				return engine.AgentToolResult{
 					Content: []core.ContentBlock{core.TextContent{Type: "text", Text: "invalid args: " + err.Error()}},
 					IsError: true,
 				}, nil
 			}
-			return runtime.AgentToolResult{
+			return engine.AgentToolResult{
 				Content: []core.ContentBlock{core.TextContent{Type: "text", Text: "Echo: " + args.Text}},
 			}, nil
 		},
 	}
 
-	a := runtime.New(runtime.AgentOptions{
-		InitialState: &runtime.AgentState{
+	a := engine.New(engine.AgentOptions{
+		InitialState: &engine.AgentState{
 			Model:        cfg.GetModel(),
 			SystemPrompt: "You are a helpful assistant. When asked to echo, use the echo tool. Always summarize tool results in a short sentence.",
-			Tools:        []runtime.AgentTool{echoTool},
+			Tools:        []engine.AgentTool{echoTool},
 			GetApiKey:    func() string { return cfg.APIKey },
 			SimpleStreamOptions: core.SimpleStreamOptions{
 				StreamOptions: core.StreamOptions{APIKey: cfg.APIKey},
@@ -59,12 +59,12 @@ func main() {
 	})
 
 	turnCount := 0
-	a.Subscribe(func(evt runtime.AgentEvent) {
+	a.Subscribe(func(evt engine.AgentEvent) {
 		switch e := evt.(type) {
-		case runtime.EventTurnStart:
+		case engine.EventTurnStart:
 			turnCount++
 			fmt.Fprintf(os.Stderr, "\n=== TURN %d ===\n", turnCount)
-		case runtime.EventMessageUpdate:
+		case engine.EventMessageUpdate:
 			switch evt := e.AssistantEvent.(type) {
 			case core.EventStart:
 				fmt.Fprintf(os.Stderr, "[llm:start] api=%s model=%s\n", evt.API, evt.Model)
@@ -77,15 +77,15 @@ func main() {
 			case core.EventError:
 				fmt.Fprintf(os.Stderr, "\n[llm:ERROR] %s\n", evt.ErrorMessage)
 			}
-		case runtime.EventToolExecStart:
+		case engine.EventToolExecStart:
 			fmt.Fprintf(os.Stderr, "[tool:start] %s\n", e.ToolName)
-		case runtime.EventToolExecEnd:
+		case engine.EventToolExecEnd:
 			s := "✓"
 			if e.IsError {
 				s = "✗"
 			}
 			fmt.Fprintf(os.Stderr, "[tool:end] %s %s\n", s, e.ToolName)
-		case runtime.EventTurnEnd:
+		case engine.EventTurnEnd:
 			fmt.Fprintf(os.Stderr, "=== END TURN %d (toolResults=%d) ===\n", turnCount, len(e.ToolResults))
 		}
 	})

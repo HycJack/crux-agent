@@ -237,16 +237,15 @@ func (b *EventBus) Emit(ctx context.Context, eventType string, event Event) (any
 			continue
 		}
 
-		// 收集需要移除的 once handler id
-		var removeIDs []string
-
 		switch gk.mode {
 		case DispatchBroadcast:
 			// 广播：并发执行，不等待。这里选择 goroutine。
 			// 注意：不等待意味着 handler 的 error 会被丢弃。
 			for _, e := range entries {
+				// Atomically remove once handlers before execution to prevent
+				// race conditions where multiple goroutines execute the same handler.
 				if e.once {
-					removeIDs = append(removeIDs, e.id)
+					b.Off(e.id)
 				}
 				go e.handler(ctx, event)
 			}
@@ -255,8 +254,9 @@ func (b *EventBus) Emit(ctx context.Context, eventType string, event Event) (any
 			var wg sync.WaitGroup
 			errs := make([]error, len(entries))
 			for i, e := range entries {
+				// Atomically remove once handlers before execution.
 				if e.once {
-					removeIDs = append(removeIDs, e.id)
+					b.Off(e.id)
 				}
 				wg.Add(1)
 				go func(i int, e handlerEntry) {
@@ -275,8 +275,9 @@ func (b *EventBus) Emit(ctx context.Context, eventType string, event Event) (any
 
 		case DispatchSerial:
 			for _, e := range entries {
+				// Atomically remove once handlers before execution.
 				if e.once {
-					removeIDs = append(removeIDs, e.id)
+					b.Off(e.id)
 				}
 				r, err := e.handler(ctx, event)
 				result = r
@@ -289,8 +290,9 @@ func (b *EventBus) Emit(ctx context.Context, eventType string, event Event) (any
 
 		case DispatchBail:
 			for _, e := range entries {
+				// Atomically remove once handlers before execution.
 				if e.once {
-					removeIDs = append(removeIDs, e.id)
+					b.Off(e.id)
 				}
 				r, err := e.handler(ctx, event)
 				if err != nil {
@@ -308,14 +310,20 @@ func (b *EventBus) Emit(ctx context.Context, eventType string, event Event) (any
 		case DispatchWaterfall:
 			var prev any // 瀑布流的输入，第一个 handler 收到的 prev 为 nil
 			for _, e := range entries {
+				// Atomically remove once handlers before execution.
 				if e.once {
-					removeIDs = append(removeIDs, e.id)
+					b.Off(e.id)
 				}
-				// waterfall handler 需要能拿到上一步的结果，
-				// 通过把 prev 注入到 event 的副本（或约定）实现。
-				// 这里采用约定：handler 内部自行从 event.EventData 读取/写入。
-				// 为简化实现，waterfall 不自动传递 prev，而是返回最后一个结果。
-				r, err := e.handler(ctx, event)
+				// Create a wrapped event that carries the previous result.
+				// The handler can access it via the WaterfallInput interface.
+				var currentEvent Event = event
+				if prev != nil {
+					currentEvent = &waterfallEvent{
+						Event:    event,
+						previous: prev,
+					}
+				}
+				r, err := e.handler(ctx, currentEvent)
 				if err != nil {
 					firstErr = err
 					hasErr = true
@@ -324,11 +332,6 @@ func (b *EventBus) Emit(ctx context.Context, eventType string, event Event) (any
 				prev = r
 			}
 			result = prev
-		}
-
-		// 移除已触发的 once handler
-		for _, id := range removeIDs {
-			b.Off(id)
 		}
 	}
 
@@ -351,6 +354,25 @@ func (b *EventBus) Emit(ctx context.Context, eventType string, event Event) (any
 		return nil, errors.Join(collected...)
 	}
 	return nil, nil
+}
+
+// waterfallEvent wraps an Event and carries the previous handler's result
+// for Waterfall dispatch mode.
+type waterfallEvent struct {
+	Event
+	previous any
+}
+
+// WaterfallInput is an interface that waterfall events implement.
+// Handlers can use this to access the previous handler's result.
+type WaterfallInput interface {
+	// PreviousResult returns the result from the previous handler in the waterfall chain.
+	PreviousResult() any
+}
+
+// PreviousResult implements the WaterfallInput interface.
+func (e *waterfallEvent) PreviousResult() any {
+	return e.previous
 }
 
 // HasListeners 返回是否注册了指定 eventType 的监听器。

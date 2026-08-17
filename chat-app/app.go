@@ -1151,11 +1151,16 @@ func (a *App) StreamMessage(params map[string]interface{}) error {
 			}
 		}
 
-		_, _ = agt.Run(runCtx, core.UserMessage{
+		logutil.Infof("[stream] starting agent run for message: %s", truncateStr(p.Message, 100))
+		_, runErr := agt.Run(runCtx, core.UserMessage{
 			Role:      core.MessageRoleUser,
 			Content:   p.Message,
 			Timestamp: time.Now(),
 		})
+		if runErr != nil {
+			logutil.Errorf("[stream] agent run failed: %v", runErr)
+			wruntime.EventsEmit(a.ctx, "stream-error", runErr.Error())
+		}
 
 		// Persist this turn's new messages to the persistent session so the
 		// conversation can be recovered after restart.
@@ -1816,4 +1821,11 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func truncateStr(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }

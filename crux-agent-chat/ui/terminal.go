@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	runtime "github.com/hycjack/agent-engine/engine"
+	"github.com/hycjack/agent-engine/engine"
 	"github.com/hycjack/crux-ai/core"
 )
 
@@ -42,16 +42,16 @@ func enableVTSupport() {
 }
 
 // Subscriber returns a function that prints agent events to the terminal.
-func Subscriber() func(runtime.AgentEvent) {
-	return func(evt runtime.AgentEvent) {
+func Subscriber() func(engine.AgentEvent) {
+	return func(evt engine.AgentEvent) {
 		switch e := evt.(type) {
-		case runtime.EventMessageUpdate:
+		case engine.EventMessageUpdate:
 			handleMessageUpdate(e)
-		case runtime.EventToolExecStart:
+		case engine.EventToolExecStart:
 			// Show tool name and truncated args
 			argsStr := truncate(string(e.Args), 300)
 			fmt.Printf("\n%s🔧 [%s]%s %s\n", colorYellow, e.ToolName, colorReset, argsStr)
-		case runtime.EventToolExecEnd:
+		case engine.EventToolExecEnd:
 			status := colorGreen + "✓"
 			if e.IsError {
 				status = colorRed + "✗"
@@ -62,7 +62,7 @@ func Subscriber() func(runtime.AgentEvent) {
 			if resultPreview != "" && resultPreview != "null" {
 				fmt.Printf("%s  → %s%s\n", colorDim, resultPreview, colorReset)
 			}
-		case runtime.EventTurnEnd:
+		case engine.EventTurnEnd:
 			// Show error message if the turn ended with an error
 			if e.Message.ErrorMessage != "" {
 				fmt.Printf("\n%s❌ Error: %s%s\n", colorRed, e.Message.ErrorMessage, colorReset)
@@ -71,7 +71,7 @@ func Subscriber() func(runtime.AgentEvent) {
 	}
 }
 
-func handleMessageUpdate(e runtime.EventMessageUpdate) {
+func handleMessageUpdate(e engine.EventMessageUpdate) {
 	switch evt := e.AssistantEvent.(type) {
 	case core.EventTextDelta:
 		fmt.Print(evt.Delta)

@@ -2,26 +2,27 @@
 
 > 🌏 **语言 / Languages**: [English](./README.md) · [中文](./README.zh-CN.md)
 
-Crux 是一个基于 Go 的多层 AI Agent 框架。仓库被刻意拆分成四个
-互相独立的小 Go module，让每一层都可以被单独采用（也可以被跳过）：
+Crux 是一个基于 Go 的多层 AI Agent 框架。仓库包含多个独立的 Go module：
 
 | Module | 路径 | 职责 |
 |---|---|---|
 | **`crux-ai`** | `crux-ai/` | 与具体厂商无关的 AI 客户端——统一定义类型、流式接口，并提供 OpenAI / Anthropic / Google / Bedrock / Mistral / Azure 等适配器。 |
-| **`crux-agent-runtime`** | `crux-agent-runtime/` | 可复用的 **Agent 循环**，提供事件流和工具执行框架。 |
-| **`crux-agent-harness`** | `crux-agent-harness/` | 可插拔的"代理管理"套件：上下文压缩、审批闸门、检查点、会话持久化、技能加载、可观测性、提示词构建。 |
-| **`crux-agent-chat`** | `crux-agent-chat/` | 一个开箱即用、跨平台的 REPL **编程助手**，建立在前三层之上。 |
+| **`crux-kernel`** | `crux-kernel/` | 核心运行时容器——插件生命周期、事件总线、服务注册表（Cordis 风格）。 |
+| **`agent-engine`** | `agent-engine/` | 轻量级、可嵌入的 **Agent 循环引擎**，提供事件流、工具执行和管道抽象。 |
+| **`crux-plugin`** | `crux-plugin/` | 子进程 JSON-RPC 2.0 插件框架（stdio）。 |
+| **`crux-agent-chat`** | `crux-agent-chat/` | 一个开箱即用、跨平台的 REPL **编程助手**，建立在所有层之上。 |
+| **`crux-agent-tui`** | `crux-agent-tui/` | TUI 终端界面，用于 Agent 交互。 |
+| **`chat-app`** | `chat-app/` | Wails v2 + React 桌面聊天应用。 |
+| **`crux-mcp`** | `crux-mcp/` | 模型上下文协议（MCP）客户端库。 |
+| **`crux-memory`** | `crux-memory/` | 4 层长期记忆系统（热/温/冷/归档）。 |
+| **`crux-turn`** | `crux-turn/` | 独立的 Turn FSM 库，用于单次 Agent 轮次。 |
 
 依赖方向是**严格单向**的：
 
 ```
-crux-agent-chat  →  crux-agent-runtime  →  crux-ai
-crux-agent-harness  ───────────────────→  crux-ai
+crux-agent-chat / chat-app / crux-agent-tui  →  agent-engine  →  crux-ai
+                              crux-kernel  →  crux-ai
 ```
-
-`crux-agent-harness` 完全不知道 runtime 的存在，runtime 也完全不
-知道 harness 的存在。每一层都可以独立替换或扩展，而不必动到其他
-层。
 
 ---
 
@@ -67,76 +68,40 @@ crux-agent-harness  ───────────────────→
   `openai-codex-responses`、`google-generative`、`google-vertex`、
   `mistral-conversations`）。
 
-最小用法：
+### 2. `crux-kernel` — 运行时容器
 
-```go
-import (
-    "context"
-    "crux-ai/ai"
-    "crux-ai/core"
-    _ "crux-ai/providers" // 注册所有内置 provider
-)
+核心运行时容器，灵感来自 VS Code 的 ServiceCollection 和
+Cordis 的 Container/Scope 架构。
 
-model := core.Model{
-    ID:   "claude-sonnet-4-5",
-    API:  core.APIAnthropicMessages,
-    Provider: core.ProviderAnthropic,
-    Input: []core.Modality{core.ModalityText, core.ModalityImage},
-}
+- **`container`** — 服务集合，带生命周期钩子（`Start` / `Stop`）
+- **`bus`** — 插件事件总线（`Register`、`Fire`、`Listen`、`Once`）
+- **`service`** — 服务注册表（`Service`、`ServiceFactory` 接口）
+- **`plugin`** — 插件生命周期（`PluginDef`、`PluginContext`、`PluginManager`）
+- **`scope`** — 隔离的依赖注入作用域
+- **`disposable`** — 资源清理模式
 
-msg, err := ai.CompleteSimple(context.Background(), model,
-    []core.Message{core.UserMessage{Content: "你好！"}},
-    core.SimpleStreamOptions{StreamOptions: core.StreamOptions{
-        APIKey:  "<你的密钥>",
-        MaxTokens: ptr(1024),
-    }},
-)
-```
+### 3. `agent-engine` — Agent 循环引擎
 
-`crux-ai/cmd` 目录下有一个小的 CLI 演示（`crux-ai.go`），
-`crux-ai/testenv` 提供基于 `faux` 模拟 provider 的沙箱测试工具。
+轻量级、可嵌入的 Agent 循环引擎（编译后仅 164KB）。
 
-### 2. `crux-agent-runtime` — Agent 循环
+- **`core`** — 核心抽象（`AgentLoop`、`Pipeline`、`TurnContext`）
+- **`engine`** — `DefaultEngine` 实现，带插件生命周期管理
+- **`pipeline`** — 三层管道：SystemPrompt → History → Response
+- **`events`** — 强类型事件系统（`EventTextDelta`、`EventToolCallEnd` 等）
+- **`harness`** — 可选的 harness 服务（压缩、会话、可观测性等）
+- **`memory`** — 4 层记忆集成（热/温/冷/归档）
 
-一个独立、小巧的 `Agent` 类型，把 `crux-ai` 包装成事件驱动的循环：
+### 4. `crux-plugin` — 子进程插件框架
 
-- `agent.New(config, toolSpecs)` — 用一组工具构造一个 Agent。
-- `agent.Run(ctx, userMessage)` — 跑一轮或多轮，直到模型
-  自然停止或发出 `StopToolUse`。
-- `agent.Subscribe(fn)` / `agent.SubscribeChan(ch)` — 监听
-  类型化事件（`EventText`、`EventThinkingStart`、`EventToolCallStart`、
-  `EventToolResult`、`EventDone`、`EventError` 等）。
-- `agent.Abort()` — 协作式取消。
+基于 VS Code 插件架构的子进程 JSON-RPC 2.0 插件框架。
 
-Runtime 自带一套工具规范（tool-spec）系统，因此可以接入任何自定义
-工具而无需改动核心循环。
+- **`transport`** — `stdio` 传输（`ReadPacket` / `WritePacket` / `PacketType`）
+- **`protocol`** — JSON-RPC 2.0（`Request`、`Response`、`Notification`）
+- **`lifecycle`** — 插件激活、停用和状态管理
 
-### 3. `crux-agent-harness` — 横切关注点
+### 5. `crux-agent-chat` — 可工作的编程 Agent
 
-十一个小型子 package，解决"每个严肃的 Agent 迟早都会遇到的问题"。
-所有 package 都**独立于 runtime**——只消费 `crux-ai` 的类型，
-因此可以自由混搭：
-
-| Package | 作用 |
-|---|---|
-| `token` | 基于 Tiktoken 的 token 计数，自带进程级 Counter 缓存池。 |
-| `token/messages` | 根据 `core.Message` 序列估算请求大小（含图片、工具调用）。 |
-| `context` | token 预算、状态检查、二分搜索找切分点。 |
-| `context/compactor` | `Compactor` 接口 + LLM / 滑动窗口 / 混合三种实现。 |
-| `context/pipeline` | `Pipeline.Check` → `ShouldCompact` → `Compact` 编排。 |
-| `approval` | 基于规则的闸门（`DecisionAllow` / `Block` / `Ask`），支持自定义匹配器。 |
-| `checkpoint` | 快照栈，支持撤销 / 重做。 |
-| `session` + `session/jsonl` | JSONL 持久化的会话树（`Message`、`CustomMessage`、`BranchSummary`、`Compaction`、`ModelChange`、`ThinkingChange`、`SessionInfo`、`Label`）。 |
-| `observe` | 结构化 JSON 行日志 + turn 计时器 + token 用量记录。 |
-| `prompt` | 系统提示词构造器，自带 skills/templates 的 XML 区块。 |
-| `skills` | `SKILL.md` 加载器（YAML frontmatter，支持 `disable-model-invocation`）。 |
-
-> Harness 是**可选的**。Runtime 和 chat 不依赖它也能跑；按需
-> 引入即可。
-
-### 4. `crux-agent-chat` — 可工作的编程 Agent
-
-一个真正端到端的 REPL，复用了下面三个 module：
+一个真正端到端的 REPL，复用了所有层：
 
 - `main.go` — REPL 主循环，Ctrl+C 中止，命令解析
   （`/help`、`/clear`、`/tools`、`/paste`、`/clearimg`、`/quit`）。
@@ -155,13 +120,21 @@ Runtime 自带一套工具规范（tool-spec）系统，因此可以接入任何
 - `ui/terminal*.go` — ANSI 渲染，在 Windows 下通过
   `kernel32.dll` 启用 Virtual Terminal Processing。
 
+### 6. 其他模块
+
+- **`crux-agent-tui`** — TUI 终端界面，用于 Agent 交互
+- **`chat-app`** — Wails v2 + React 桌面聊天应用
+- **`crux-mcp`** — 模型上下文协议（MCP）客户端库
+- **`crux-memory`** — 4 层长期记忆系统（热/温/冷/归档）
+- **`crux-turn`** — 独立的 Turn FSM 库，用于单次 Agent 轮次
+
 ---
 
 ## 🚀 快速开始
 
 ### 环境要求
 
-- **Go 1.23+**（每个 module 都指定 `go 1.23.0`）
+- **Go 1.25+**（go.work 指定 `go 1.25.0`）
 - 一个 `.env` 文件（参见 [配置](#-配置)）
 - 至少一个支持厂商的 API 密钥
 
@@ -169,7 +142,7 @@ Runtime 自带一套工具规范（tool-spec）系统，因此可以接入任何
 
 在仓库根目录：
 
-```powershell
+```bash
 go build ./...
 ```
 
@@ -178,9 +151,9 @@ go build ./...
 
 ### 跑 REPL
 
-```powershell
+```bash
 cd crux-agent-chat
-copy .env.example .env
+cp .env.example .env
 # 编辑 .env，填入你的 API 密钥
 go run .
 ```
@@ -196,18 +169,11 @@ REPL 中可以这样用：
 👤 You: /quit            # 退出（按两次 Ctrl+C 也可以退出）
 ```
 
-### 跑 Harness 测试
+### 跑 agent-engine 演示
 
-```powershell
-cd crux-agent-harness
-go test ./...
-```
-
-### 跑 Runtime 演示
-
-```powershell
-cd crux-agent-runtime
-go run ./cmd
+```bash
+cd agent-engine
+go run ./cmd/demo-agent
 ```
 
 ---
@@ -235,7 +201,7 @@ go run ./cmd
 ## 🧱 项目结构
 
 ```
-crux/
+crux-agent/
 ├── crux-ai/                       # AI 客户端核心
 │   ├── core/                      # 类型、环境变量、注册表
 │   ├── ai/                        # 流式入口
@@ -243,27 +209,39 @@ crux/
 │   ├── testenv/                   # 沙箱测试辅助
 │   └── cmd/                       # CLI 演示
 │
-├── crux-agent-runtime/            # Agent 循环
-│   ├── agent/                     # Agent、AgentLoop、事件类型
-│   └── cmd/                       # 演示二进制
+├── crux-kernel/                   # 运行时容器
+│   ├── container/                 # 服务集合
+│   ├── bus/                       # 插件事件总线
+│   ├── service/                   # 服务注册表
+│   ├── plugin/                    # 插件生命周期
+│   ├── scope/                     # 隔离的 DI 作用域
+│   └── disposable/                # 资源清理
 │
-├── crux-agent-harness/            # 可选的 harness 套件
-│   ├── token/                     # Tiktoken 计数（含缓存池）
-│   ├── context/                   # 预算 + 流水线 + 压缩器
-│   ├── approval/                  # 基于规则的审批闸门
-│   ├── checkpoint/                # 撤销 / 重做快照
-│   ├── session/                   # JSONL 会话树
-│   ├── observe/                   # JSON 行日志
-│   ├── prompt/                    # 系统提示词构造器
-│   └── skills/                    # SKILL.md 加载器
+├── agent-engine/                  # Agent 循环引擎
+│   ├── core/                      # 核心抽象
+│   ├── engine/                    # DefaultEngine 实现
+│   ├── pipeline/                  # 三层管道
+│   ├── events/                    # 强类型事件系统
+│   ├── harness/                   # 可选的 harness 服务
+│   └── memory/                    # 4 层记忆集成
 │
-└── crux-agent-chat/               # 端到端 REPL 编程助手
-    ├── main.go                    # REPL 主循环
-    ├── agent/                     # Agent 工厂
-    ├── config/                    # .env 加载器
-    ├── tools/                     # bash、files、read_image
-    ├── ui/                        # ANSI 渲染（含 Windows VT）
-    └── react-go-tutorial/         # 内置的示例 Web 应用
+├── crux-plugin/                   # 子进程插件框架
+│   ├── transport/                 # stdio 传输
+│   ├── protocol/                  # JSON-RPC 2.0
+│   └── lifecycle/                 # 插件生命周期
+│
+├── crux-agent-chat/               # 端到端 REPL 编程助手
+│   ├── main.go                    # REPL 主循环
+│   ├── agent/                     # Agent 工厂
+│   ├── config/                    # .env 加载器
+│   ├── tools/                     # bash、files、read_image
+│   └── ui/                        # ANSI 渲染（含 Windows VT）
+│
+├── crux-agent-tui/                # TUI 终端界面
+├── chat-app/                      # Wails v2 + React 桌面应用
+├── crux-mcp/                      # MCP 客户端库
+├── crux-memory/                   # 4 层长期记忆系统
+└── crux-turn/                     # 独立的 Turn FSM 库
 ```
 
 ---
@@ -273,8 +251,9 @@ crux/
 | Module | 命令 |
 |---|---|
 | `crux-ai` | `go test ./...`（部分包有以 `//go:build integration` 守门的集成测试） |
-| `crux-agent-runtime` | `go test ./...` |
-| `crux-agent-harness` | `go test ./...` |
+| `crux-kernel` | `go test ./...` |
+| `agent-engine` | `go test ./...` |
+| `crux-plugin` | `go test ./...` |
 | `crux-agent-chat` | `go build ./...`（设计上不写测试） |
 
 `crux-ai/providers/faux` 提供的 mock provider 可以用于跑集成测试，
@@ -293,13 +272,16 @@ crux/
 `crux-agent-chat/tools/tools.go` 的 `AllTools()` 里追加一个
 `ToolDef`，它会自动暴露给 LLM。
 
-**采用 Harness。** Harness 故意做得松耦合——按需引入某些 package
-（例如只要 `context.Pipeline` 做压缩），其余的可以忽略。
+**创建插件。** 使用 `crux-plugin` 构建子进程插件，
+通过 stdio 的 JSON-RPC 2.0 进行通信。
+
+**使用 agent-engine。** 该引擎设计为可嵌入。
+导入 `agent-engine` 并使用 `engine.NewDefaultEngine()` 创建
+带插件生命周期管理的完整 Agent。
 
 ---
 
 ## 📄 许可证
 
 当前许可证见
-[`crux-agent-chat/LICENSE`](./crux-agent-chat/LICENSE)。内置的
-`react-go-tutorial` 保留其各自许可证，仅作为示例项目引入。
+[`crux-agent-chat/LICENSE`](./crux-agent-chat/LICENSE)。

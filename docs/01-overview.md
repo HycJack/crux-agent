@@ -2,7 +2,7 @@
 
 ## 一、项目概述
 
-Crux 是一个基于 Go 的多层模块化 AI Agent 框架，用于构建 AI Agent 和 Agent 驱动的应用程序。项目被有意拆分为四个独立的 Go 模块，每个层都可以独立采用或跳过。
+Crux 是一个基于 Go 的多层模块化 AI Agent 框架，用于构建 AI Agent 和 Agent 驱动的应用程序。项目包含多个独立的 Go 模块。
 
 ### 1.1 核心特性
 
@@ -10,7 +10,7 @@ Crux 是一个基于 Go 的多层模块化 AI Agent 框架，用于构建 AI Age
 - **推理感知**：原生支持 `ThinkingContent` 块和按模型的推理强度映射
 - **多模态**：文本、图片、音频和工具调用共享统一的 `ContentBlock` 联合类型
 - **工具循环**：支持中止的流式 `AgentLoop`，并发工具执行和结构化事件
-- **Harness 管道**：Token 感知的上下文压缩、规则型审批网关、撤销/重做检查点、JSONL 会话持久化
+- **插件系统**：子进程 JSON-RPC 2.0 插件框架
 - **REPL 编码 Agent**：跨平台终端助手，支持 Windows、macOS 和 Linux
 
 ### 1.2 模块列表
@@ -18,9 +18,15 @@ Crux 是一个基于 Go 的多层模块化 AI Agent 框架，用于构建 AI Age
 | 模块 | 路径 | 用途 |
 |------|------|------|
 | **crux-ai** | `crux-ai/` | 供应商无关的 AI 客户端 — 类型、流式传输和适配器 |
-| **crux-agent-runtime** | `crux-agent-runtime/` | 可重用的 Agent 循环，包含事件流和工具执行框架 |
-| **crux-agent-harness** | `crux-agent-harness/` | 可插拔的横切关注点：上下文压缩、审批网关、检查点、会话持久化等 |
+| **crux-kernel** | `crux-kernel/` | 核心运行时容器 — 插件生命周期、事件总线、服务注册表 |
+| **agent-engine** | `agent-engine/` | 轻量级、可嵌入的 Agent 循环引擎 |
+| **crux-plugin** | `crux-plugin/` | 子进程 JSON-RPC 2.0 插件框架 |
+| **crux-agent-chat** | `crux-agent-chat/` | 跨平台 REPL 编程助手 |
 | **crux-agent-tui** | `crux-agent-tui/` | TUI 终端界面 |
+| **chat-app** | `chat-app/` | Wails v2 + React 桌面聊天应用 |
+| **crux-mcp** | `crux-mcp/` | 模型上下文协议客户端库 |
+| **crux-memory** | `crux-memory/` | 4 层长期记忆系统 |
+| **crux-turn** | `crux-turn/` | 独立的 Turn FSM 库 |
 
 ## 二、架构分层
 
@@ -29,26 +35,21 @@ Crux 是一个基于 Go 的多层模块化 AI Agent 框架，用于构建 AI Age
 依赖方向严格单向：
 
 ```
-crux-agent-tui  →  crux-agent-runtime  →  crux-ai
-crux-agent-harness  ───────────────────→  crux-ai
+crux-agent-chat / chat-app / crux-agent-tui  →  agent-engine  →  crux-ai
+                              crux-kernel  →  crux-ai
 ```
-
-**关键设计原则**：
-- `crux-agent-harness` 不了解 runtime
-- runtime 不了解 harness
-- 每层都可以独立替换或扩展
 
 ### 2.2 分层说明
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│              crux-agent-tui (TUI界面层)                      │
+│              crux-agent-chat / chat-app / crux-agent-tui     │
 │                      ↓                                      │
 ├─────────────────────────────────────────────────────────────┤
-│              crux-agent-runtime (Agent运行时)                │
+│              agent-engine (Agent循环引擎)                    │
 │                      ↓                                      │
 ├─────────────────────────────────────────────────────────────┤
-│              crux-agent-harness (Harness组件)               │
+│              crux-kernel (运行时容器)                        │
 │                      ↓                                      │
 ├─────────────────────────────────────────────────────────────┤
 │              crux-ai (AI客户端核心)                          │
@@ -208,7 +209,7 @@ func (t *BashTool) Call(ctx context.Context, args map[string]any) (any, error) {
 ## 八、项目结构
 
 ```
-crux/
+crux-agent/
 ├── crux-ai/                       # 核心AI客户端
 │   ├── core/                      # 类型、环境、注册表
 │   ├── ai/                        # 流式入口点
@@ -216,24 +217,39 @@ crux/
 │   ├── testenv/                   # 测试辅助工具
 │   └── cmd/                       # CLI演示
 │
-├── crux-agent-runtime/            # Agent循环
-│   ├── agent/                     # Agent、AgentLoop、事件类型
-│   └── cmd/                       # 演示二进制
+├── crux-kernel/                   # 运行时容器
+│   ├── container/                 # 服务集合
+│   ├── bus/                       # 插件事件总线
+│   ├── service/                   # 服务注册表
+│   ├── plugin/                    # 插件生命周期
+│   ├── scope/                     # 隔离的DI作用域
+│   └── disposable/                # 资源清理
 │
-├── crux-agent-harness/            # 可选的Harness组件
-│   ├── token/                     # Tiktoken计数
-│   ├── context/                   # 预算 + 管道 + 压缩器
-│   ├── approval/                  # 规则型网关
-│   ├── checkpoint/                # 撤销/重做快照
-│   ├── session/                   # JSONL会话树
-│   ├── observe/                   # JSON行日志
-│   ├── prompt/                    # 系统提示词构建器
-│   └── skills/                    # SKILL.md加载器
+├── agent-engine/                  # Agent循环引擎
+│   ├── core/                      # 核心抽象
+│   ├── engine/                    # DefaultEngine实现
+│   ├── pipeline/                  # 三层管道
+│   ├── events/                    # 强类型事件系统
+│   ├── harness/                   # 可选的harness服务
+│   └── memory/                    # 4层记忆集成
 │
-└── crux-agent-tui/               # TUI终端界面
-    ├── main.go                    # REPL循环
-    ├── internal/app/              # 应用逻辑
-    └── tui/                       # TUI渲染
+├── crux-plugin/                   # 子进程插件框架
+│   ├── transport/                 # stdio传输
+│   ├── protocol/                  # JSON-RPC 2.0
+│   └── lifecycle/                 # 插件生命周期
+│
+├── crux-agent-chat/               # 端到端REPL编程助手
+│   ├── main.go                    # REPL循环
+│   ├── agent/                     # Agent工厂
+│   ├── config/                    # .env加载器
+│   ├── tools/                     # bash、files、read_image
+│   └── ui/                        # ANSI渲染（含Windows VT）
+│
+├── crux-agent-tui/                # TUI终端界面
+├── chat-app/                      # Wails v2 + React桌面应用
+├── crux-mcp/                      # MCP客户端库
+├── crux-memory/                   # 4层长期记忆系统
+└── crux-turn/                     # 独立的Turn FSM库
 ```
 
 ## 九、测试策略
@@ -241,9 +257,10 @@ crux/
 | 模块 | 测试命令 | 说明 |
 |------|----------|------|
 | crux-ai | `go test ./...` | 部分包有集成测试（`//go:build integration`） |
-| crux-agent-runtime | `go test ./...` | 单元测试 |
-| crux-agent-harness | `go test ./...` | 单元测试 |
-| crux-agent-tui | `go build ./...` | 无测试（设计如此） |
+| crux-kernel | `go test ./...` | 单元测试 |
+| agent-engine | `go test ./...` | 单元测试 |
+| crux-plugin | `go test ./...` | 单元测试 |
+| crux-agent-chat | `go build ./...` | 无测试（设计如此） |
 
 **测试工具**：
 - `crux-ai/providers/faux`：模拟供应商，用于集成测试而不消耗真实 token

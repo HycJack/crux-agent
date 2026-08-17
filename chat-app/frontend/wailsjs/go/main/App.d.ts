@@ -8,6 +8,8 @@ export function CancelStream():Promise<void>;
 
 export function ClearMemory():Promise<void>;
 
+export function ClearSession():Promise<number>;
+
 export function DeleteMemory(arg1:string):Promise<void>;
 
 export function GetAutoLearnEnabled():Promise<boolean>;
@@ -51,6 +53,8 @@ export function ResetAgent():Promise<void>;
 export function SaveConversations(arg1:Array<main.PersistedConversation>):Promise<void>;
 
 export function SaveSettings(arg1:main.PersistedSettings):Promise<void>;
+
+export function SessionMessageCount():Promise<number>;
 
 export function SetAutoLearnEnabled(arg1:boolean):Promise<void>;
 

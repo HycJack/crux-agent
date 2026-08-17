@@ -22,20 +22,19 @@ import (
 	"crux-agent-chat/tools"
 	"crux-agent-chat/ui"
 
-	agentruntime "github.com/hycjack/agent-engine/engine"
+	"github.com/hycjack/agent-engine/engine"
 	"github.com/hycjack/crux-ai/core"
 
 	"golang.org/x/term"
 )
 
-// chatAgent is a thin wrapper around the runtime Agent that lets us
-// swap in a compacted message list between queries (the runtime's
-// public API does not expose a SetMessages method).
+// chatAgent is a thin wrapper around the engine Agent that lets us
+// swap in a compacted message list between queries.
 type chatAgent struct {
-	inner       *agentruntime.Agent
+	inner       *engine.Agent
 	mu          sync.Mutex
 	override    []core.Message
-	subscribers []func(agentruntime.AgentEvent)
+	subscribers []func(engine.AgentEvent)
 }
 
 // sessionWriter persists messages to the harness session.
@@ -52,21 +51,14 @@ func (c *chatAgent) Run(ctx context.Context, prompt core.UserMessage) ([]core.Me
 	c.override = nil
 	inner := c.inner
 	if len(override) > 0 {
-		// Apply compaction: rebuild the agent's state with compacted history.
-		state := inner.State()
-		state.Messages = override
-		newInner := agentruntime.New(agentruntime.AgentOptions{InitialState: &state})
-		c.inner = newInner
-		inner = newInner
-		for _, fn := range c.subscribers {
-			c.inner.Subscribe(fn)
-		}
+		// Apply compaction: replace the agent's message history with compacted list.
+		inner.SetMessages(override)
 	}
 	c.mu.Unlock()
 	return inner.Run(ctx, prompt)
 }
 
-func (c *chatAgent) Subscribe(fn func(agentruntime.AgentEvent)) {
+func (c *chatAgent) Subscribe(fn func(engine.AgentEvent)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.subscribers = append(c.subscribers, fn)
@@ -79,7 +71,7 @@ func (c *chatAgent) Abort() {
 	c.inner.Abort()
 	c.mu.Unlock()
 }
-func (c *chatAgent) State() agentruntime.AgentState {
+func (c *chatAgent) State() engine.AgentState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.inner.State()
@@ -168,7 +160,7 @@ func main() {
 
 	// Coding agent, integrated with the harness.
 	ca := &chatAgent{inner: agent.NewCodingAgentWithHarness(agent.Options{Config: cfg, Harness: hr})}
-	ca.Subscribe(func(evt agentruntime.AgentEvent) {
+	ca.Subscribe(func(evt engine.AgentEvent) {
 		ui.Subscriber()(evt)
 		chatSubscriber(evt, hr)
 	})
@@ -237,7 +229,7 @@ func main() {
 					ca.ResetSubscribers()
 					ca.SetOverride(nil)
 					ca.inner = agent.NewCodingAgentWithHarness(agent.Options{Config: cfg, Harness: hr})
-					ca.Subscribe(func(evt agentruntime.AgentEvent) {
+					ca.Subscribe(func(evt engine.AgentEvent) {
 						ui.Subscriber()(evt)
 						chatSubscriber(evt, hr)
 					})
@@ -263,7 +255,7 @@ func main() {
 						ui.PrintError("Failed to create new session: %v", err)
 					} else {
 						newCa := &chatAgent{inner: agent.NewCodingAgentWithHarness(agent.Options{Config: cfg, Harness: newHr})}
-						newCa.Subscribe(func(evt agentruntime.AgentEvent) {
+						newCa.Subscribe(func(evt engine.AgentEvent) {
 							ui.Subscriber()(evt)
 							chatSubscriber(evt, newHr)
 						})
@@ -291,7 +283,7 @@ func main() {
 						ui.PrintError("Failed to restore session: %v", err)
 					} else {
 						newCa := &chatAgent{inner: agent.NewCodingAgentWithHarness(agent.Options{Config: cfg, Harness: newHr})}
-						newCa.Subscribe(func(evt agentruntime.AgentEvent) {
+						newCa.Subscribe(func(evt engine.AgentEvent) {
 							ui.Subscriber()(evt)
 							chatSubscriber(evt, newHr)
 						})
@@ -588,18 +580,11 @@ func maybeCompactBeforeQuery(hr *harness.Harness, ca *chatAgent) {
 	if res == nil {
 		return
 	}
-	// Apply compaction immediately: rebuild the agent's state with the
-	// compacted message list, so ca.Messages() reflects the new list
-	// right away (not just on the next ca.Run()).
+	// Apply compaction immediately: replace the agent's message list with
+	// the compacted one, so ca.Messages() reflects the new list right away.
 	ca.mu.Lock()
 	ca.override = nil
-	state.Messages = newMsgs
-	newInner := agentruntime.New(agentruntime.AgentOptions{InitialState: &state})
-	subs := ca.subscribers
-	ca.inner = newInner
-	for _, fn := range subs {
-		ca.inner.Subscribe(fn)
-	}
+	ca.inner.SetMessages(newMsgs)
 	ca.mu.Unlock()
 	// Record compaction and persist the compacted messages
 	if err := hr.CompactAndPersist(res.Summary, res.TokensBefore, newMsgs); err != nil {
@@ -619,18 +604,11 @@ func forceCompact(hr *harness.Harness, ca *chatAgent) {
 		ui.PrintInfo("No compaction needed.")
 		return
 	}
-	// Apply compaction immediately: rebuild the agent's state with the
-	// compacted message list, so ca.Messages() reflects the new list
-	// right away (not just on the next ca.Run()).
+	// Apply compaction immediately: replace the agent's message list with
+	// the compacted one, so ca.Messages() reflects the new list right away.
 	ca.mu.Lock()
 	ca.override = nil // discard any pending override
-	state.Messages = newMsgs
-	newInner := agentruntime.New(agentruntime.AgentOptions{InitialState: &state})
-	subs := ca.subscribers
-	ca.inner = newInner
-	for _, fn := range subs {
-		ca.inner.Subscribe(fn)
-	}
+	ca.inner.SetMessages(newMsgs)
 	ca.mu.Unlock()
 	// Record compaction and persist the compacted messages
 	if err := hr.CompactAndPersist(res.Summary, res.TokensBefore, newMsgs); err != nil {
@@ -645,9 +623,9 @@ func forceCompact(hr *harness.Harness, ca *chatAgent) {
 // Only EventMessageEnd is used to record usage. EventMessageUpdate+EventDone
 // is NOT used because it would cause double-counting (EventMessageEnd already
 // contains the final message with complete Usage data).
-func chatSubscriber(evt agentruntime.AgentEvent, hr *harness.Harness) {
+func chatSubscriber(evt engine.AgentEvent, hr *harness.Harness) {
 	switch e := evt.(type) {
-	case agentruntime.EventMessageEnd:
+	case engine.EventMessageEnd:
 		hr.AccumulateUsage(e.Message.Usage)
 		// Print usage information after each message
 		usage := e.Message.Usage

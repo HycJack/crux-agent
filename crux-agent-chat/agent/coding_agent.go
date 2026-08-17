@@ -16,7 +16,7 @@ import (
 	"crux-agent-chat/harness"
 	"crux-agent-chat/tools"
 	"github.com/hycjack/agent-engine/harness/approval"
-	agentruntime "github.com/hycjack/agent-engine/engine"
+	"github.com/hycjack/agent-engine/engine"
 	"github.com/hycjack/crux-ai/core"
 )
 
@@ -33,7 +33,7 @@ type Options struct {
 }
 
 // NewCodingAgent creates a fully configured coding agent from the config.
-func NewCodingAgent(cfg *config.Config) *agentruntime.Agent {
+func NewCodingAgent(cfg *config.Config) *engine.Agent {
 	return NewCodingAgentWithHarness(Options{Config: cfg})
 }
 
@@ -42,7 +42,7 @@ func NewCodingAgent(cfg *config.Config) *agentruntime.Agent {
 //
 // If opts.Harness is nil, falls back to the standalone behavior
 // (no approval, no skills, no compaction).
-func NewCodingAgentWithHarness(opts Options) *agentruntime.Agent {
+func NewCodingAgentWithHarness(opts Options) *engine.Agent {
 	cfg := opts.Config
 	h := opts.Harness
 
@@ -67,7 +67,7 @@ func NewCodingAgentWithHarness(opts Options) *agentruntime.Agent {
 
 	agentTools := tools.AllTools()
 
-	state := &agentruntime.AgentState{
+	state := &engine.AgentState{
 		Model:        model,
 		SystemPrompt: systemPrompt,
 		Tools:        agentTools,
@@ -99,7 +99,7 @@ func NewCodingAgentWithHarness(opts Options) *agentruntime.Agent {
 	}
 
 	if h != nil {
-		state.BeforeToolCall = func(ctx agentruntime.BeforeToolCallContext) *agentruntime.ToolCallBlock {
+		state.BeforeToolCall = func(ctx engine.BeforeToolCallContext) *engine.ToolCallBlock {
 			return approvalHook(h, ctx)
 		}
 
@@ -145,7 +145,7 @@ func NewCodingAgentWithHarness(opts Options) *agentruntime.Agent {
 		}
 	}
 
-	agent := agentruntime.New(agentruntime.AgentOptions{InitialState: state})
+	agent := engine.New(engine.AgentOptions{InitialState: state})
 
 	if h != nil {
 		// Subscribe the harness collector to agent events for run statistics.
@@ -256,7 +256,7 @@ func buildTrimmedSummary(msg core.ToolResultMessage) string {
 // approvalHook bridges the harness's approval gate to the agent's
 // BeforeToolCall hook. It blocks tools when the gate says so, or
 // delegates the ask to the harness (which prompts on stdin).
-func approvalHook(h *harness.Harness, ctx agentruntime.BeforeToolCallContext) (blockResult *agentruntime.ToolCallBlock) {
+func approvalHook(h *harness.Harness, ctx engine.BeforeToolCallContext) (blockResult *engine.ToolCallBlock) {
 	// Recover from any panic during approval to prevent crashing the agent loop.
 	defer func() {
 		if r := recover(); r != nil {
@@ -264,7 +264,7 @@ func approvalHook(h *harness.Harness, ctx agentruntime.BeforeToolCallContext) (b
 			stack := debug.Stack()
 			log.Printf("🔒 approvalHook: stack: %s", string(stack))
 			// On panic, block the tool to be safe rather than crashing the loop.
-			blockResult = &agentruntime.ToolCallBlock{
+			blockResult = &engine.ToolCallBlock{
 				Block:  true,
 				Reason: fmt.Sprintf("approval hook panicked: %v", r),
 			}
@@ -282,7 +282,7 @@ func approvalHook(h *harness.Harness, ctx agentruntime.BeforeToolCallContext) (b
 	switch res.Decision {
 	case approval.DecisionBlock:
 		log.Printf("🔒 approvalHook: tool call blocked: %s", res.Reason)
-		return &agentruntime.ToolCallBlock{Block: true, Reason: res.Reason}
+		return &engine.ToolCallBlock{Block: true, Reason: res.Reason}
 	case approval.DecisionAllow:
 		log.Printf("🔒 approvalHook: tool call allowed")
 		return nil
@@ -290,7 +290,7 @@ func approvalHook(h *harness.Harness, ctx agentruntime.BeforeToolCallContext) (b
 		log.Printf("🔒 approvalHook: asking user for approval")
 		if !h.AskUser(req) {
 			log.Printf("🔒 approvalHook: user denied")
-			return &agentruntime.ToolCallBlock{Block: true, Reason: "user denied"}
+			return &engine.ToolCallBlock{Block: true, Reason: "user denied"}
 		}
 		log.Printf("🔒 approvalHook: user approved")
 		return nil
@@ -301,7 +301,7 @@ func approvalHook(h *harness.Harness, ctx agentruntime.BeforeToolCallContext) (b
 // RunOnce runs a single user query through the agent. The prompt may be a
 // plain string (text-only) or a slice of core.ContentBlock (multimodal,
 // e.g. text + image attachments).
-func RunOnce(ctx context.Context, a *agentruntime.Agent, prompt any) ([]core.Message, error) {
+func RunOnce(ctx context.Context, a *engine.Agent, prompt any) ([]core.Message, error) {
 	return a.Run(ctx, core.UserMessage{
 		Role:      "user",
 		Content:   prompt,

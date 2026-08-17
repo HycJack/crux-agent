@@ -37,6 +37,11 @@ type Process struct {
 	onNotify func(Notification)
 	running  bool
 	cancelFn context.CancelFunc
+
+	// stdinMu protects stdin writes separately from the main mu.
+	// This allows Call/Notify to write concurrently without blocking
+	// each other when the plugin is slow to read.
+	stdinMu sync.Mutex
 }
 
 // NewProcess creates a new plugin process from a manifest.
@@ -158,9 +163,11 @@ func (p *Process) Call(ctx context.Context, method string, params interface{}) (
 	}
 	data = append(data, '\n')
 
-	p.mu.Lock()
+	// Use separate stdinMu to avoid blocking other Call/Notify operations
+	// when the plugin is slow to read from stdin.
+	p.stdinMu.Lock()
 	_, err = p.stdin.Write(data)
-	p.mu.Unlock()
+	p.stdinMu.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("plugin %s: write: %w", p.manifest.ID, err)
 	}
@@ -192,11 +199,17 @@ func (p *Process) Notify(method string, params interface{}) error {
 	data = append(data, '\n')
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if !p.running {
+		p.mu.Unlock()
 		return fmt.Errorf("plugin %s: not running", p.manifest.ID)
 	}
-	if _, err := p.stdin.Write(data); err != nil {
+	p.mu.Unlock()
+
+	// Use separate stdinMu to avoid blocking other Call/Notify operations.
+	p.stdinMu.Lock()
+	_, err = p.stdin.Write(data)
+	p.stdinMu.Unlock()
+	if err != nil {
 		return fmt.Errorf("plugin %s: notify write: %w", p.manifest.ID, err)
 	}
 	return nil
@@ -211,19 +224,23 @@ func (p *Process) Stop(timeout time.Duration) {
 		p.mu.Unlock()
 		return
 	}
-	wasRunning := p.running
 	stdin := p.stdin
 	cancelFn := p.cancelFn
 	cmd := p.cmd
-	p.running = false
 	p.mu.Unlock()
 
 	// Best-effort shutdown RPC. Call() needs the lock, which we've released.
-	if wasRunning && stdin != nil {
+	// Note: p.running is still true here, so Call() won't fail immediately.
+	if stdin != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		_, _ = p.Call(ctx, MethodShutdown, nil)
 		cancel()
 	}
+
+	// Now mark as not running and cancel context.
+	p.mu.Lock()
+	p.running = false
+	p.mu.Unlock()
 
 	// Cancel context → exec.CommandContext will SIGKILL the subprocess.
 	if cancelFn != nil {

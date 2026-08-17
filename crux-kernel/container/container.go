@@ -210,6 +210,9 @@ func (c *Container) Plugin(name string, fn PluginFunc) *fiber.PluginFiber {
 
 // PluginWithConfig 注册带配置的插件。config 会记录在 PluginFiber 中，
 // 用于 Reload 时的 epoch 比较。
+//
+// 如果插件加载失败，返回的 PluginFiber 处于 failed 状态，
+// 调用方应检查 fiber.State() 和 fiber.Err()。
 func (c *Container) PluginWithConfig(name string, config any, fn PluginFunc) *fiber.PluginFiber {
 	c.mu.Lock()
 	if c.state == StateDisposed {
@@ -229,6 +232,8 @@ func (c *Container) PluginWithConfig(name string, config any, fn PluginFunc) *fi
 	c.mu.Unlock()
 
 	// 在锁外执行加载（可能耗时）
+	// Note: Load error is reflected in fiber.State()/fiber.Err(),
+	// callers should check the returned fiber's state.
 	_ = f.Load(context.Background())
 	return f
 }
@@ -369,13 +374,16 @@ func (c *Container) Dispose() error {
 	}
 	c.mu.Unlock()
 
+	var errs []error
+
 	// 1. 先级联卸载所有 isolate 子容器
 	for _, child := range isolates {
-		_ = child.Dispose()
+		if err := child.Dispose(); err != nil {
+			errs = append(errs, fmt.Errorf("dispose isolate %q: %w", child.Name(), err))
+		}
 	}
 
 	// 2. 逆序调用插件 disposer
-	var errs []error
 	for i := len(order) - 1; i >= 0; i-- {
 		name := order[i]
 		f := fibers[name]

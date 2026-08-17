@@ -189,19 +189,29 @@ func (f *PluginFiber) Reload(ctx context.Context, newLoader Loader, newConfig an
 	}
 
 	// 先 dispose 旧资源（如有）
+	var disposeErr error
 	if f.state == StateActive && f.disposer != nil {
 		d := f.disposer
 		f.disposer = nil
 		f.state = StatePending // 临时回退，加载成功后转 active
 		f.mu.Unlock()
-		_ = d() // dispose 错误不阻塞 reload
+		disposeErr = d() // capture dispose error
 	} else {
 		f.state = StatePending
 		f.mu.Unlock()
 	}
 
 	// 重新加载
-	return f.Load(ctx)
+	loadErr := f.Load(ctx)
+
+	// If both dispose and load failed, return a combined error
+	if disposeErr != nil && loadErr != nil {
+		return fmt.Errorf("fiber: reload plugin %q failed: dispose error: %v, load error: %v", f.name, disposeErr, loadErr)
+	}
+	if disposeErr != nil {
+		return fmt.Errorf("fiber: reload plugin %q: dispose error: %w", f.name, disposeErr)
+	}
+	return loadErr
 }
 
 // IsActive 便捷判断是否处于 active 状态。

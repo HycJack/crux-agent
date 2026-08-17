@@ -1,13 +1,13 @@
 package harness
 
 import (
-	agentruntime "github.com/hycjack/agent-engine/engine"
+	"github.com/hycjack/agent-engine/engine"
 	"github.com/hycjack/crux-ai/core"
 )
 
 // AgentToolsToCore converts runtime AgentTool definitions into the
 // core.Tool values needed by the context pipeline and session helpers.
-func AgentToolsToCore(tools []agentruntime.AgentTool) []core.Tool {
+func AgentToolsToCore(tools []engine.AgentTool) []core.Tool {
 	out := make([]core.Tool, len(tools))
 	for i, t := range tools {
 		out[i] = core.Tool{

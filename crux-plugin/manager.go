@@ -176,7 +176,11 @@ func (m *Manager) StartAll(ctx context.Context) error {
 		}
 
 		proc := NewProcess(inst.Manifest, m.logger)
+
+		// Lock to protect Process field from concurrent reads via Plugins()
+		m.mu.Lock()
 		inst.Process = proc
+		m.mu.Unlock()
 
 		proc.SetNotifyHandler(func(n Notification) {
 			m.handleNotification(inst.Manifest.ID, n)

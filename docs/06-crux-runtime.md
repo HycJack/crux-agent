@@ -1,8 +1,8 @@
-# 模块设计：crux-runtime — 统一容器层
+# 模块设计：crux-kernel — 统一容器层
 
-> 模块: crux-runtime（新建）
+> 模块: crux-kernel（已实现）
 > 版本: v0.1.0（设计草案） | 更新: 2026-08-14
-> 状态: 📝 设计草案，待评审
+> 状态: ✅ 已实现
 
 ---
 
@@ -10,7 +10,7 @@
 
 **问题**：crux-agent 现有 13 个模块各自独立，缺少统一的"运行时容器"来编排插件生命周期、服务依赖和多租户隔离。`AgentLoopConfig` 的 15+ 字段需要调用方手动组装，且插件（Compactor / Memory / Tool 等）没有统一的加载/卸载/重载机制。
 
-**方案**：新增 `crux-runtime` 模块，提供三层抽象：
+**方案**：`crux-kernel` 模块提供三层抽象：
 1. **Container** — 服务注册/查询的统一容器（替代 `AgentLoopConfig` 平铺字段）
 2. **PluginFiber** — 插件生命周期状态机（pending → active → disposed）
 3. **EventBus** — 支持多派发模式的事件总线（parallel / serial / bail / waterfall）
@@ -98,7 +98,7 @@ Cordis 的核心能力依赖 TypeScript 的两个特性，**Go 都没有**：
 | Proxy 动态拦截 | `ctx.logger` 自动注入 | interface 显式注入 |
 | `declare module` 合并 | 跨包扩展 Context 类型 | 大 struct 聚合 / interface 组合 |
 
-**推论**：crux-runtime 会比 Cordis 更像 Spring/Dagger，而非 Cordis 本身。设计上选择"显式 struct + interface"，而非"动态 Proxy + 装饰器"。
+**推论**：crux-kernel 会比 Cordis 更像 Spring/Dagger，而非 Cordis 本身。设计上选择"显式 struct + interface"，而非"动态 Proxy + 装饰器"。
 
 ---
 
@@ -132,9 +132,9 @@ Cordis 的核心能力依赖 TypeScript 的两个特性，**Go 都没有**：
 └─────────────────────────────────────────────────────────────┘
           ↓                    ↓
 ┌──────────────────┐   ┌──────────────────┐
-│  crux-runtime    │   │  crux-agent-     │
-│  (NEW)           │←──│  runtime         │
-│                  │   │  (现有)          │
+│  crux-kernel     │   │  agent-engine    │
+│  (已实现)        │←──│  (已实现)        │
+│                  │   │                  │
 │  · Container     │   │  · AgentLoop     │
 │  · PluginFiber   │   │  · Pipeline      │
 │  · EventBus      │   │  · Tools         │
@@ -146,16 +146,16 @@ Cordis 的核心能力依赖 TypeScript 的两个特性，**Go 都没有**：
 ```
 
 **关键决策**：
-- `crux-runtime` 位于 runtime 层，**不依赖** `crux-agent-runtime`
-- `crux-agent-runtime` **可选依赖** `crux-runtime`（向后兼容）
-- `crux-runtime` 只依赖 stdlib + `crux-ai/core`（类型）
+- `crux-kernel` 位于 runtime 层，**不依赖** `agent-engine`
+- `agent-engine` **可选依赖** `crux-kernel`（向后兼容）
+- `crux-kernel` 只依赖 stdlib + `crux-ai/core`（类型）
 
 ### 3.2 与现有模块的关系
 
-| 现有模块 | 与 crux-runtime 的关系 |
+| 现有模块 | 与 crux-kernel 的关系 |
 |---------|----------------------|
-| `crux-ai` | crux-runtime 依赖其 `core` 包的类型（Model / Context / Message） |
-| `crux-agent-runtime` | **可选**：用 Container 替代 AgentLoopConfig，旧的 Config API 保留 |
+| `crux-ai` | crux-kernel 依赖其 `core` 包的类型（Model / Context / Message） |
+| `agent-engine` | **可选**：用 Container 替代 AgentLoopConfig，旧的 Config API 保留 |
 | `crux-agent-harness` | 各 concern（Session/Memory/Approval/...）注册为 Container 服务 |
 | `crux-plugin` | ToolPlugin 包装为 PluginFiber，获得生命周期管理 |
 | `crux-turn` | Turn FSM 独立运行，不纳入 Container（职责不同） |
@@ -428,9 +428,9 @@ package main
 
 import (
     "context"
-    "github.com/crux-agent/crux-runtime/container"
-    "github.com/crux-agent/crux-runtime/events"
-    "github.com/crux-agent/crux-runtime/fiber"
+    "github.com/crux-agent/crux-kernel/container"
+    "github.com/crux-agent/crux-kernel/events"
+    "github.com/crux-agent/crux-kernel/fiber"
 )
 
 func main() {
@@ -656,14 +656,14 @@ func (m *Manager) ReloadPlugin(c *container.Container, name string) error {
 
 ## 7. 迁移路径
 
-### Phase 1：crux-runtime 核心实现（v0.1）
+### Phase 1：crux-kernel 核心实现（v0.1）✅ 已完成
 
-**范围**：新建 `crux-runtime` 模块，实现 Container + PluginFiber + EventBus。
+**范围**：新建 `crux-kernel` 模块，实现 Container + PluginFiber + EventBus。
 
 **交付物**：
-- `crux-runtime/container/` — Container + Isolate
-- `crux-runtime/fiber/` — PluginFiber 状态机
-- `crux-runtime/events/` — EventBus + 5 种派发模式
+- `crux-kernel/container/` — Container + Isolate
+- `crux-kernel/fiber/` — PluginFiber 状态机
+- `crux-kernel/events/` — EventBus + 5 种派发模式
 - 单元测试覆盖 ≥ 80%
 
 **验收标准**：
@@ -674,7 +674,7 @@ func (m *Manager) ReloadPlugin(c *container.Container, name string) error {
 
 **不涉及**：agent-engine / harness / plugin 的改动（保持零破坏）
 
-### Phase 2：agent-engine 可选集成（v0.2）
+### Phase 2：agent-engine 可选集成（v0.2）✅ 已完成
 
 **范围**：agent-engine 新增 `WithContainer` 选项，旧 API 保留。
 
@@ -690,7 +690,7 @@ func (m *Manager) ReloadPlugin(c *container.Container, name string) error {
 
 **风险**：低。Option 模式向后兼容。
 
-### Phase 3：harness 注册辅助（v0.3）
+### Phase 3：harness 注册辅助（v0.3）✅ 已完成
 
 **范围**：harness 各 concern 提供 `Register(c, config)` 辅助函数。
 
@@ -705,7 +705,7 @@ func (m *Manager) ReloadPlugin(c *container.Container, name string) error {
 - 现有直接构造方式不受影响
 - Register 辅助函数能正确注册到 Container
 
-### Phase 4：crux-plugin 热重载（v0.4，依赖 crux-plugin v2）
+### Phase 4：crux-plugin 热重载（v0.4）✅ 已完成
 
 **范围**：crux-plugin 的子进程插件包装为 PluginFiber，支持热重载。
 
@@ -808,7 +808,7 @@ type EventToolExecEnd struct {
 
 ## 9. 与 Cordis 的对比
 
-| 维度 | Cordis | crux-runtime |
+| 维度 | Cordis | crux-kernel |
 |------|--------|--------------|
 | **语言** | TypeScript | Go |
 | **核心抽象** | Context + Fiber + Reflect（三件套） | Container + PluginFiber + EventBus |
@@ -823,7 +823,7 @@ type EventToolExecEnd struct {
 | **HMR** | hmr 包（完整依赖图分析） | 不做（留给 crux-plugin v2） |
 | **Proxy 使用** | 重度（Context/Service/traceable 三层） | 零 |
 
-**核心差异**：Cordis 是"动态声明式"（运行时可变），crux-runtime 是"静态显式"（编译期固定）。
+**核心差异**：Cordis 是"动态声明式"（运行时可变），crux-kernel 是"静态显式"（编译期固定）。
 
 ---
 
@@ -871,17 +871,17 @@ type EventToolExecEnd struct {
 
 ## 11. 后续计划
 
-### 短期（v0.1 - v0.3）
+### 短期（v0.1 - v0.3）✅ 已完成
 
-- [ ] 实现 Container + PluginFiber + EventBus
-- [ ] agent-engine 集成 WithContainer 选项
-- [ ] harness 各 concern 提供 Register 辅助
-- [ ] 单元测试覆盖 ≥ 80%
+- [x] 实现 Container + PluginFiber + EventBus
+- [x] agent-engine 集成 WithContainer 选项
+- [x] harness 各 concern 提供 Register 辅助
+- [x] 单元测试覆盖 ≥ 80%
 
-### 中期（v0.4 - v0.5）
+### 中期（v0.4 - v0.5）✅ 已完成
 
-- [ ] crux-plugin 子进程插件接入 PluginFiber
-- [ ] 子进程崩溃自动重启
+- [x] crux-plugin 子进程插件接入 PluginFiber
+- [x] 子进程崩溃自动重启
 - [ ] Isolate 多租户场景验证
 
 ### 长期（v1.0+）

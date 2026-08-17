@@ -3,8 +3,9 @@ module chat-app
 go 1.25.0
 
 require (
-	github.com/hycjack/agent-engine v0.0.0
+	github.com/hycjack/agent-engine v0.0.1
 	github.com/hycjack/crux-ai v0.0.1
+	github.com/hycjack/crux-kernel v0.0.1
 	github.com/hycjack/crux-plugin v0.0.0
 	github.com/wailsapp/wails/v2 v2.12.0
 	golang.org/x/text v0.38.0
@@ -45,5 +46,6 @@ require (
 replace (
 	github.com/hycjack/agent-engine => ../agent-engine
 	github.com/hycjack/crux-ai => ../crux-ai
+	github.com/hycjack/crux-kernel => ../crux-kernel
 	github.com/hycjack/crux-plugin => ../crux-plugin
 )

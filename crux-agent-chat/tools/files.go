@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	agent "github.com/hycjack/agent-engine/engine"
+	"github.com/hycjack/agent-engine/engine"
 )
 
 // ReadFileTool reads the contents of a file with line numbers.
@@ -19,7 +19,7 @@ var ReadFileTool = ToolDef{
 	Execute:     executeReadFile,
 }
 
-func executeReadFile(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (agent.AgentToolResult, error) {
+func executeReadFile(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (engine.AgentToolResult, error) {
 	var args struct {
 		Path   string `json:"path"`
 		Offset int    `json:"offset"`
@@ -79,7 +79,7 @@ var WriteFileTool = ToolDef{
 	Execute:     executeWriteFile,
 }
 
-func executeWriteFile(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (agent.AgentToolResult, error) {
+func executeWriteFile(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (engine.AgentToolResult, error) {
 	var args struct {
 		Path    string `json:"path"`
 		Content string `json:"content"`
@@ -108,7 +108,7 @@ var ListFilesTool = ToolDef{
 	Execute:     executeListFiles,
 }
 
-func executeListFiles(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (agent.AgentToolResult, error) {
+func executeListFiles(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (engine.AgentToolResult, error) {
 	var args struct {
 		Path       string `json:"path"`
 		Recursive  bool   `json:"recursive"`
@@ -128,7 +128,7 @@ func executeListFiles(ctx context.Context, id string, params json.RawMessage, on
 	return listFlat(args.Path, args.ShowHidden)
 }
 
-func listFlat(dir string, showHidden bool) (agent.AgentToolResult, error) {
+func listFlat(dir string, showHidden bool) (engine.AgentToolResult, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return toolError(fmt.Sprintf("failed to list %s: %v", dir, err)), nil
@@ -151,7 +151,7 @@ func listFlat(dir string, showHidden bool) (agent.AgentToolResult, error) {
 	return toolResult(strings.Join(lines, "\n")), nil
 }
 
-func listRecursive(dir string, showHidden bool) (agent.AgentToolResult, error) {
+func listRecursive(dir string, showHidden bool) (engine.AgentToolResult, error) {
 	var lines []string
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -199,7 +199,7 @@ var EditFileTool = ToolDef{
 	Execute:     executeEditFile,
 }
 
-func executeEditFile(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (agent.AgentToolResult, error) {
+func executeEditFile(ctx context.Context, id string, params json.RawMessage, onUpdate func(json.RawMessage)) (engine.AgentToolResult, error) {
 	var args struct {
 		Path    string `json:"path"`
 		OldText string `json:"old_text"`

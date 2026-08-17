@@ -30,7 +30,7 @@ import (
 	"github.com/hycjack/agent-engine/harness/session"
 	"github.com/hycjack/agent-engine/harness/skills"
 
-	agentruntime "github.com/hycjack/agent-engine/engine"
+	"github.com/hycjack/agent-engine/engine"
 
 	"github.com/hycjack/crux-ai/core"
 )
@@ -590,20 +590,20 @@ func (h *Harness) ResetCollector() {
 // Usage:
 //
 //	agent.Subscribe(harness.NewAgentSubscriber())
-func (h *Harness) NewAgentSubscriber() func(agentruntime.AgentEvent) {
-	return func(evt agentruntime.AgentEvent) {
+func (h *Harness) NewAgentSubscriber() func(engine.AgentEvent) {
+	return func(evt engine.AgentEvent) {
 		switch e := evt.(type) {
-		case agentruntime.EventTurnStart:
+		case engine.EventTurnStart:
 			// Turn start: no stats to record yet
-		case agentruntime.EventTurnEnd:
+		case engine.EventTurnEnd:
 			// Finished a turn
-		case agentruntime.EventMessageEnd:
+		case engine.EventMessageEnd:
 			h.collector.RecordUsage(e.Message.Usage)
-		case agentruntime.EventToolExecEnd:
+		case engine.EventToolExecEnd:
 			h.collector.RecordToolCall(e.ToolName, e.IsError)
 			// Accumulate token totals for session metadata
 			// h.metadata is updated elsewhere
-		case agentruntime.EventAgentEnd:
+		case engine.EventAgentEnd:
 			h.collector.MarkRunEnded()
 			sum, cov := h.collector.Snapshot()
 			log.Printf("harness: run ended — %d steps, %d tools, %d errors, %.4f cost",
