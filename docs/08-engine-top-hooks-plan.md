@@ -212,8 +212,8 @@ func (x *Ctx) Dispose() error                     // → Container.Dispose（逆
 
 | 阶段 | 内容 | 交付物 | 编译目标 |
 |---|---|---|---|
-| P1 | 契约层打桩 | `plugin/hooks.go` + `plugin/adapt.go` + 测试 | 绿（新增不影响现有） |
-| P2 | engine 内部收敛 | `AgentLoopConfig` 复制字段进 Hooks；engine 调用点 `config.Hooks.X`；保留旧字段(deprecated) 双向填充 | 绿（零行为变化） |
+| P1 | 契约层打桩 ✅ 已完成 (23a9ed8) | `plugin/hooks.go` + `plugin/adapt.go` + `adapt_test.go` | 绿（新增不影响现有） |
+| P2 | engine 内部收敛 ✅ 已完成 (81a1433) | `AgentLoopConfig` 新增 `Hooks` 字段；engine 调用点 `config.hooks()` 归一化；legacy 字段(deprecated) 双向填充；`Agent.hooks()`/`AttachHooks`；钩子类型别名收敛；`hooks_test.go` | 绿（零行为变化，legacy 全兼容） |
 | P3 | defaults 插件化 | 新增 `ctx` 包 + `defaults/*_plugin.go` + `BundleDefault` | 绿（新增不动存量） |
 | P4 | 应用切 ctx | chat-app/chat/tui 改用 `ctx.New+Mount+Start`；删手工桥 | 绿（行为对照） |
 | P5 | 收尾去重 | 并入 `harness/`，删 `integration/bridge.go` 适配，删旧字段 | 绿 |
